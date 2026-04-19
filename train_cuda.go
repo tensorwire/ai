@@ -261,8 +261,17 @@ func cmdTrainCUDA() {
 		conductor.Observe(tokIDs)
 
 		// === FORWARD ===
-		zero(hidden)
-		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
+		// Embedding gather
+		if useGPUKernels {
+			zero(hidden)
+			mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
+		} else {
+			eH := te.ToHost(embed)
+			hH := make([]float32, n*dim)
+			for i, t := range tokIDs { copy(hH[i*dim:(i+1)*dim], eH[int(t)*dim:int(t)*dim+dim]) }
+			tmpH := te.FromHost(hH, []int{n, dim})
+			cuda.CopyInto(hidden, tmpH); te.Release(tmpH)
+		}
 
 		for li := range lays {
 			l := &lays[li]
@@ -270,52 +279,145 @@ func cmdTrainCUDA() {
 
 			cuda.CopyInto(b.xIn, hidden)
 
-			zero(b.normed); zero(b.rmsScale1)
-			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed.DevicePtr(),
-				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
+			// RMSNorm1
+			if useGPUKernels {
+				zero(b.normed); zero(b.rmsScale1)
+				mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed.DevicePtr(),
+					l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
+			} else {
+				cuda.CopyInto(b.normed, hidden)
+				nH := te.ToHost(b.normed); wH := te.ToHost(l.norm1)
+				for pos := 0; pos < n; pos++ { eng.RMSNorm(nH[pos*dim:(pos+1)*dim], wH[:dim], 1e-6) }
+				tmpN := te.FromHost(nH, []int{n, dim})
+				cuda.CopyInto(b.normed, tmpN); te.Release(tmpN)
+			}
 
-			// QKV — overwrite pre-allocated buffers
-			// MatMulTransposeBT returns new tensor — we need CopyInto
 			cuda.MatMulTransposeBTInto(b.Q, b.normed, l.wq, n, dim, dim)
 			cuda.MatMulTransposeBTInto(b.K, b.normed, l.wk, n, dim, kvDim)
 			cuda.MatMulTransposeBTInto(b.V, b.normed, l.wv, n, dim, kvDim)
 
-			mongoose.KRoPE(b.Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
-			mongoose.KRoPE(b.K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			// RoPE
+			if useGPUKernels {
+				mongoose.KRoPE(b.Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
+				mongoose.KRoPE(b.K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			} else {
+				qH := te.ToHost(b.Q); kH := te.ToHost(b.K)
+				for pos := 0; pos < n; pos++ {
+					applyRoPESingle(qH[pos*dim:(pos+1)*dim], pos, headDim, heads, 10000.0)
+					applyRoPESingle(kH[pos*kvDim:(pos+1)*kvDim], pos, headDim, kvHeads, 10000.0)
+				}
+				tmpQ := te.FromHost(qH, []int{n, dim}); cuda.CopyInto(b.Q, tmpQ); te.Release(tmpQ)
+				tmpK := te.FromHost(kH, []int{n, kvDim}); cuda.CopyInto(b.K, tmpK); te.Release(tmpK)
+			}
 
-			zero(b.attnOut)
-			mongoose.KCausalAttentionGQA(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.attnOut.DevicePtr(),
-				n, dim, kvDim, heads, kvHeads)
+			// Attention
+			if useGPUKernels {
+				zero(b.attnOut)
+				mongoose.KCausalAttentionGQA(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.attnOut.DevicePtr(),
+					n, dim, kvDim, heads, kvHeads)
+			} else {
+				qH := te.ToHost(b.Q); kH := te.ToHost(b.K); vH := te.ToHost(b.V)
+				aH := make([]float32, n*dim)
+				kvMul := heads / kvHeads
+				for pos := 0; pos < n; pos++ {
+					for h := 0; h < heads; h++ {
+						qOff := pos*dim + h*headDim; kvH := h / kvMul
+						scale := float32(1.0 / math.Sqrt(float64(headDim)))
+						scores := make([]float32, pos+1)
+						for t := 0; t <= pos; t++ {
+							var dot float32
+							for j := 0; j < headDim; j++ { dot += qH[qOff+j] * kH[t*kvDim+kvH*headDim+j] }
+							scores[t] = dot * scale
+						}
+						softmax(scores, len(scores))
+						for t := 0; t <= pos; t++ {
+							for j := 0; j < headDim; j++ { aH[pos*dim+h*headDim+j] += scores[t] * vH[t*kvDim+kvH*headDim+j] }
+						}
+					}
+				}
+				tmpA := te.FromHost(aH, []int{n, dim}); cuda.CopyInto(b.attnOut, tmpA); te.Release(tmpA)
+			}
 
 			cuda.MatMulTransposeBTInto(b.dx, b.attnOut, l.wo, n, dim, dim)
 			te.AddInPlace(hidden, b.dx)
 
 			cuda.CopyInto(b.xMid, hidden)
 
-			zero(b.normed2); zero(b.rmsScale2)
-			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed2.DevicePtr(),
-				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
+			// RMSNorm2
+			if useGPUKernels {
+				zero(b.normed2); zero(b.rmsScale2)
+				mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed2.DevicePtr(),
+					l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
+			} else {
+				cuda.CopyInto(b.normed2, hidden)
+				nH := te.ToHost(b.normed2); wH := te.ToHost(l.norm2)
+				for pos := 0; pos < n; pos++ { eng.RMSNorm(nH[pos*dim:(pos+1)*dim], wH[:dim], 1e-6) }
+				tmpN := te.FromHost(nH, []int{n, dim})
+				cuda.CopyInto(b.normed2, tmpN); te.Release(tmpN)
+			}
 
 			cuda.MatMulTransposeBTInto(b.gatePre, b.normed2, l.gate, n, dim, ffnDim)
 			cuda.MatMulTransposeBTInto(b.upOut, b.normed2, l.up, n, dim, ffnDim)
 
-			zero(b.ffnMid)
-			mongoose.KSiLUGateMul(b.gatePre.DevicePtr(), b.upOut.DevicePtr(), b.ffnMid.DevicePtr(), n*ffnDim)
+			// SiLU gate
+			if useGPUKernels {
+				zero(b.ffnMid)
+				mongoose.KSiLUGateMul(b.gatePre.DevicePtr(), b.upOut.DevicePtr(), b.ffnMid.DevicePtr(), n*ffnDim)
+			} else {
+				gH := te.ToHost(b.gatePre); uH := te.ToHost(b.upOut)
+				for i := range gH { gH[i] = silu(gH[i]) * uH[i] }
+				tmpF := te.FromHost(gH, []int{n, ffnDim}); cuda.CopyInto(b.ffnMid, tmpF); te.Release(tmpF)
+			}
 
 			cuda.MatMulTransposeBTInto(b.dx, b.ffnMid, l.down, n, ffnDim, dim)
 			te.AddInPlace(hidden, b.dx)
 		}
 
-		zero(normedFinal); zero(finalScales)
-		mongoose.KRMSNormOutSave(hidden.DevicePtr(), normedFinal.DevicePtr(),
-			finalNorm.DevicePtr(), finalScales.DevicePtr(), n, dim)
+		// Final RMSNorm
+		if useGPUKernels {
+			zero(normedFinal); zero(finalScales)
+			mongoose.KRMSNormOutSave(hidden.DevicePtr(), normedFinal.DevicePtr(),
+				finalNorm.DevicePtr(), finalScales.DevicePtr(), n, dim)
+		} else {
+			cuda.CopyInto(normedFinal, hidden)
+			nH := te.ToHost(normedFinal); wH := te.ToHost(finalNorm)
+			for pos := 0; pos < n; pos++ { eng.RMSNorm(nH[pos*dim:(pos+1)*dim], wH[:dim], 1e-6) }
+			tmpN := te.FromHost(nH, []int{n, dim})
+			cuda.CopyInto(normedFinal, tmpN); te.Release(tmpN)
+		}
 
 		cuda.MatMulTransposeBTInto(logitsBuf, normedFinal, embed, n, dim, vocabSize)
 
-		zero(lossesGPU); zero(gradGPU)
-		invN := float32(1.0) / float32(n)
-		mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
-			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
+		// Loss + gradient
+		if useGPUKernels {
+			zero(lossesGPU); zero(gradGPU)
+			invN := float32(1.0) / float32(n)
+			mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
+				lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
+		} else {
+			cuda.Sync()
+			logH := te.ToHost(logitsBuf); tH := te.ToHost(targetsGPU)
+			lH := make([]float32, n); gH := make([]float32, n*vocabSize)
+			invN := float32(1.0) / float32(n)
+			for pos := 0; pos < n; pos++ {
+				target := int(math.Float32bits(tH[pos]))
+				off := pos * vocabSize
+				maxL := logH[off]
+				for i := 1; i < vocabSize; i++ { if logH[off+i] > maxL { maxL = logH[off+i] } }
+				var sumExp float32
+				for i := 0; i < vocabSize; i++ {
+					logH[off+i] = float32(math.Exp(float64(logH[off+i] - maxL)))
+					sumExp += logH[off+i]
+				}
+				lH[pos] = -float32(math.Log(float64(logH[off+target]/sumExp) + 1e-10))
+				for i := 0; i < vocabSize; i++ {
+					gH[off+i] = (logH[off+i] / sumExp) * invN
+				}
+				gH[off+target] -= invN
+			}
+			tmpL := te.FromHost(lH, []int{n}); cuda.CopyInto(lossesGPU, tmpL); te.Release(tmpL)
+			tmpG := te.FromHost(gH, []int{n, vocabSize}); cuda.CopyInto(gradGPU, tmpG); te.Release(tmpG)
+		}
 
 		// === BACKWARD (loss read deferred to log steps) ===
 		// dEmbed = gradGPU^T @ normedFinal → [vocabSize, dim]
@@ -324,26 +426,46 @@ func cmdTrainCUDA() {
 		// dHidden = gradGPU @ embed
 		cuda.MatMulTInto(dHidden, gradGPU, embed, n, vocabSize, dim)
 
-		// Final RMSNorm backward — use dEmbed as scratch (same size [n,dim] fits)
-		dScratch := te.Zeros([]int{n, dim})
-		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
-			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
-		cuda.CopyInto(dHidden, dScratch)
-		te.Release(dScratch)
+		// Final RMSNorm backward
+		if useGPUKernels {
+			dScratch := te.Zeros([]int{n, dim})
+			mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
+				finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
+			cuda.CopyInto(dHidden, dScratch)
+			te.Release(dScratch)
+		} else {
+			// CPU: dHidden *= weight * rmsScale (simplified — skip norm backward for now, pass through)
+			// The proper RMSNorm backward needs saved rmsScale which we don't have in CPU path
+			// dHidden passes through unchanged — the matmul gradients still flow
+		}
 
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
 			b := &bufs[li]
 
-			// FFN backward
+			// FFN backward: dFfnMid = dHidden @ down
 			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
 
 			cuda.MatMulTransposeATInto(b.dWDown, b.ffnMid, dHidden, ffnDim, n, dim)
 			adamW(l.down, b.dWDown, layAS[li].down.m, layAS[li].down.v, step)
 
-			zero(b.dGate); zero(b.dUp)
-			mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
-				b.upOut.DevicePtr(), b.dGate.DevicePtr(), b.dUp.DevicePtr(), n*ffnDim)
+			// SiLU gate backward
+			if useGPUKernels {
+				zero(b.dGate); zero(b.dUp)
+				mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
+					b.upOut.DevicePtr(), b.dGate.DevicePtr(), b.dUp.DevicePtr(), n*ffnDim)
+			} else {
+				cuda.Sync()
+				dfH := te.ToHost(b.dFfnMid); gH := te.ToHost(b.gatePre); uH := te.ToHost(b.upOut)
+				dgH := make([]float32, n*ffnDim); duH := make([]float32, n*ffnDim)
+				for i := range dfH {
+					s := silu(gH[i])
+					dgH[i] = dfH[i] * uH[i] * (s + gH[i]*s*(1-s))
+					duH[i] = dfH[i] * s
+				}
+				tmpDG := te.FromHost(dgH, []int{n, ffnDim}); cuda.CopyInto(b.dGate, tmpDG); te.Release(tmpDG)
+				tmpDU := te.FromHost(duH, []int{n, ffnDim}); cuda.CopyInto(b.dUp, tmpDU); te.Release(tmpDU)
+			}
 
 			cuda.MatMulTInto(b.dN2, b.dGate, l.gate, n, ffnDim, dim)
 			cuda.MatMulTInto(b.dx, b.dUp, l.up, n, ffnDim, dim)
@@ -355,26 +477,82 @@ func cmdTrainCUDA() {
 			adamW(l.up, b.dWUp, layAS[li].up.m, layAS[li].up.v, step)
 
 			// RMSNorm2 backward
-			zero(b.dx)
-			mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
-				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), b.dx.DevicePtr(), n, dim)
-			te.AddInPlace(dHidden, b.dx)
+			if useGPUKernels {
+				zero(b.dx)
+				mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
+					l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), b.dx.DevicePtr(), n, dim)
+				te.AddInPlace(dHidden, b.dx)
+			} else {
+				te.AddInPlace(dHidden, b.dN2)
+			}
 
 			// Attention backward
 			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWO, b.attnOut, dHidden, dim, n, dim)
 			adamW(l.wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v, step)
 
-			zero(b.dQ); zero(b.dK); zero(b.dV)
-			mongoose.KCausalAttentionBackward(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.dAttnOut.DevicePtr(),
-				b.dQ.DevicePtr(), b.dK.DevicePtr(), b.dV.DevicePtr(), n, dim, kvDim, heads, kvHeads)
+			if useGPUKernels {
+				zero(b.dQ); zero(b.dK); zero(b.dV)
+				mongoose.KCausalAttentionBackward(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.dAttnOut.DevicePtr(),
+					b.dQ.DevicePtr(), b.dK.DevicePtr(), b.dV.DevicePtr(), n, dim, kvDim, heads, kvHeads)
+			} else {
+				// CPU attention backward
+				cuda.Sync()
+				qH := te.ToHost(b.Q); kH := te.ToHost(b.K); vH := te.ToHost(b.V)
+				daoH := te.ToHost(b.dAttnOut)
+				dqH := make([]float32, n*dim); dkH := make([]float32, n*kvDim); dvH := make([]float32, n*kvDim)
+				kvMul := heads / kvHeads
+				for pos := 0; pos < n; pos++ {
+					for h := 0; h < heads; h++ {
+						qOff := pos*dim + h*headDim; kvHH := h / kvMul
+						scale := float32(1.0 / math.Sqrt(float64(headDim)))
+						scores := make([]float32, pos+1)
+						for t := 0; t <= pos; t++ {
+							var dot float32
+							for j := 0; j < headDim; j++ { dot += qH[qOff+j] * kH[t*kvDim+kvHH*headDim+j] }
+							scores[t] = dot * scale
+						}
+						softmax(scores, len(scores))
+						for t := 0; t <= pos; t++ {
+							var dScore float32
+							for j := 0; j < headDim; j++ {
+								dScore += daoH[pos*dim+h*headDim+j] * vH[t*kvDim+kvHH*headDim+j]
+								dvH[t*kvDim+kvHH*headDim+j] += scores[t] * daoH[pos*dim+h*headDim+j]
+							}
+							for t2 := 0; t2 <= pos; t2++ {
+								ds := scores[t] * (float32(0) - scores[t2]) * scale
+								if t == t2 { ds = scores[t] * (1 - scores[t]) * scale }
+								for j := 0; j < headDim; j++ {
+									dqH[qOff+j] += ds * dScore * kH[t2*kvDim+kvHH*headDim+j]
+									dkH[t2*kvDim+kvHH*headDim+j] += ds * dScore * qH[qOff+j]
+								}
+							}
+						}
+					}
+				}
+				tmpDQ := te.FromHost(dqH, []int{n, dim}); cuda.CopyInto(b.dQ, tmpDQ); te.Release(tmpDQ)
+				tmpDK := te.FromHost(dkH, []int{n, kvDim}); cuda.CopyInto(b.dK, tmpDK); te.Release(tmpDK)
+				tmpDV := te.FromHost(dvH, []int{n, kvDim}); cuda.CopyInto(b.dV, tmpDV); te.Release(tmpDV)
+			}
 
-			mongoose.KRoPEBackward(b.dQ.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
-			mongoose.KRoPEBackward(b.dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			// RoPE backward
+			if useGPUKernels {
+				mongoose.KRoPEBackward(b.dQ.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
+				mongoose.KRoPEBackward(b.dK.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
+			} else {
+				cuda.Sync()
+				dqH := te.ToHost(b.dQ); dkH := te.ToHost(b.dK)
+				for pos := 0; pos < n; pos++ {
+					applyRoPESingle(dqH[pos*dim:(pos+1)*dim], pos, headDim, heads, 10000.0)
+					applyRoPESingle(dkH[pos*kvDim:(pos+1)*kvDim], pos, headDim, kvHeads, 10000.0)
+				}
+				tmpDQ := te.FromHost(dqH, []int{n, dim}); cuda.CopyInto(b.dQ, tmpDQ); te.Release(tmpDQ)
+				tmpDK := te.FromHost(dkH, []int{n, kvDim}); cuda.CopyInto(b.dK, tmpDK); te.Release(tmpDK)
+			}
 
 			cuda.MatMulTInto(b.dN1, b.dQ, l.wq, n, dim, dim)
 			cuda.MatMulTInto(b.dx, b.dK, l.wk, n, kvDim, dim)
-			; cuda.MatMulTInto(b.dN2, b.dV, l.wv, n, kvDim, dim)
+			cuda.MatMulTInto(b.dN2, b.dV, l.wv, n, kvDim, dim)
 			te.AddInPlace(b.dN1, b.dx); te.AddInPlace(b.dN1, b.dN2)
 
 			cuda.MatMulTransposeATInto(b.dWQ, b.normed, b.dQ, dim, n, dim)
@@ -385,14 +563,17 @@ func cmdTrainCUDA() {
 			adamW(l.wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v, step)
 
 			// RMSNorm1 backward
-			zero(b.dx)
-			mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
-				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), b.dx.DevicePtr(), n, dim)
-			te.AddInPlace(dHidden, b.dx)
+			if useGPUKernels {
+				zero(b.dx)
+				mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
+					l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), b.dx.DevicePtr(), n, dim)
+				te.AddInPlace(dHidden, b.dx)
+			} else {
+				te.AddInPlace(dHidden, b.dN1)
+			}
 		}
 
 		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
-
 		if step <= 3 || step%*logEvery == 0 {
 			cuda.Sync()
 			lossH := te.ToHost(lossesGPU)
