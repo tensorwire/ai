@@ -462,34 +462,6 @@ func resolveModel(name string) string {
 	return ""
 }
 
-func matVec(out, W, x []float32, rows, cols int) {
-	for i := 0; i < rows; i++ {
-		// Kahan compensated summation — eliminates float32 accumulation drift
-		// that compounds across 24+ transformer layers with 896+ dim dot products.
-		var sum, comp float32
-		off := i * cols
-		for j := 0; j < cols; j++ {
-			y := W[off+j]*x[j] - comp
-			t := sum + y
-			comp = (t - sum) - y
-			sum = t
-		}
-		out[i] = sum
-	}
-}
-
-func rmsNorm(x, weight []float32, eps float32) {
-	n := len(x)
-	var ss float32
-	for i := 0; i < n; i++ {
-		ss += x[i] * x[i]
-	}
-	ss = ss/float32(n) + eps
-	ss = float32(1.0 / math.Sqrt(float64(ss)))
-	for i := 0; i < n; i++ {
-		x[i] = x[i] * ss * weight[i]
-	}
-}
 
 func softmax(x []float32, n int) {
 	max := x[0]

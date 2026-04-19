@@ -70,57 +70,6 @@ func zeroSlice(s []float32) {
 	for i := range s { s[i] = 0 }
 }
 
-// mvFn computes y = M @ x (matrix-vector multiply).
-// M is [rows, cols] row-major, x is [cols], y is [rows].
-func mvFn(y, M, x []float32, rows, cols int) {
-	for i := 0; i < rows; i++ {
-		var sum float32
-		off := i * cols
-		for j := 0; j < cols; j++ {
-			sum += M[off+j] * x[j]
-		}
-		y[i] = sum
-	}
-}
-
-// softmaxFn applies softmax in-place to a float32 slice.
-func softmaxFn(x []float32) {
-	mx := x[0]
-	for _, v := range x[1:] { if v > mx { mx = v } }
-	var se float32
-	for i := range x { x[i] = float32(math.Exp(float64(x[i] - mx))); se += x[i] }
-	invSe := 1.0 / se
-	for i := range x { x[i] *= invSe }
-}
-
-// rmsNormFwdFn computes RMSNorm in-place and returns the inverse RMS scale.
-// x is modified to x * scale * weight.
-func rmsNormFwdFn(x, weight []float32) float32 {
-	n := len(x)
-	var ss float32
-	for _, v := range x { ss += v * v }
-	rms := float32(1.0 / math.Sqrt(float64(ss)/float64(n)+1e-6))
-	for i := range x { x[i] = x[i] * rms * weight[i] }
-	return rms
-}
-
-// rmsNormBwdFn computes RMSNorm backward.
-// dOut is modified in-place to contain the gradient w.r.t. the pre-norm input.
-// weightGrad is accumulated.
-func rmsNormBwdFn(dOut, xIn, weight, weightGrad []float32, rmsScale float32) {
-	n := len(xIn)
-	for i := 0; i < n; i++ {
-		weightGrad[i] += dOut[i] * xIn[i] * rmsScale
-	}
-	var dot float32
-	for i := 0; i < n; i++ {
-		dot += dOut[i] * weight[i] * xIn[i]
-	}
-	dot *= rmsScale * rmsScale * rmsScale / float32(n)
-	for i := 0; i < n; i++ {
-		dOut[i] = rmsScale*weight[i]*dOut[i] - dot*xIn[i]
-	}
-}
 
 // selectEngine initializes the GPU backend.
 func selectEngine(backend string) mongoose.Engine {

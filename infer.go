@@ -113,6 +113,11 @@ func cmdInferImpl(model, prompt string) {
 	eng := selectEngine("auto")
 	fmt.Printf("Engine: %s\n", eng.Name())
 
+	mv := func(out, W, x []float32, rows, cols int) {
+		r := eng.MatMul(W, x, rows, cols, 1)
+		copy(out, r)
+	}
+
 	x := make([]float32, dim)
 	buf := make([]float32, dim)
 	q := make([]float32, dim)
@@ -149,15 +154,15 @@ func cmdInferImpl(model, prompt string) {
 
 			normW, _, _ := st.ReadTensorFloat32(prefix + "input_layernorm.weight")
 			copy(buf, x)
-			rmsNorm(buf, normW, normEps)
+			eng.RMSNorm(buf, normW, normEps)
 
 			wq, qRows, qCols, _ := readWeight(prefix+"self_attn.q_proj.weight", dim, dim)
 			wk, kRows, kCols, _ := readWeight(prefix+"self_attn.k_proj.weight", kvDim, dim)
 			wv, vRows, vCols, _ := readWeight(prefix+"self_attn.v_proj.weight", kvDim, dim)
 
-			matVec(q, wq, buf, qRows, qCols)
-			matVec(k[:kvDim], wk, buf, kRows, kCols)
-			matVec(v[:kvDim], wv, buf, vRows, vCols)
+			mv(q, wq, buf, qRows, qCols)
+			mv(k[:kvDim], wk, buf, kRows, kCols)
+			mv(v[:kvDim], wv, buf, vRows, vCols)
 
 			if bq, _, e := st.ReadTensorFloat32(prefix + "self_attn.q_proj.bias"); e == nil {
 				for i := range bq { q[i] += bq[i] }
@@ -199,18 +204,18 @@ func cmdInferImpl(model, prompt string) {
 
 			wo, woRows, woCols, _ := readWeight(prefix+"self_attn.o_proj.weight", dim, dim)
 			proj := make([]float32, dim)
-			matVec(proj, wo, attnOut, woRows, woCols)
+			mv(proj, wo, attnOut, woRows, woCols)
 			for i := 0; i < dim; i++ { x[i] += proj[i] }
 
 			normW2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
 			copy(buf, x)
-			rmsNorm(buf, normW2, normEps)
+			eng.RMSNorm(buf, normW2, normEps)
 
 			gate, gRows, gCols, _ := readWeight(prefix+"mlp.gate_proj.weight", ffnDim, dim)
 			up, uRows, uCols, _ := readWeight(prefix+"mlp.up_proj.weight", ffnDim, dim)
 			down, dRows, dCols, _ := readWeight(prefix+"mlp.down_proj.weight", dim, ffnDim)
-			matVec(ffnBuf, gate, buf, gRows, gCols)
-			matVec(ffnBuf2, up, buf, uRows, uCols)
+			mv(ffnBuf, gate, buf, gRows, gCols)
+			mv(ffnBuf2, up, buf, uRows, uCols)
 			if act == "relu" {
 				for i := 0; i < ffnDim; i++ {
 					if ffnBuf[i] < 0 { ffnBuf[i] = 0 }
@@ -222,15 +227,15 @@ func cmdInferImpl(model, prompt string) {
 				}
 			}
 			downOut := make([]float32, dim)
-			matVec(downOut, down, ffnBuf, dRows, dCols)
+			mv(downOut, down, ffnBuf, dRows, dCols)
 			for i := 0; i < dim; i++ { x[i] += downOut[i] }
 		}
 
 		finalNorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
-		rmsNorm(x, finalNorm, normEps)
+		eng.RMSNorm(x, finalNorm, normEps)
 
 		logits := make([]float32, vocabSize)
-		matVec(logits, lmHeadData, x, vocabSize, dim)
+		mv(logits, lmHeadData, x, vocabSize, dim)
 		return logits
 	}
 

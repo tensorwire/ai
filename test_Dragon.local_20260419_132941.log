@@ -1,0 +1,56 @@
+  build...
+  vet...
+  smoke: --help
+tesseract — GPU compute for Go. Zero Python.
+
+Commands:
+  pull <model>            Download model from HuggingFace
+  models                  List downloaded models
+  info <model>            Show model architecture
+  bench                   Benchmark your GPU
+  gpus                    Detect all GPUs and calibrate
+  train                   Train a model
+  finetune <model> <data> Fine-tune a model
+  quantize <model> [q8|q4] Quantize model weights
+  resume <ckpt-dir> <data> Resume training from checkpoint
+  merge <model> <adapters> Merge LoRA adapters into base model
+  serve <model>           OpenAI-compatible API server
+  benchmark <model>       Profile inference speed + memory
+  convert gguf <model>    Convert safetensors → GGUF (for Ollama)
+  infer <model> "prompt"   Generate text
+
+Global Flags (before command):
+  --device <dev>     Target: auto, cuda, metal, cpu (default: auto)
+  --precision <mode> Compute: auto, fp32, fp16, int8 (default: auto)
+  --out <dir>        Output directory for all artifacts
+  --verbose          Show detailed logs
+  --helix            Enable helix DNA optimizer
+  --needle           Enable needle INT8 kernels
+
+Examples:
+  tesseract pull Qwen/Qwen2.5-14B
+  tesseract bench
+  tesseract infer qwen2-0.5b "The meaning of life is"
+  tesseract quantize qwen2.5-14b q8
+  tesseract serve qwen2.5-14b
+  smoke: --version
+tesseract v1.0.0 — powered by mongoose
+  smoke: bench
+Tesseract GPU Benchmark
+
+2026/04/19 13:29:50 [mongoose] Metal initialized: Apple M1 Pro (compute kernels ready)
+Engine: metal/Apple M1 Pro
+  512x512: 449.9 GFLOPS (0.6 ms/iter)
+  1024x1024: 1508.1 GFLOPS (1.4 ms/iter)
+  2048x2048: 2537.9 GFLOPS (6.8 ms/iter)
+  smoke: gpus
+Detected compute backends:
+
+  CPU:  cpu (1.6 GFLOPS)
+
+══════════════════════════════════════════════
+SUMMARY (Dragon.local)
+  Passed: 6
+  Failed: 0
+  Log:    test_Dragon.local_20260419_132941.log
+══════════════════════════════════════════════
