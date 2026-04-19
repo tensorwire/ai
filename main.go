@@ -49,6 +49,8 @@ func main() {
 		cmdTrain()
 	case "train-cuda":
 		cmdTrainCUDA()
+	case "train-any":
+		cmdTrainAny()
 	case "finetune":
 		cmdFinetune()
 	case "quantize":

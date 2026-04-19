@@ -71,8 +71,12 @@ func zeroSlice(s []float32) {
 }
 
 
-// selectEngine initializes the GPU backend.
-func selectEngine(backend string) mongoose.Engine {
+// selectEngine initializes the compute backend based on GlobalDevice flag.
+func selectEngine(hint string) mongoose.Engine {
+	backend := GlobalDevice
+	if backend == "" || backend == "auto" {
+		backend = hint
+	}
 	switch backend {
 	case "metal":
 		if runtime.GOOS != "darwin" {
@@ -89,14 +93,14 @@ func selectEngine(backend string) mongoose.Engine {
 			log.Fatal("CUDA GPU not available")
 		}
 		return c
+	case "cpu":
+		return &mongoose.CPU{}
 	default:
-		// Auto-detect
 		if runtime.GOOS == "darwin" {
 			if m := mongoose.NewMetal(); m != nil { return m }
 		}
 		if c := mongoose.NewCUDA(); c != nil { return c }
-		log.Fatal("No GPU backend available")
-		return nil
+		return &mongoose.CPU{}
 	}
 }
 
