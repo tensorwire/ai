@@ -591,3 +591,20 @@ func sampleTopK(logits []float32, temp float32, topK int) int {
 	return topItems[0].idx
 }
 
+
+func applyRoPESingle(x []float32, pos, headDim, numHeads int, theta float64) {
+	half := headDim / 2
+	for h := 0; h < numHeads; h++ {
+		base := h * headDim
+		for i := 0; i < half; i++ {
+			freq := 1.0 / math.Pow(theta, float64(2*i)/float64(headDim))
+			angle := float64(pos) * freq
+			cos := float32(math.Cos(angle))
+			sin := float32(math.Sin(angle))
+			x0 := x[base+i]
+			x1 := x[base+half+i]
+			x[base+i] = x0*cos - x1*sin
+			x[base+half+i] = x0*sin + x1*cos
+		}
+	}
+}
