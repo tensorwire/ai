@@ -192,21 +192,7 @@ func cmdTrain() {
 	fmt.Printf("Model saved to: %s\n", *saveDir)
 }
 
-func cmdFinetune() {
-	fmt.Println("tesseract finetune — fine-tune an existing model")
-	fmt.Println()
-	fmt.Println("Uses helix DNA optimizer for forward-only training. Optional needle INT8 kernels")
-	fmt.Println("for training INT8 weights directly (no LoRA, no full-precision copies).")
-	fmt.Println()
-	fmt.Println("Usage: tesseract finetune <model> <data> [flags]")
-	fmt.Println()
-	fmt.Println("Flags:")
-	fmt.Println("  --helix             Enable helix DNA optimizer (recommended)")
-	fmt.Println("  --needle            Enable needle INT8 kernels (maximum performance)")
-	fmt.Println("  --lr <float>        Learning rate (default: 1e-4)")
-	fmt.Println("  --steps <int>       Fine-tuning steps (default: 500)")
-	fmt.Fprintln(os.Stderr, "\nNot yet wired — helix fine-tuning dispatch needs connection to CLI flags")
-}
+// cmdFinetune is in train_finetune.go
 
 func cmdResume() {
 	fmt.Println("tesseract resume — resume training from checkpoint")
