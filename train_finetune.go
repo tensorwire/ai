@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/open-ai-org/gguf"
+	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
 )
 
@@ -108,6 +109,10 @@ func cmdFinetune() {
 		}
 	}
 
+	// Helix — CPU computes rung, GPU kernel applies DNA-coupled update
+	hlx := helix.NewHelixOptimizer(lr, 0.9, 0.95, 1e-8, 0.1)
+
+	// GPU Adam state for all weights
 	type as struct{ m, v *mongoose.Tensor }
 	newAS := func(sz int) as { return as{te.Zeros([]int{sz}), te.Zeros([]int{sz})} }
 	embedAS := newAS(vocabSize * dim)
@@ -188,31 +193,11 @@ func cmdFinetune() {
 	data := make([]int, len(raw))
 	for i, b := range raw { data[i] = int(b) }
 
-	totalSteps := *stepsFlag
-	warmupSteps := totalSteps / 10
-	if warmupSteps < 5 { warmupSteps = 5 }
-	minLR := lr / 10.0
-
-	getLR := func(step int) float32 {
-		if step < warmupSteps {
-			return lr * float32(step) / float32(warmupSteps)
-		}
-		progress := float64(step-warmupSteps) / float64(totalSteps-warmupSteps)
-		cosine := 0.5 * (1.0 + math.Cos(math.Pi*progress))
-		return minLR + float32(cosine)*float32(lr-minLR)
-	}
-
-	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		stepLR := getLR(step)
-		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			stepLR, 0.1, step, param.Size)
-	}
-
 	zero := func(t *mongoose.Tensor) {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
-	fmt.Println("tesseract finetune — FP32 backward + AdamW")
+	fmt.Println("tesseract finetune — FP32 backward + Helix DNA optimizer")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  model:    %s\n", *modelPath)
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
@@ -291,20 +276,17 @@ func cmdFinetune() {
 		mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
 			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
 
+		// Always read loss — helix immune system needs it every step
+		cuda.Sync()
 		var stepLoss float32
-		if step <= 3 || step%*logEvery == 0 {
-			cuda.Sync()
-			lossH := te.ToHost(lossesGPU)
-			for _, l := range lossH { stepLoss += l }
-			stepLoss /= float32(n)
-		}
+		lossH := te.ToHost(lossesGPU)
+		for _, l := range lossH { stepLoss += l }
+		stepLoss /= float32(n)
 
-		// === BACKWARD ===
-		// lm_head gradient (untied)
+		// === BACKWARD (GPU) ===
 		cuda.MatMulTransposeATInto(dLmHead, gradGPU, normedFinal, n, vocabSize, dim)
 		cuda.MatMulTInto(dHidden, gradGPU, lmHead, n, vocabSize, dim)
 
-		// Final RMSNorm backward
 		dScratch := te.Zeros([]int{n, dim})
 		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
@@ -317,7 +299,6 @@ func cmdFinetune() {
 
 			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
 			cuda.MatMulTransposeATInto(b.dWDown, dHidden, b.ffnMid, n, dim, ffnDim)
-			adamW(l.down, b.dWDown, layAS[li].down.m, layAS[li].down.v, step)
 
 			zero(b.dGate); zero(b.dUp)
 			mongoose.KSiLUGateBackward(b.dFfnMid.DevicePtr(), b.gatePre.DevicePtr(),
@@ -329,8 +310,6 @@ func cmdFinetune() {
 
 			cuda.MatMulTransposeATInto(b.dWGate, b.dGate, b.normed2, n, ffnDim, dim)
 			cuda.MatMulTransposeATInto(b.dWUp, b.dUp, b.normed2, n, ffnDim, dim)
-			adamW(l.gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v, step)
-			adamW(l.up, b.dWUp, layAS[li].up.m, layAS[li].up.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
@@ -339,7 +318,6 @@ func cmdFinetune() {
 
 			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWO, dHidden, b.attnOut, n, dim, dim)
-			adamW(l.wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v, step)
 
 			zero(b.dQ); zero(b.dK); zero(b.dV)
 			mongoose.KCausalAttentionBackward(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.dAttnOut.DevicePtr(),
@@ -356,9 +334,6 @@ func cmdFinetune() {
 			cuda.MatMulTransposeATInto(b.dWQ, b.dQ, b.normed, n, dim, dim)
 			cuda.MatMulTransposeATInto(b.dWK, b.dK, b.normed, n, kvDim, dim)
 			cuda.MatMulTransposeATInto(b.dWV, b.dV, b.normed, n, kvDim, dim)
-			adamW(l.wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v, step)
-			adamW(l.wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, step)
-			adamW(l.wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v, step)
 
 			zero(b.dx)
 			mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
@@ -366,13 +341,53 @@ func cmdFinetune() {
 			te.AddInPlace(dHidden, b.dx)
 		}
 
-		adamW(lmHead, dLmHead, lmHeadAS.m, lmHeadAS.v, step)
-		adamW(embed, dLmHead, embedAS.m, embedAS.v, step)
+		// === HELIX OPTIMIZER — CPU computes rung, GPU applies ===
+		// Advance helix phase, get rung coefficients
+		hlx.Step(step, stepLoss, lr)
+		r := hlx.CurrentRung()
+		beta1 := float32(0.9)
+		beta2 := float32(0.95)
+
+		// DNA-coupled updates for paired weights (gate↔up, wq↔wk)
+		dnaStep := func(w1, g1, m1, v1, w2, g2, m2, v2 *mongoose.Tensor, bs float32) {
+			mongoose.KHelixDNAStep(
+				w1.DevicePtr(), w2.DevicePtr(), g1.DevicePtr(), g2.DevicePtr(),
+				m1.DevicePtr(), m2.DevicePtr(), v1.DevicePtr(), v2.DevicePtr(),
+				lr, beta1, beta2, step, 1e-8, 0.1,
+				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+				bs, w1.Size,
+			)
+		}
+		// Singles use standard AdamW
+		adamW := func(param, grad, mS, vS *mongoose.Tensor) {
+			mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
+				lr, 0.1, step, param.Size)
+		}
+
+		for li := range lays {
+			b := &bufs[li]
+			// gate↔up: G↔C bond (3 H-bonds) — same size, safe to pair
+			dnaStep(lays[li].gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v,
+				lays[li].up, b.dWUp, layAS[li].up.m, layAS[li].up.v, 3.0/5.0)
+			// wq↔wk: only pair if same size (MHA), otherwise singles (GQA)
+			if lays[li].wq.Size == lays[li].wk.Size {
+				dnaStep(lays[li].wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v,
+					lays[li].wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, 2.0/5.0)
+			} else {
+				adamW(lays[li].wq, b.dWQ, layAS[li].wq.m, layAS[li].wq.v)
+				adamW(lays[li].wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v)
+			}
+			adamW(lays[li].wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v)
+			adamW(lays[li].wo, b.dWO, layAS[li].wo.m, layAS[li].wo.v)
+			adamW(lays[li].down, b.dWDown, layAS[li].down.m, layAS[li].down.v)
+		}
+		adamW(lmHead, dLmHead, lmHeadAS.m, lmHeadAS.v)
+		adamW(embed, dLmHead, embedAS.m, embedAS.v)
 
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, stepLoss, getLR(step), elapsed.Seconds(), float64(step)/elapsed.Seconds())
+				step, *stepsFlag, stepLoss, lr, elapsed.Seconds(), float64(step)/elapsed.Seconds())
 		}
 	}
 
