@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 )
 
 // cmdDataset handles dataset subcommands.
@@ -24,8 +29,37 @@ func cmdDataset(args map[string]string) {
 			os.Exit(1)
 		}
 		datasetInspect(file)
+	case "split":
+		if file == "" {
+			fmt.Fprintln(os.Stderr, "Usage: ai dataset split <file> [--train 0.8] [--val 0.1] [--test 0.1] [--seed 42]")
+			os.Exit(1)
+		}
+		trainRatio := 0.8
+		valRatio := 0.1
+		seed := int64(42)
+		if v, ok := args["train"]; ok { fmt.Sscanf(v, "%f", &trainRatio) }
+		if v, ok := args["val"]; ok { fmt.Sscanf(v, "%f", &valRatio) }
+		if v, ok := args["seed"]; ok { fmt.Sscanf(v, "%d", &seed) }
+		testRatio := 1.0 - trainRatio - valRatio
+		datasetSplit(file, trainRatio, valRatio, testRatio, seed)
+	case "augment":
+		if file == "" {
+			fmt.Fprintln(os.Stderr, "Usage: ai dataset augment <file> [--output <file>] [--repeat N] [--shuffle] [--lowercase] [--dedup]")
+			os.Exit(1)
+		}
+		output := args["output"]
+		if output == "" { output = args["_2"] }
+		repeat := 1
+		if v, ok := args["repeat"]; ok { fmt.Sscanf(v, "%d", &repeat) }
+		_, doShuffle := args["shuffle"]
+		_, doLower := args["lowercase"]
+		_, doDedup := args["dedup"]
+		datasetAugment(file, output, repeat, doShuffle, doLower, doDedup)
 	default:
-		fmt.Fprintln(os.Stderr, "Usage: ai dataset inspect <file>")
+		fmt.Fprintln(os.Stderr, "Usage:")
+		fmt.Fprintln(os.Stderr, "  ai dataset inspect <file>              Preview dataset statistics")
+		fmt.Fprintln(os.Stderr, "  ai dataset split <file> [--train 0.8]  Split into train/val/test")
+		fmt.Fprintln(os.Stderr, "  ai dataset augment <file> [flags]      Apply transforms")
 		os.Exit(1)
 	}
 }

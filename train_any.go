@@ -136,7 +136,7 @@ func cmdTrainAny() {
 			dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("tesseract train-any — universal Engine path")
+	fmt.Println("ai train-any — universal Engine path")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",

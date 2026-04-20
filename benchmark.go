@@ -13,7 +13,7 @@ import (
 	"github.com/open-ai-org/mongoose"
 )
 
-// cmdBenchmark: mongoose benchmark <model> [flags]
+// cmdBenchmark: ai benchmark <model> [flags]
 //
 // Measures real inference performance on an actual model:
 //   - Tokens/second at different generation lengths
@@ -25,12 +25,12 @@ import (
 // `benchmark` answers: "how fast will this model run in production?"
 //
 // Example:
-//   mongoose benchmark qwen2-0.5b
-//   mongoose benchmark qwen2.5-14b --tokens 100
-//   mongoose benchmark qwen2-0.5b --profile   # per-layer timing
+//   ai benchmark qwen2-0.5b
+//   ai benchmark qwen2.5-14b --tokens 100
+//   ai benchmark qwen2-0.5b --profile   # per-layer timing
 func cmdBenchmark() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: mongoose benchmark <model> [flags]")
+		fmt.Fprintln(os.Stderr, "Usage: ai benchmark <model> [flags]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Measures inference throughput, latency, and memory.")
 		fmt.Fprintln(os.Stderr, "")
@@ -85,7 +85,7 @@ func cmdBenchmark() {
 		}
 	}
 
-	fmt.Println("mongoose benchmark")
+	fmt.Println("ai benchmark")
 	fmt.Printf("  model:   %s\n", modelDir)
 	fmt.Printf("  arch:    dim=%d layers=%d vocab=%d\n", dim, layers, vocabSize)
 	if nParams > 0 {
@@ -125,7 +125,7 @@ func cmdBenchmark() {
 				fmt.Println("  WARNING: Model does not fit in GPU VRAM at any precision")
 				fmt.Println("  Consider: layer streaming, CPU offload, or a larger GPU")
 			} else if !fp32Fits && !fp16Fits {
-				fmt.Println("  RECOMMENDATION: Use INT8 quantization (mongoose quantize <model> q8)")
+				fmt.Println("  RECOMMENDATION: Use INT8 quantization (ai quantize <model> q8)")
 			} else if !fp32Fits {
 				fmt.Println("  RECOMMENDATION: Use FP16 precision for inference")
 			}

@@ -10,18 +10,18 @@ import (
 	"github.com/open-ai-org/gguf"
 )
 
-// cmdQuantize: mongoose quantize <model> [q8|q4|f16]
+// cmdQuantize: ai quantize <model> [q8|q4|f16]
 //
 // Quantizes a safetensors model to GGUF format for deployment.
 // Weight matrices get quantized, norms/biases/embeddings stay FP32.
 //
 // Example:
-//   mongoose quantize qwen2.5-14b q8       → qwen2.5-14b-q8.gguf
-//   mongoose quantize qwen2.5-14b q4       → qwen2.5-14b-q4.gguf
-//   mongoose quantize ./my-model f16       → my-model-f16.gguf
+//   ai quantize qwen2.5-14b q8       → qwen2.5-14b-q8.gguf
+//   ai quantize qwen2.5-14b q4       → qwen2.5-14b-q4.gguf
+//   ai quantize ./my-model f16       → my-model-f16.gguf
 func cmdQuantize() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: mongoose quantize <model> [q8|q4|f16|f32]")
+		fmt.Fprintln(os.Stderr, "Usage: ai quantize <model> [q8|q4|f16|f32]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "  Converts HuggingFace safetensors → GGUF with quantization.")
 		fmt.Fprintln(os.Stderr, "  Default: q8 (INT8, ~1 byte/param)")
@@ -77,7 +77,7 @@ func cmdQuantize() {
 		}
 	}
 
-	fmt.Printf("mongoose quantize\n")
+	fmt.Printf("ai quantize\n")
 	fmt.Printf("  model:  %s\n", modelDir)
 	fmt.Printf("  params: %s\n", formatParams(int(totalParams)))
 	fmt.Printf("  source: %.1f GB (%s)\n", float64(sourceBytes)/(1024*1024*1024), st.TensorNames[0])

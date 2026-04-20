@@ -11,7 +11,7 @@
 //   GET  /health                — liveness probe
 //
 // Usage:
-//   mongoose serve [--host 0.0.0.0] [--port 11434] [--model <name>]
+//   ai serve [--host 0.0.0.0] [--port 11434] [--model <name>]
 
 package main
 
@@ -900,7 +900,7 @@ func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"model_loaded": modelLoaded,
 		"model":        modelName,
 		"gpu":          hasGPU,
-		"version":      "mongoose v1.0.0",
+		"version":      "ai v1.0.0",
 	}
 
 	w.Header().Set("Content-Type", "application/json")

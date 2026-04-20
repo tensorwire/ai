@@ -33,7 +33,7 @@ func cmdConvert(format string, args []string) {
 		log.Fatalf("Unknown format: %s (supported: gguf)", format)
 	}
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: mongoose convert gguf <model-dir> [output.gguf] [--quant f32|q8_0|q4_0]")
+		fmt.Fprintln(os.Stderr, "Usage: ai convert gguf <model-dir> [output.gguf] [--quant f32|q8_0|q4_0]")
 		os.Exit(1)
 	}
 
@@ -67,7 +67,7 @@ func cmdPull(model string) {
 	// model can be "org/name" (HuggingFace) or just "name" (search local)
 	if !strings.Contains(model, "/") {
 		fmt.Fprintf(os.Stderr, "Please specify full HuggingFace model: org/name\n")
-		fmt.Fprintf(os.Stderr, "  e.g. mongoose pull SparseLLM/ReluLLaMA-7B\n")
+		fmt.Fprintf(os.Stderr, "  e.g. ai pull SparseLLM/ReluLLaMA-7B\n")
 		os.Exit(1)
 	}
 
@@ -134,7 +134,7 @@ func cmdPull(model string) {
 		}
 	}
 
-	fmt.Printf("\nDone. Use: mongoose info %s\n", filepath.Base(model))
+	fmt.Printf("\nDone. Use: ai info %s\n", filepath.Base(model))
 }
 
 func downloadFile(url, dest string) error {
@@ -165,7 +165,7 @@ func cmdModels() {
 	entries, err := os.ReadDir(modelsDir)
 	if err != nil || len(entries) == 0 {
 		fmt.Println("No models downloaded yet.")
-		fmt.Println("  mongoose pull SparseLLM/ReluLLaMA-7B")
+		fmt.Println("  ai pull SparseLLM/ReluLLaMA-7B")
 		return
 	}
 
@@ -251,7 +251,7 @@ func cmdInfo(model string) {
 // === bench ===
 
 func cmdBench() {
-	fmt.Println("Tesseract GPU Benchmark")
+	fmt.Println("ai GPU Benchmark")
 	fmt.Println()
 
 	eng := selectEngine("auto")
@@ -320,15 +320,15 @@ func cmdInfer(model string, args []string) {
 
 func cmdExport(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: mongoose export qdrant <url> <collection> [output.jsonl]")
-		fmt.Fprintln(os.Stderr, "       mongoose export npy <input.npy> <output.jsonl>")
+		fmt.Fprintln(os.Stderr, "Usage: ai export qdrant <url> <collection> [output.jsonl]")
+		fmt.Fprintln(os.Stderr, "       ai export npy <input.npy> <output.jsonl>")
 		os.Exit(1)
 	}
 
 	switch args[0] {
 	case "qdrant":
 		if len(args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: mongoose export qdrant <url> <collection> [output.jsonl]")
+			fmt.Fprintln(os.Stderr, "Usage: ai export qdrant <url> <collection> [output.jsonl]")
 			os.Exit(1)
 		}
 		qdrantURL := args[1]
@@ -341,7 +341,7 @@ func cmdExport(args []string) {
 
 	case "npy":
 		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "Usage: mongoose export npy <input.npy> [output.jsonl]")
+			fmt.Fprintln(os.Stderr, "Usage: ai export npy <input.npy> [output.jsonl]")
 			os.Exit(1)
 		}
 		input := args[1]
