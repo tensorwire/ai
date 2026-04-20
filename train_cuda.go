@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/mongoose"
 )
 
@@ -46,7 +47,7 @@ func cmdTrainCUDA() {
 	if !mongoose.LoadKernels() {
 		log.Fatal("CUDA kernels required — compile kernels/mongoose.cu")
 	}
-	log.Println("[tesseract] CUDA kernels loaded")
+	log.Println("[ai] CUDA kernels loaded")
 
 	sched := mongoose.NewScheduler(eng)
 	_ = sched
@@ -134,6 +135,7 @@ func cmdTrainCUDA() {
 	finalScales := te.Zeros([]int{n})
 	dEmbed := te.Zeros([]int{vocabSize, dim})
 	dHidden := te.Zeros([]int{n, dim})
+	dScratch := te.Zeros([]int{n, dim})
 
 	type fwdBuf struct {
 		xIn, normed, Q, K, V, attnOut          *mongoose.Tensor
@@ -171,7 +173,7 @@ func cmdTrainCUDA() {
 		nParams += dim + dim*dim + kvDim*dim*2 + dim*dim + dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("tesseract train-cuda — zero-alloc GPU kernels + AdamW")
+	fmt.Println("ai train — zero-alloc GPU kernels + AdamW")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
@@ -341,30 +343,16 @@ func cmdTrainCUDA() {
 		cuda.MatMulTransposeATInto(dEmbed, gradGPU, normedFinal, n, vocabSize, dim)
 		cuda.MatMulTInto(dHidden, gradGPU, embed, n, vocabSize, dim)
 
-		// RMSNorm backward — CPU reference
-		{
-			cuda.Sync()
-			dOH := te.ToHost(dHidden); xH := te.ToHost(hidden)
-			wH := te.ToHost(finalNorm); sH := te.ToHost(finalScales)
-			dxH := make([]float32, n*dim)
-			for row := 0; row < n; row++ {
-				sc := sH[row]
-				var dot float32
-				for i := 0; i < dim; i++ { dot += dOH[row*dim+i] * wH[i] * xH[row*dim+i] }
-				coeff := sc * sc * sc * dot / float32(dim)
-				for i := 0; i < dim; i++ {
-					dxH[row*dim+i] = (dOH[row*dim+i]*wH[i] - xH[row*dim+i]*coeff) * sc
-				}
-			}
-			tmp := te.FromHost(dxH, []int{n, dim}); cuda.CopyInto(dHidden, tmp); te.Release(tmp)
-		}
+		zero(dScratch)
+		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
+			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
+		cuda.CopyInto(dHidden, dScratch)
 
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
 			b := &bufs[li]
 
 			cuda.MatMulTInto(b.dFfnMid, dHidden, l.down, n, dim, ffnDim)
-
 			cuda.MatMulTransposeATInto(b.dWDown, dHidden, b.ffnMid, n, dim, ffnDim)
 			adamW(l.down, b.dWDown, layAS[li].down.m, layAS[li].down.v, step)
 
@@ -381,23 +369,9 @@ func cmdTrainCUDA() {
 			adamW(l.gate, b.dWGate, layAS[li].gate.m, layAS[li].gate.v, step)
 			adamW(l.up, b.dWUp, layAS[li].up.m, layAS[li].up.v, step)
 
-			// RMSNorm2 backward — CPU
-			{
-				cuda.Sync()
-				dOH := te.ToHost(b.dN2); xH := te.ToHost(b.xMid)
-				wH := te.ToHost(l.norm2); sH := te.ToHost(b.rmsScale2)
-				dxH := make([]float32, n*dim)
-				for row := 0; row < n; row++ {
-					sc := sH[row]
-					var dot float32
-					for i := 0; i < dim; i++ { dot += dOH[row*dim+i] * wH[i] * xH[row*dim+i] }
-					coeff := sc * sc * sc * dot / float32(dim)
-					for i := 0; i < dim; i++ {
-						dxH[row*dim+i] = (dOH[row*dim+i]*wH[i] - xH[row*dim+i]*coeff) * sc
-					}
-				}
-				tmp := te.FromHost(dxH, []int{n, dim}); cuda.CopyInto(b.dx, tmp); te.Release(tmp)
-			}
+			zero(b.dx)
+			mongoose.KRMSNormBackward(b.dN2.DevicePtr(), b.xMid.DevicePtr(),
+				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), b.dx.DevicePtr(), n, dim)
 			te.AddInPlace(dHidden, b.dx)
 
 			cuda.MatMulTInto(b.dAttnOut, dHidden, l.wo, n, dim, dim)
@@ -423,23 +397,9 @@ func cmdTrainCUDA() {
 			adamW(l.wk, b.dWK, layAS[li].wk.m, layAS[li].wk.v, step)
 			adamW(l.wv, b.dWV, layAS[li].wv.m, layAS[li].wv.v, step)
 
-			// RMSNorm1 backward — CPU
-			{
-				cuda.Sync()
-				dOH := te.ToHost(b.dN1); xH := te.ToHost(b.xIn)
-				wH := te.ToHost(l.norm1); sH := te.ToHost(b.rmsScale1)
-				dxH := make([]float32, n*dim)
-				for row := 0; row < n; row++ {
-					sc := sH[row]
-					var dot float32
-					for i := 0; i < dim; i++ { dot += dOH[row*dim+i] * wH[i] * xH[row*dim+i] }
-					coeff := sc * sc * sc * dot / float32(dim)
-					for i := 0; i < dim; i++ {
-						dxH[row*dim+i] = (dOH[row*dim+i]*wH[i] - xH[row*dim+i]*coeff) * sc
-					}
-				}
-				tmp := te.FromHost(dxH, []int{n, dim}); cuda.CopyInto(b.dx, tmp); te.Release(tmp)
-			}
+			zero(b.dx)
+			mongoose.KRMSNormBackward(b.dN1.DevicePtr(), b.xIn.DevicePtr(),
+				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), b.dx.DevicePtr(), n, dim)
 			te.AddInPlace(dHidden, b.dx)
 		}
 
@@ -454,4 +414,39 @@ func cmdTrainCUDA() {
 	cuda.Sync()
 	total := time.Since(t0)
 	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)\n", *stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds())
+
+	// Save model
+	saveDir := filepath.Join(os.TempDir(), "ai-train-out")
+	if GlobalOutDir != "" {
+		saveDir = GlobalOutDir
+	}
+	os.MkdirAll(saveDir, 0755)
+
+	tensors := map[string]gguf.SaveTensor{
+		"model.embed_tokens.weight": {Data: te.ToHost(embed), Shape: []int{vocabSize, dim}},
+		"model.norm.weight":         {Data: te.ToHost(finalNorm), Shape: []int{dim}},
+	}
+	for li := range lays {
+		pfx := fmt.Sprintf("model.layers.%d.", li)
+		tensors[pfx+"self_attn.q_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wq), Shape: []int{dim, dim}}
+		tensors[pfx+"self_attn.k_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wk), Shape: []int{kvDim, dim}}
+		tensors[pfx+"self_attn.v_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wv), Shape: []int{kvDim, dim}}
+		tensors[pfx+"self_attn.o_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wo), Shape: []int{dim, dim}}
+		tensors[pfx+"mlp.gate_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].gate), Shape: []int{ffnDim, dim}}
+		tensors[pfx+"mlp.up_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].up), Shape: []int{ffnDim, dim}}
+		tensors[pfx+"mlp.down_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].down), Shape: []int{dim, ffnDim}}
+		tensors[pfx+"input_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm1), Shape: []int{dim}}
+		tensors[pfx+"post_attention_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm2), Shape: []int{dim}}
+	}
+
+	stPath := filepath.Join(saveDir, "model.safetensors")
+	if err := gguf.SaveSafeTensors(stPath, tensors); err != nil {
+		log.Printf("[save] error: %v", err)
+	} else {
+		// Write config.json
+		cfgJSON := fmt.Sprintf(`{"architectures":["LlamaForCausalLM"],"hidden_size":%d,"num_hidden_layers":%d,"num_attention_heads":%d,"num_key_value_heads":%d,"intermediate_size":%d,"vocab_size":%d,"max_position_embeddings":2048,"rope_theta":10000.0,"rms_norm_eps":1e-6,"hidden_act":"silu","tie_word_embeddings":true}`,
+			dim, nLayers, heads, kvHeads, ffnDim, vocabSize)
+		os.WriteFile(filepath.Join(saveDir, "config.json"), []byte(cfgJSON), 0644)
+		fmt.Printf("Model saved to %s\n", saveDir)
+	}
 }

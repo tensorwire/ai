@@ -1,21 +1,19 @@
-// tesseract — GPU compute CLI. Train, infer, quantize, serve.
+// ai — GPU compute CLI. Train, infer, quantize, serve.
 //
 // Usage:
-//   tesseract pull <model>              Download a model from HuggingFace
-//   tesseract models                    List downloaded models
-//   tesseract info <model>              Show model architecture
-//   tesseract bench                     Benchmark your GPU
-//   tesseract gpus                      Detect GPUs and calibrate
-//   tesseract train                     Train a model
-//   tesseract infer <model> "prompt"    Generate text
-//   tesseract quantize <model> [q8|q4]  Quantize model weights
-//   tesseract serve <model>             OpenAI-compatible API server
+//   ai train data=file.txt                        Train from scratch
+//   ai train model=TinyLlama data=file.txt        Fine-tune a pretrained model
+//   ai infer model "prompt"                       Generate text
+//   ai pull org/model                             Download from HuggingFace
+//   ai quantize model [q8|q4]                     Quantize model weights
+//   ai serve model                                OpenAI-compatible API server
 
 package main
 
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -26,10 +24,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
+	cmd := os.Args[1]
+	args := parseKV(os.Args[2:])
+
+	switch cmd {
+	case "train":
+		cmdTrainUnified(args)
+	case "eval":
+		cmdEval(args)
+	case "profile":
+		cmdProfile(args)
+	case "dataset":
+		cmdDataset(args)
+	case "checkpoint":
+		cmdCheckpoint(args)
 	case "pull":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: tesseract pull <model>")
+			fmt.Fprintln(os.Stderr, "Usage: ai pull <org/model>")
 			os.Exit(1)
 		}
 		cmdPull(os.Args[2])
@@ -37,92 +48,105 @@ func main() {
 		cmdModels()
 	case "info":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: tesseract info <model>")
+			fmt.Fprintln(os.Stderr, "Usage: ai info <model>")
 			os.Exit(1)
 		}
 		cmdInfo(os.Args[2])
+	case "infer":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: ai infer <model> \"prompt\"")
+			os.Exit(1)
+		}
+		cmdInferGPU(os.Args[2], os.Args[3:])
+	case "quantize":
+		cmdQuantize()
+	case "serve":
+		cmdServe()
 	case "bench":
 		cmdBench()
 	case "gpus":
 		cmdGPUs()
-	case "train":
-		cmdTrain()
+	case "merge":
+		cmdMerge()
+	case "convert":
+		if len(os.Args) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: ai convert gguf <model-dir> [output.gguf]")
+			os.Exit(1)
+		}
+		cmdConvert(os.Args[2], os.Args[3:])
+	case "benchmark":
+		cmdBenchmark()
+	case "export":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "Usage: ai export qdrant <url> <collection> [output.jsonl]")
+			os.Exit(1)
+		}
+		cmdExport(os.Args[2:])
+	// Hidden aliases for backwards compat
 	case "train-cuda":
 		cmdTrainCUDA()
 	case "train-any":
 		cmdTrainAny()
 	case "finetune":
 		cmdFinetune()
-	case "quantize":
-		cmdQuantize()
-	case "resume":
-		cmdResume()
-	case "merge":
-		cmdMerge()
-	case "serve":
-		cmdServe()
-	case "benchmark":
-		cmdBenchmark()
-	case "convert":
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: tesseract convert gguf <model-dir> [output.gguf]")
-			os.Exit(1)
-		}
-		cmdConvert(os.Args[2], os.Args[3:])
-	case "infer":
-		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "Usage: tesseract infer <model> \"prompt text\"")
-			os.Exit(1)
-		}
-		cmdInfer(os.Args[2], os.Args[3:])
-	case "export":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Usage: tesseract export qdrant <url> <collection> <output.jsonl>")
-			os.Exit(1)
-		}
-		cmdExport(os.Args[2:])
+
 	case "-h", "--help", "help":
 		usage()
 	case "-v", "--version", "version":
-		fmt.Println("tesseract v1.0.0 — powered by mongoose")
+		fmt.Println("ai v0.1.0 — powered by mongoose")
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
 		usage()
 		os.Exit(1)
 	}
 }
 
+// parseKV extracts key=value pairs and positional args from command-line arguments.
+func parseKV(raw []string) map[string]string {
+	m := make(map[string]string)
+	pos := 0
+	for _, arg := range raw {
+		if k, v, ok := strings.Cut(arg, "="); ok {
+			m[k] = v
+		} else {
+			m[fmt.Sprintf("_%d", pos)] = arg
+			pos++
+		}
+	}
+	return m
+}
+
 func usage() {
-	fmt.Println("tesseract — GPU compute for Go. Zero Python.")
+	fmt.Println("ai — GPU-accelerated ML. Zero Python, one binary.")
 	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  pull <model>            Download model from HuggingFace")
-	fmt.Println("  models                  List downloaded models")
-	fmt.Println("  info <model>            Show model architecture")
-	fmt.Println("  bench                   Benchmark your GPU")
-	fmt.Println("  gpus                    Detect all GPUs and calibrate")
-	fmt.Println("  train                   Train a model")
-	fmt.Println("  finetune <model> <data> Fine-tune a model")
-	fmt.Println("  quantize <model> [q8|q4] Quantize model weights")
-	fmt.Println("  resume <ckpt-dir> <data> Resume training from checkpoint")
-	fmt.Println("  merge <model> <adapters> Merge LoRA adapters into base model")
-	fmt.Println("  serve <model>           OpenAI-compatible API server")
-	fmt.Println("  benchmark <model>       Profile inference speed + memory")
-	fmt.Println("  convert gguf <model>    Convert safetensors → GGUF (for Ollama)")
-	fmt.Println("  infer <model> \"prompt\"   Generate text")
+	fmt.Println("Training:")
+	fmt.Println("  ai train data=<file>                       Train from scratch")
+	fmt.Println("  ai train model=<name> data=<file>          Fine-tune pretrained model")
+	fmt.Println("  ai eval model=<name> data=<file>           Validation pass (loss + perplexity)")
 	fmt.Println()
-	fmt.Println("Global Flags (before command):")
-	fmt.Println("  --device <dev>     Target: auto, cuda, metal, cpu (default: auto)")
-	fmt.Println("  --precision <mode> Compute: auto, fp32, fp16, int8 (default: auto)")
-	fmt.Println("  --out <dir>        Output directory for all artifacts")
-	fmt.Println("  --verbose          Show detailed logs")
-	fmt.Println("  --helix            Enable helix DNA optimizer")
-	fmt.Println("  --needle           Enable needle INT8 kernels")
+	fmt.Println("Inference:")
+	fmt.Println("  ai infer <model> \"prompt\"                  Generate text")
+	fmt.Println("  ai serve <model>                           OpenAI-compatible API")
 	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  tesseract pull Qwen/Qwen2.5-14B")
-	fmt.Println("  tesseract bench")
-	fmt.Println("  tesseract infer qwen2-0.5b \"The meaning of life is\"")
-	fmt.Println("  tesseract quantize qwen2.5-14b q8")
-	fmt.Println("  tesseract serve qwen2.5-14b")
+	fmt.Println("Models:")
+	fmt.Println("  ai pull <org/model>                        Download from HuggingFace")
+	fmt.Println("  ai models                                  List downloaded models")
+	fmt.Println("  ai info <model>                            Show model architecture")
+	fmt.Println()
+	fmt.Println("Optimization:")
+	fmt.Println("  ai quantize <model> [q8|q4|f16]            Quantize model weights")
+	fmt.Println("  ai convert gguf <model>                    Convert to GGUF (for Ollama)")
+	fmt.Println("  ai merge <base> <adapters>                 Merge LoRA into base model")
+	fmt.Println()
+	fmt.Println("Analysis:")
+	fmt.Println("  ai profile [dim=N]                         Per-op GPU timing breakdown")
+	fmt.Println("  ai dataset inspect <file>                  Dataset statistics")
+	fmt.Println("  ai checkpoint ls [dir]                     List training checkpoints")
+	fmt.Println("  ai checkpoint diff <a> <b>                 Compare two checkpoints")
+	fmt.Println("  ai bench                                   Raw GPU benchmark")
+	fmt.Println("  ai gpus                                    Detect and calibrate GPUs")
+	fmt.Println("  ai benchmark <model>                       Profile model inference")
+	fmt.Println()
+	fmt.Println("Train overrides:  steps=N  lr=1e-4  dim=512  layers=8  seq=128  log=100")
+	fmt.Println("Global flags:     --device cuda  --verbose")
 }

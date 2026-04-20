@@ -442,23 +442,23 @@ func exportNpy(input, output string) {
 // === helpers ===
 
 func resolveModel(name string) string {
-	// Try as absolute path first
 	if _, err := os.Stat(name); err == nil {
 		return name
 	}
-	// Try in models dir
-	path := filepath.Join(modelsDir, name)
-	if _, err := os.Stat(path); err == nil {
-		return path
+	home, _ := os.UserHomeDir()
+	dirs := []string{
+		modelsDir,
+		filepath.Join(home, ".mongoose", "models"),
 	}
-	// Try with common suffixes
-	for _, suffix := range []string{"", "-hf", "-chat"} {
-		p := filepath.Join(modelsDir, name+suffix)
-		if _, err := os.Stat(p); err == nil {
-			return p
+	for _, dir := range dirs {
+		for _, suffix := range []string{"", "-hf", "-chat"} {
+			p := filepath.Join(dir, name+suffix)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
 		}
 	}
-	log.Fatalf("Model not found: %s\nTry: mongoose pull <org>/%s", name, name)
+	log.Fatalf("Model not found: %s\nTry: ai pull <org>/%s", name, name)
 	return ""
 }
 

@@ -218,7 +218,7 @@ func cmdFinetune() {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
-	fmt.Println("tesseract finetune — FP32 backward + Helix DNA optimizer")
+	fmt.Println("ai train — FP32 backward + Helix DNA optimizer")
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  model:    %s\n", *modelPath)
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
@@ -228,20 +228,23 @@ func cmdFinetune() {
 	fmt.Printf("  training: steps=%d lr=%.0e\n", *stepsFlag, *lrFlag)
 	fmt.Println()
 
+	// Pre-allocate hot-path buffers outside the training loop
+	dScratch := te.Zeros([]int{n, dim})
+	tokF := make([]float32, n)
+	targF := make([]float32, n)
+
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	fmt.Println("Training...")
 	t0 := time.Now()
 
 	for step := 1; step <= *stepsFlag; step++ {
 		start := rng.Intn(len(data) - n - 1)
-		tokF := make([]float32, n)
-		targF := make([]float32, n)
 		for i := 0; i < n; i++ {
 			tokF[i] = math.Float32frombits(uint32(int32(data[start+i])))
 			targF[i] = math.Float32frombits(uint32(int32(data[start+i+1])))
 		}
-		tmpTok := te.FromHost(tokF, []int{n}); cuda.CopyInto(tokGPU, tmpTok); te.Release(tmpTok)
-		tmpTarg := te.FromHost(targF, []int{n}); cuda.CopyInto(targetsGPU, tmpTarg); te.Release(tmpTarg)
+		cuda.UploadInto(tokGPU, tokF)
+		cuda.UploadInto(targetsGPU, targF)
 
 		// === FORWARD ===
 		zero(hidden)
@@ -308,11 +311,10 @@ func cmdFinetune() {
 		cuda.MatMulTransposeATInto(dLmHead, gradGPU, normedFinal, n, vocabSize, dim)
 		cuda.MatMulTInto(dHidden, gradGPU, lmHead, n, vocabSize, dim)
 
-		dScratch := te.Zeros([]int{n, dim})
+		zero(dScratch)
 		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
 		cuda.CopyInto(dHidden, dScratch)
-		te.Release(dScratch)
 
 		for li := nLayers - 1; li >= 0; li-- {
 			l := &lays[li]
@@ -368,7 +370,6 @@ func cmdFinetune() {
 		beta1 := float32(0.9)
 		beta2 := float32(0.95)
 
-		// Needle: update INT8 weights directly + refresh dequant cache
 		needleUpdate := func(nw *needleWeight, gradT *mongoose.Tensor) {
 			mongoose.KHelixNeedle(nw.q8.DataPtr, nw.q8.ScalePtr, gradT.DevicePtr(),
 				nw.mom, nw.vel, nw.mask,
