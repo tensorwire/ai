@@ -29,7 +29,7 @@ func main() {
 
 	switch cmd {
 	case "train":
-		cmdTrainUnified(args)
+		cmdTrain()
 	case "eval":
 		cmdEval(args)
 	case "profile":
@@ -105,6 +105,8 @@ func main() {
 	// Hidden aliases for backwards compat
 	case "train-cuda":
 		cmdTrainCUDA()
+	case "train-metal":
+		cmdTrainMetal()
 	case "train-any":
 		cmdTrainAny()
 

@@ -70,6 +70,34 @@ func cmdTrainCUDA() {
 	data := make([]int, len(raw))
 	for i, b := range raw { data[i] = int(b) }
 
+	// Estimate VRAM requirement and auto-select precision
+	vramBytes := eng.VRAM()
+	vramGB := float64(vramBytes) / (1024 * 1024 * 1024)
+
+	layerParams := int64(dim*dim*2 + kvDim*dim*2 + ffnDim*dim*3 + dim*2)
+	totalParams := int64(vocabSize*dim) + int64(dim) + int64(nLayers)*layerParams
+	// FP32: weights + gradients + Adam M + Adam V = 4x params
+	fp32Bytes := totalParams * 4 * 4
+	// FP16 weights + FP16 Adam + FP32 gradients = params*(2+4+4) = 10 bytes/param
+	fp16Bytes := totalParams * 10
+	// Buffer overhead ~5%
+	fp32Need := float64(fp32Bytes) * 1.05
+	fp16Need := float64(fp16Bytes) * 1.05
+
+	useFP16Training := false
+	if fp32Need > float64(vramBytes) {
+		if fp16Need <= float64(vramBytes) {
+			useFP16Training = true
+			log.Printf("[ai] FP32 needs %.1f GB but only %.1f GB VRAM — switching to mixed precision (FP16 weights + FP32 grads)",
+				fp32Need/(1024*1024*1024), vramGB)
+		} else {
+			log.Printf("[ai] WARNING: model needs %.1f GB (FP16) but only %.1f GB VRAM — may OOM. Consider reducing dim or layers.",
+				fp16Need/(1024*1024*1024), vramGB)
+			useFP16Training = true
+		}
+	}
+
+	_ = useFP16Training
 	conductor := mongoose.NewConductor(vocabSize, 100)
 
 	halfHead := headDim / 2

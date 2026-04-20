@@ -1,4 +1,4 @@
-//go:build ignore
+//go:build darwin && cgo
 
 package main
 
@@ -109,17 +109,41 @@ func cmdTrainMetal() {
 		}
 	}
 
-	// AdamW state
-	type as struct{ m, v *mongoose.Tensor }
-	newAS := func(sz int) as { return as{te.Zeros([]int{sz}), te.Zeros([]int{sz})} }
-	embedAS := newAS(vocabSize * dim)
-	type layerAS struct{ wq, wk, wv, wo, gate, up, down as }
-	layAS := make([]layerAS, nLayers)
-	for l := range layAS {
-		layAS[l] = layerAS{
-			wq: newAS(dim * dim), wk: newAS(kvDim * dim), wv: newAS(kvDim * dim),
-			wo: newAS(dim * dim), gate: newAS(ffnDim * dim), up: newAS(ffnDim * dim),
-			down: newAS(dim * ffnDim),
+	// Warm cache: single unified-memory buffer for all optimizer state.
+	// Helix reads/writes m/v via CPU slices; GPU kernel reads/writes at byte offsets.
+	// Model weights are the ONLY persistent GPU allocation beyond this.
+	perLayerMV := 2 * (dim*dim + kvDim*dim + kvDim*dim + dim*dim + ffnDim*dim + ffnDim*dim + dim*ffnDim)
+	totalMV := nLayers*perLayerMV + 2*(vocabSize*dim)
+	warmCache := mtl.NewWarmCache(totalMV)
+
+	type mvOff struct{ m, v, n int }
+	cursor := 0
+	alloc := func(sz int) mvOff {
+		off := mvOff{m: cursor, v: cursor + sz, n: sz}
+		cursor += 2 * sz
+		return off
+	}
+
+	embedMV := alloc(vocabSize * dim)
+	type layerMV struct{ wq, wk, wv, wo, gate, up, down mvOff }
+	layMV := make([]layerMV, nLayers)
+	for l := range layMV {
+		layMV[l] = layerMV{
+			wq: alloc(dim * dim), wk: alloc(kvDim * dim), wv: alloc(kvDim * dim),
+			wo: alloc(dim * dim), gate: alloc(ffnDim * dim), up: alloc(ffnDim * dim),
+			down: alloc(dim * ffnDim),
+		}
+	}
+
+	// Build HelixParams backed by unified memory — data/grad from Tensor shared
+	// pointers, m/v from warm cache slices. helix.SimpleHelixParam wraps raw slices.
+	makeParam := func(w, g *mongoose.Tensor, mv mvOff) *helix.SimpleHelixParam {
+		return &helix.SimpleHelixParam{
+			D: mtl.SharedSlice(w),
+			G: mtl.SharedSlice(g),
+			M: warmCache.Slice(mv.m, mv.n),
+			V: warmCache.Slice(mv.v, mv.n),
+			N: mv.n,
 		}
 	}
 
@@ -128,7 +152,7 @@ func cmdTrainMetal() {
 	tokGPU := te.Zeros([]int{n})
 	targetsGPU := te.Zeros([]int{n})
 	logitsBuf := te.Zeros([]int{n, vocabSize})
-	lossesGPU := te.Zeros([]int{n})
+	lossesGPU := te.Zeros([]int{n}); _ = lossesGPU
 	gradGPU := te.Zeros([]int{n, vocabSize})
 	normedFinal := te.Zeros([]int{n, dim})
 	finalScales := te.Zeros([]int{n})
@@ -186,7 +210,28 @@ func cmdTrainMetal() {
 		fmt.Printf("  params:   %.1fK\n", float64(nParams)/1e3)
 	}
 	fmt.Printf("  training: steps=%d lr=%.0e\n", *stepsFlag, *lrFlag)
+	fmt.Printf("  memory:   model only — warm cache %d floats (%.1f KB)\n", totalMV, float64(totalMV*4)/1024)
 	fmt.Println()
+
+	// Register helix pairs/singles with warm cache-backed HelixParams.
+	// Gradient tensors (bufs[li].dW*) are now allocated, so we can build shared slices.
+	for li := range lays {
+		l := &lays[li]
+		b := &bufs[li]
+		mv := &layMV[li]
+
+		hlx.PairGC(makeParam(l.gate, b.dWGate, mv.gate), makeParam(l.up, b.dWUp, mv.up))
+		if l.wq.Size == l.wk.Size {
+			hlx.PairAT(makeParam(l.wq, b.dWQ, mv.wq), makeParam(l.wk, b.dWK, mv.wk))
+		} else {
+			hlx.Register(makeParam(l.wq, b.dWQ, mv.wq))
+			hlx.Register(makeParam(l.wk, b.dWK, mv.wk))
+		}
+		hlx.Register(makeParam(l.wv, b.dWV, mv.wv))
+		hlx.Register(makeParam(l.wo, b.dWO, mv.wo))
+		hlx.Register(makeParam(l.down, b.dWDown, mv.down))
+	}
+	hlx.Register(makeParam(embed, dEmbed, embedMV))
 
 	// LR schedule
 	totalSteps := *stepsFlag
@@ -202,9 +247,6 @@ func cmdTrainMetal() {
 	}
 
 	var curLR float32
-	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
-		mtl.AdamWT(param, grad, mS, vS, curLR, 0.1, step)
-	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -293,9 +335,7 @@ func cmdTrainMetal() {
 						idx += cols
 					}
 				}
-				tmp := te.FromHost(wH, proj.w.Shape)
-				mtl.FusedCopy(proj.w, tmp, proj.w.Size)
-				te.Release(tmp)
+				mtl.UploadInto(proj.w, wH)
 			}
 		}
 	}
@@ -372,10 +412,8 @@ func cmdTrainMetal() {
 			}
 		}
 
-		// Upload gradient to GPU
-		tmp := te.FromHost(gradH, []int{n, vocabSize})
-		mtl.FusedCopy(gradGPU, tmp, n*vocabSize)
-		te.Release(tmp)
+		// Upload gradient to GPU — direct memcpy to shared memory, no command buffer needed
+		mtl.UploadInto(gradGPU, gradH)
 
 		return totalLoss / float32(n)
 	}
@@ -392,12 +430,8 @@ func cmdTrainMetal() {
 			tokF[i] = math.Float32frombits(uint32(int32(data[start+i])))
 			targF[i] = math.Float32frombits(uint32(int32(data[start+i+1])))
 		}
-		tmpTok := te.FromHost(tokF, []int{n})
-		mtl.FusedCopy(tokGPU, tmpTok, n)
-		te.Release(tmpTok)
-		tmpTarg := te.FromHost(targF, []int{n})
-		mtl.FusedCopy(targetsGPU, tmpTarg, n)
-		te.Release(tmpTarg)
+		mtl.UploadInto(tokGPU, tokF)
+		mtl.UploadInto(targetsGPU, targF)
 
 		tokIDs := make([]int32, n)
 		for i := 0; i < n; i++ {
@@ -414,10 +448,7 @@ func cmdTrainMetal() {
 				tokID := data[start+i]
 				copy(hidH[i*dim:(i+1)*dim], embedH[tokID*dim:(tokID+1)*dim])
 			}
-			tmp := te.FromHost(hidH, []int{n, dim})
-			mtl.FusedCopy(hidden, tmp, n*dim)
-			mtl.Sync() // ensure copy completes before pool reclaims tmp
-			te.Release(tmp)
+			mtl.UploadInto(hidden, hidH)
 		}
 
 		mtl.FusedBegin()
@@ -430,20 +461,21 @@ func cmdTrainMetal() {
 
 			mtl.FusedRMSNorm(hidden, l.norm1, b.rmsScale1, n, dim)
 			mtl.FusedCopy(b.normed, hidden, n*dim)
-			// Restore hidden (RMSNorm was in-place on hidden, but we need pre-norm for residual)
 			mtl.FusedCopy(hidden, b.xIn, n*dim)
 
-			mtl.FusedGemmBT(b.normed, l.wq, b.Q, n, dim, dim)
-			mtl.FusedGemmBT(b.normed, l.wk, b.K, n, dim, kvDim)
-			mtl.FusedGemmBT(b.normed, l.wv, b.V, n, dim, kvDim)
+			mtl.FusedGemmF32BT(b.normed, l.wq, b.Q, n, dim, dim)
+			mtl.FusedGemmF32BT(b.normed, l.wk, b.K, n, dim, kvDim)
+			mtl.FusedGemmF32BT(b.normed, l.wv, b.V, n, dim, kvDim)
 
 			mtl.FusedRoPE(b.Q, headDim, heads, 10000.0, dim, n)
 			mtl.FusedRoPE(b.K, headDim, kvHeads, 10000.0, kvDim, n)
 
 			mtl.FusedAttention(b.Q, b.K, b.V, b.attnOut, scores, dim, kvDim, headDim, heads, kvHeads, n)
 
-			mtl.FusedGemmBT(b.attnOut, l.wo, b.dx, n, dim, dim)
+			mtl.FusedGemmF32BT(b.attnOut, l.wo, b.dx, n, dim, dim)
 			mtl.FusedAddInPlace(hidden, b.dx, n*dim)
+
+
 
 			mtl.FusedCopy(b.xMid, hidden, n*dim)
 
@@ -451,19 +483,19 @@ func cmdTrainMetal() {
 			mtl.FusedCopy(b.normed2, hidden, n*dim)
 			mtl.FusedCopy(hidden, b.xMid, n*dim)
 
-			mtl.FusedGemmBT(b.normed2, l.gate, b.gatePre, n, dim, ffnDim)
-			mtl.FusedGemmBT(b.normed2, l.up, b.upOut, n, dim, ffnDim)
+			mtl.FusedGemmF32BT(b.normed2, l.gate, b.gatePre, n, dim, ffnDim)
+			mtl.FusedGemmF32BT(b.normed2, l.up, b.upOut, n, dim, ffnDim)
 
 			mtl.FusedSiLUGateMul(b.gatePre, b.upOut, b.ffnMid, n*ffnDim)
 
-			mtl.FusedGemmBT(b.ffnMid, l.down, b.dx, n, ffnDim, dim)
+			mtl.FusedGemmF32BT(b.ffnMid, l.down, b.dx, n, ffnDim, dim)
 			mtl.FusedAddInPlace(hidden, b.dx, n*dim)
 		}
 
 		mtl.FusedRMSNorm(hidden, finalNorm, finalScales, n, dim)
 		mtl.FusedCopy(normedFinal, hidden, n*dim)
 
-		mtl.FusedGemmBT(normedFinal, embed, logitsBuf, n, dim, vocabSize)
+		mtl.FusedGemmF32BT(normedFinal, embed, logitsBuf, n, dim, vocabSize)
 
 		mtl.FusedEnd()
 
@@ -513,11 +545,9 @@ func cmdTrainMetal() {
 			go saveFullCheckpoint(step, stepLoss)
 		}
 
-		// === HELIX DNA optimizer ===
+		// === Signal-scaled LR ===
 		stepLR := getLR(step)
-		r, _, _, _ := hlx.PrepareStep(step, stepLoss, stepLR)
-
-		if step > 1 && prevLoss > 0 {
+		if prevLoss > 0 {
 			dLoss := float64(stepLoss) - float64(prevLoss)
 			if dLoss > 0 {
 				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
@@ -537,12 +567,9 @@ func cmdTrainMetal() {
 		// === BACKWARD ===
 		mtl.FusedBegin()
 
-		// dEmbed = gradGPU^T @ normedFinal
-		mtl.FusedGemmTN(gradGPU, normedFinal, dEmbed, vocabSize, n, dim)
-		// dHidden = gradGPU @ embed
-		mtl.FusedGemmNN(gradGPU, embed, dHidden, n, vocabSize, dim)
+		mtl.FusedGemmF32TN(gradGPU, normedFinal, dEmbed, vocabSize, n, dim)
+		mtl.FusedGemmF32NN(gradGPU, embed, dHidden, n, vocabSize, dim)
 
-		// Final RMSNorm backward
 		mtl.FusedRMSNormBwd(dHidden, hidden, finalNorm, finalScales, dScratch, n, dim)
 		mtl.FusedCopy(dHidden, dScratch, n*dim)
 
@@ -550,85 +577,48 @@ func cmdTrainMetal() {
 			l := &lays[li]
 			b := &bufs[li]
 
-			// FFN backward
-			mtl.FusedGemmNN(dHidden, l.down, b.dFfnMid, n, dim, ffnDim)
-			mtl.FusedGemmTN(dHidden, b.ffnMid, b.dWDown, dim, n, ffnDim)
+			mtl.FusedGemmF32NN(dHidden, l.down, b.dFfnMid, n, dim, ffnDim)
+			mtl.FusedGemmF32TN(dHidden, b.ffnMid, b.dWDown, dim, n, ffnDim)
 
 			mtl.SiLUGateBackward(b.dFfnMid, b.gatePre, b.upOut, b.gateAct, b.dGate, b.dUp)
 
-			mtl.FusedGemmNN(b.dGate, l.gate, b.dN2, n, ffnDim, dim)
-			mtl.FusedGemmNN(b.dUp, l.up, b.dx, n, ffnDim, dim)
+			mtl.FusedGemmF32NN(b.dGate, l.gate, b.dN2, n, ffnDim, dim)
+			mtl.FusedGemmF32NN(b.dUp, l.up, b.dx, n, ffnDim, dim)
 			mtl.FusedAddInPlace(b.dN2, b.dx, n*dim)
 
-			mtl.FusedGemmTN(b.dGate, b.normed2, b.dWGate, ffnDim, n, dim)
-			mtl.FusedGemmTN(b.dUp, b.normed2, b.dWUp, ffnDim, n, dim)
+			mtl.FusedGemmF32TN(b.dGate, b.normed2, b.dWGate, ffnDim, n, dim)
+			mtl.FusedGemmF32TN(b.dUp, b.normed2, b.dWUp, ffnDim, n, dim)
 
-			// RMSNorm2 backward
 			mtl.FusedRMSNormBwd(b.dN2, b.xMid, l.norm2, b.rmsScale2, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 
-			// Attention backward
-			mtl.FusedGemmNN(dHidden, l.wo, b.dAttnOut, n, dim, dim)
-			mtl.FusedGemmTN(dHidden, b.attnOut, b.dWO, dim, n, dim)
+			mtl.FusedGemmF32NN(dHidden, l.wo, b.dAttnOut, n, dim, dim)
+			mtl.FusedGemmF32TN(dHidden, b.attnOut, b.dWO, dim, n, dim)
 
 			mtl.FusedAttentionBwdQ(b.dAttnOut, b.Q, b.K, b.V, scores,
 				b.dQ, b.dK, b.dV, dim, kvDim, headDim, heads, kvHeads, n, n)
 
-			// RoPE backward — same as forward with conjugate (negate sin)
 			mtl.FusedRoPE(b.dQ, headDim, heads, -10000.0, dim, n)
 			mtl.FusedRoPE(b.dK, headDim, kvHeads, -10000.0, kvDim, n)
 
-			mtl.FusedGemmNN(b.dQ, l.wq, b.dN1, n, dim, dim)
-			mtl.FusedGemmNN(b.dK, l.wk, b.dx, n, kvDim, dim)
-			mtl.FusedGemmNN(b.dV, l.wv, b.dN2, n, kvDim, dim)
+			mtl.FusedGemmF32NN(b.dQ, l.wq, b.dN1, n, dim, dim)
+			mtl.FusedGemmF32NN(b.dK, l.wk, b.dx, n, kvDim, dim)
+			mtl.FusedGemmF32NN(b.dV, l.wv, b.dN2, n, kvDim, dim)
 			mtl.FusedAddInPlace(b.dN1, b.dx, n*dim)
 			mtl.FusedAddInPlace(b.dN1, b.dN2, n*dim)
 
-			mtl.FusedGemmTN(b.dQ, b.normed, b.dWQ, dim, n, dim)
-			mtl.FusedGemmTN(b.dK, b.normed, b.dWK, kvDim, n, dim)
-			mtl.FusedGemmTN(b.dV, b.normed, b.dWV, kvDim, n, dim)
+			mtl.FusedGemmF32TN(b.dQ, b.normed, b.dWQ, dim, n, dim)
+			mtl.FusedGemmF32TN(b.dK, b.normed, b.dWK, kvDim, n, dim)
+			mtl.FusedGemmF32TN(b.dV, b.normed, b.dWV, kvDim, n, dim)
 
-			// RMSNorm1 backward
 			mtl.FusedRMSNormBwd(b.dN1, b.xIn, l.norm1, b.rmsScale1, b.dx, n, dim)
 			mtl.FusedAddInPlace(dHidden, b.dx, n*dim)
 		}
 
 		mtl.FusedEnd()
 
-		// === Optimizer (Metal kernels) ===
-		bc1 := float32(1.0 - math.Pow(0.9, float64(step)))
-		bc2 := float32(1.0 - math.Pow(0.95, float64(step)))
-
-		for li := range lays {
-			l := &lays[li]
-			b := &bufs[li]
-			la := &layAS[li]
-
-			// gate↔up: GC pair
-			mtl.DNARungGPU(
-				l.gate, b.dWGate, la.gate.m, la.gate.v,
-				l.up, b.dWUp, la.up.m, la.up.v,
-				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-				3.0/5.0, curLR, 0.9, 0.95, bc1, bc2, 1e-8, 0.1, l.gate.Size)
-
-			// wq↔wk: AT pair — only when same size
-			if l.wq.Size == l.wk.Size {
-				mtl.DNARungGPU(
-					l.wq, b.dWQ, la.wq.m, la.wq.v,
-					l.wk, b.dWK, la.wk.m, la.wk.v,
-					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-					2.0/5.0, curLR, 0.9, 0.95, bc1, bc2, 1e-8, 0.1, l.wq.Size)
-			} else {
-				adamW(l.wq, b.dWQ, la.wq.m, la.wq.v, step)
-				adamW(l.wk, b.dWK, la.wk.m, la.wk.v, step)
-			}
-
-			adamW(l.wv, b.dWV, la.wv.m, la.wv.v, step)
-			adamW(l.wo, b.dWO, la.wo.m, la.wo.v, step)
-			adamW(l.down, b.dWDown, la.down.m, la.down.v, step)
-		}
-
-		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
+		// === Helix: all weight updates CPU-side through unified memory ===
+		hlx.Step(step, stepLoss, curLR)
 
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
@@ -643,6 +633,7 @@ func cmdTrainMetal() {
 		*stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds(), bestFloor)
 
 	saveFullCheckpoint(*stepsFlag, bestFloor)
+	warmCache.Release()
 	_ = mtl
 	_ = scores
 }
