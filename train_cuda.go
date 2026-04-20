@@ -249,32 +249,35 @@ func cmdTrainCUDA() {
 	fmt.Println("Training...")
 	t0 := time.Now()
 
-	var batchStart int
+	var batchReady chan struct{}
+	curStart := start0
 	for step := 1; step <= *stepsFlag; step++ {
-		if l3 != nil {
-			batchStart = start0
-			tmpTok := te.FromHost(nextTokL3, []int{n})
-			cuda.CopyInto(tokGPU, tmpTok)
-			te.Release(tmpTok)
-			tmpTarg := te.FromHost(nextTargL3, []int{n})
-			cuda.CopyInto(targetsGPU, tmpTarg)
-			te.Release(tmpTarg)
-		} else {
-			batchStart = rng.Intn(len(data) - n - 1)
-			tokF := make([]float32, n)
-			for i := 0; i < n; i++ { tokF[i] = math.Float32frombits(uint32(int32(data[batchStart+i]))) }
-			tmpTok := te.FromHost(tokF, []int{n})
-			cuda.CopyInto(tokGPU, tmpTok)
-			te.Release(tmpTok)
-			targF := make([]float32, n)
-			for i := 0; i < n; i++ { targF[i] = math.Float32frombits(uint32(int32(data[batchStart+i+1]))) }
-			tmpTarg := te.FromHost(targF, []int{n})
-			cuda.CopyInto(targetsGPU, tmpTarg)
-			te.Release(tmpTarg)
+		// Wait for L3 prep goroutine from previous step
+		if batchReady != nil {
+			<-batchReady
 		}
 
+		// Upload current batch
+		if l3 != nil {
+			cuda.UploadInto(tokGPU, nextTokL3)
+			cuda.UploadInto(targetsGPU, nextTargL3)
+		} else {
+			curStart = rng.Intn(len(data) - n - 1)
+			tokF := make([]float32, n)
+			for i := 0; i < n; i++ { tokF[i] = math.Float32frombits(uint32(int32(data[curStart+i]))) }
+			cuda.UploadInto(tokGPU, tokF)
+			targF := make([]float32, n)
+			for i := 0; i < n; i++ { targF[i] = math.Float32frombits(uint32(int32(data[curStart+i+1]))) }
+			cuda.UploadInto(targetsGPU, targF)
+		}
+
+		// Prep NEXT batch in L3 (async, overlaps with GPU training)
 		nextStart := rng.Intn(len(data) - n - 1)
-		go prepBatch(nextStart)
+		batchReady = make(chan struct{})
+		go func(s int, ch chan struct{}) {
+			prepBatch(s)
+			close(ch)
+		}(nextStart, batchReady)
 
 		tokIDs := make([]int32, n)
 		for i := 0; i < n; i++ { tokIDs[i] = int32(data[nextStart+i]) }
@@ -399,19 +402,52 @@ func cmdTrainCUDA() {
 			te.AddInPlace(dHidden, b.dx)
 		}
 
-		// === TEST 3: Pure AdamW, no helix, batched after backward ===
-		hlx.Step(step, stepLoss, getLR(step))
+		// === HELIX DNA optimizer with immune response ===
+		stepLR := getLR(step)
+		r, _, _, rewound := hlx.PrepareStep(step, stepLoss, stepLR)
+		if rewound {
+			if step <= 3 || step%*logEvery == 0 {
+				elapsed := time.Since(t0)
+				fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s) [REWIND]\n",
+					step, *stepsFlag, stepLoss, stepLR, elapsed.Seconds(), float64(step)/elapsed.Seconds())
+			}
+			continue
+		}
 
 		for li := range lays {
+			l := &lays[li]
 			b := &bufs[li]
 			la := &layAS[li]
-			adamW(lays[li].gate, b.dWGate, la.gate.m, la.gate.v, step)
-			adamW(lays[li].up, b.dWUp, la.up.m, la.up.v, step)
-			adamW(lays[li].wq, b.dWQ, la.wq.m, la.wq.v, step)
-			adamW(lays[li].wk, b.dWK, la.wk.m, la.wk.v, step)
-			adamW(lays[li].wv, b.dWV, la.wv.m, la.wv.v, step)
-			adamW(lays[li].wo, b.dWO, la.wo.m, la.wo.v, step)
-			adamW(lays[li].down, b.dWDown, la.down.m, la.down.v, step)
+
+			// gate↔up: GC pair (3 H-bonds)
+			mongoose.KHelixDNAStep(
+				l.gate.DevicePtr(), l.up.DevicePtr(),
+				b.dWGate.DevicePtr(), b.dWUp.DevicePtr(),
+				la.gate.m.DevicePtr(), la.up.m.DevicePtr(),
+				la.gate.v.DevicePtr(), la.up.v.DevicePtr(),
+				stepLR, 0.9, 0.95, step, 1e-8, 0.1,
+				r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+				3.0/5.0, l.gate.Size)
+
+			// wq↔wk: AT pair (2 H-bonds) — only when same size
+			if l.wq.Size == l.wk.Size {
+				mongoose.KHelixDNAStep(
+					l.wq.DevicePtr(), l.wk.DevicePtr(),
+					b.dWQ.DevicePtr(), b.dWK.DevicePtr(),
+					la.wq.m.DevicePtr(), la.wk.m.DevicePtr(),
+					la.wq.v.DevicePtr(), la.wk.v.DevicePtr(),
+					stepLR, 0.9, 0.95, step, 1e-8, 0.1,
+					r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+					2.0/5.0, l.wq.Size)
+			} else {
+				adamW(l.wq, b.dWQ, la.wq.m, la.wq.v, step)
+				adamW(l.wk, b.dWK, la.wk.m, la.wk.v, step)
+			}
+
+			// Singles
+			adamW(l.wv, b.dWV, la.wv.m, la.wv.v, step)
+			adamW(l.wo, b.dWO, la.wo.m, la.wo.v, step)
+			adamW(l.down, b.dWDown, la.down.m, la.down.v, step)
 		}
 
 		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)

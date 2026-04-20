@@ -588,11 +588,86 @@ func cmdInferGPU(model string, promptParts []string) {
 		return logits
 	}
 
-	// === Metal fused graph forward (2 dispatches/layer + 1 final) ===
+	// === Metal fused compute-shader forward (one command buffer per token) ===
+	fusedForward := func(tokenID, pos int) []float32 { return nil }
+	useFused := false
+
+	if metal, ok := eng.(*mongoose.Metal); ok {
+		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq)
+		if ret == 0 {
+			nw := metal.FusedNumWeights()
+			fmt.Printf("  Metal fused compute pipeline (%d weight slots)\n", nw)
+
+			wi := 0
+			for l := 0; l < nLayers; l++ {
+				prefix := fmt.Sprintf("model.layers.%d.", l)
+				loadW := func(name string, rows, cols int) {
+					data, _, _, _ := readWeight(prefix+name, rows, cols)
+					if data != nil {
+						metal.FusedSetWeight(wi, data)
+					}
+					wi++
+				}
+				loadNorm := func(name string) {
+					data, _, _ := st.ReadTensorFloat32(prefix + name)
+					if data != nil {
+						metal.FusedSetWeight(wi, data)
+					}
+					wi++
+				}
+				loadBias := func(name string, sz int) {
+					data, _, _ := st.ReadTensorFloat32(prefix + name)
+					if data == nil {
+						data = make([]float32, sz)
+					}
+					metal.FusedSetWeight(wi, data)
+					wi++
+				}
+				loadNorm("input_layernorm.weight")
+				loadW("self_attn.q_proj.weight", dim, dim)
+				loadW("self_attn.k_proj.weight", kvDim, dim)
+				loadW("self_attn.v_proj.weight", kvDim, dim)
+				loadBias("self_attn.q_proj.bias", dim)
+				loadBias("self_attn.k_proj.bias", kvDim)
+				loadBias("self_attn.v_proj.bias", kvDim)
+				loadW("self_attn.o_proj.weight", dim, dim)
+				loadNorm("post_attention_layernorm.weight")
+				loadW("mlp.gate_proj.weight", ffnDim, dim)
+				loadW("mlp.up_proj.weight", ffnDim, dim)
+				loadW("mlp.down_proj.weight", dim, ffnDim)
+			}
+			fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+			metal.FusedSetWeight(wi, fnorm)
+			wi++
+			metal.FusedSetWeight(wi, lmHeadData)
+			wi++
+
+			fmt.Printf("  Loaded %d weights\n", wi)
+			useFused = true
+
+			fHidden := make([]float32, dim)
+			fLogits := make([]float32, vocabSize)
+
+			fusedForward = func(tokenID, pos int) []float32 {
+				tokOff := tokenID * dim
+				if tokOff+dim > len(embedData) {
+					return nil
+				}
+				copy(fHidden, embedData[tokOff:tokOff+dim])
+				cosSlice := cosTab[pos*halfHead : pos*halfHead+halfHead]
+				sinSlice := sinTab[pos*halfHead : pos*halfHead+halfHead]
+				metal.FusedStep(fHidden, cosSlice, sinSlice, pos, fLogits)
+				return fLogits
+			}
+		}
+	}
+
+	// === Metal MPSGraph forward (fallback — 2 dispatches/layer) ===
 	metalForward := func(tokenID, pos int) []float32 { return nil }
 	useMetalGraph := false
 
-	if metal, ok := eng.(*mongoose.Metal); ok {
+	if !useFused {
+		if metal, ok := eng.(*mongoose.Metal); ok {
 		ret := metal.BuildInferGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, float64(ropeTheta))
 		if ret == 0 {
 			nw := metal.InferNumWeights()
@@ -651,6 +726,8 @@ func cmdInferGPU(model string, promptParts []string) {
 			mVBuf := make([]float32, kvDim)
 			mAttnOut := make([]float32, dim)
 			mLogits := make([]float32, vocabSize)
+			invSqrtHeadDim := float32(1.0 / math.Sqrt(float64(headDim)))
+			kvMulConst := heads / kvHeads
 
 			metalForward = func(tokenID, pos int) []float32 {
 				tokOff := tokenID * dim
@@ -668,22 +745,19 @@ func cmdInferGPU(model string, promptParts []string) {
 					copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], mKBuf)
 					copy(valCache[l][pos*kvDim:(pos+1)*kvDim], mVBuf)
 
-					kvMul := heads / kvHeads
 					for i := range mAttnOut {
 						mAttnOut[i] = 0
 					}
 					for h := 0; h < heads; h++ {
 						qOff := h * headDim
-						kvH := h / kvMul
-						kvOff := kvH * headDim
-						scale := float32(1.0 / math.Sqrt(float64(headDim)))
+						kvOff := (h / kvMulConst) * headDim
 						scores := att[h*(pos+1) : h*(pos+1)+(pos+1)]
 						for t := 0; t <= pos; t++ {
 							var dot float64
 							for j := 0; j < headDim; j++ {
 								dot += float64(mQBuf[qOff+j]) * float64(keyCache[l][t*kvDim+kvOff+j])
 							}
-							scores[t] = float32(dot) * scale
+							scores[t] = float32(dot) * invSqrtHeadDim
 						}
 						softmax(scores, pos+1)
 						for t := 0; t <= pos; t++ {
@@ -701,11 +775,14 @@ func cmdInferGPU(model string, promptParts []string) {
 				return mLogits
 			}
 		}
+		}
 	}
 
 	// Select tier
 	fwd := forward
-	if useMetalGraph {
+	if useFused {
+		fwd = fusedForward
+	} else if useMetalGraph {
 		fwd = metalForward
 	} else if useGPUKernels && gpuResident {
 		fwd = gpuForward
