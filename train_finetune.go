@@ -30,7 +30,7 @@ func cmdFinetune() {
 
 	if *modelPath == "" {
 		home, _ := os.UserHomeDir()
-		*modelPath = filepath.Join(home, ".mongoose", "models", "TinyLlama-1.1B-Chat-v1.0")
+		*modelPath = filepath.Join(home, ".ai", "models", "TinyLlama-1.1B-Chat-v1.0")
 	}
 	if *dataPath == "" {
 		*dataPath = "data/tinystories_hf.txt"

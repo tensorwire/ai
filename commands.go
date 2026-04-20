@@ -21,7 +21,7 @@ var modelsDir string
 
 func init() {
 	home, _ := os.UserHomeDir()
-	modelsDir = filepath.Join(home, ".tesseract", "models")
+	modelsDir = filepath.Join(home, ".ai", "models")
 	os.MkdirAll(modelsDir, 0755)
 }
 
@@ -448,7 +448,7 @@ func resolveModel(name string) string {
 	home, _ := os.UserHomeDir()
 	dirs := []string{
 		modelsDir,
-		filepath.Join(home, ".mongoose", "models"),
+		filepath.Join(home, ".ai", "models"),
 	}
 	for _, dir := range dirs {
 		for _, suffix := range []string{"", "-hf", "-chat"} {

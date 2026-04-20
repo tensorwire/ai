@@ -53,7 +53,7 @@ func resolveModelPath(name string) string {
 	}
 	home, _ := os.UserHomeDir()
 	candidates := []string{
-		filepath.Join(home, ".mongoose", "models", name),
+		filepath.Join(home, ".ai", "models", name),
 		filepath.Join(home, ".tesseract", "models", name),
 	}
 	for _, c := range candidates {
@@ -63,7 +63,7 @@ func resolveModelPath(name string) string {
 	}
 	// Try case-insensitive match
 	for _, base := range []string{
-		filepath.Join(home, ".mongoose", "models"),
+		filepath.Join(home, ".ai", "models"),
 		filepath.Join(home, ".tesseract", "models"),
 	} {
 		entries, err := os.ReadDir(base)
@@ -107,9 +107,9 @@ func runFromScratch(dataPath string, args map[string]string) {
 		injectArgs(args, dataPath)
 		cmdTrainCUDA()
 	case "graph":
-		log.Println("[ai] using GraphTrainEngine")
+		log.Println("[ai] using Metal fused kernel path")
 		injectArgs(args, dataPath)
-		cmdTrain()
+		cmdTrainMetal()
 	default:
 		log.Println("[ai] using universal CPU path")
 		injectArgs(args, dataPath)

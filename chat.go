@@ -84,7 +84,7 @@ func resolveModelName(name string) string {
 
 	// Try common HuggingFace naming patterns
 	home, _ := os.UserHomeDir()
-	modelsDir := filepath.Join(home, ".mongoose", "models")
+	modelsDir := filepath.Join(home, ".ai", "models")
 
 	// llama3 -> TinyLlama-*, Llama-3-*
 	// qwen2.5:0.5b -> Qwen2.5-0.5B
