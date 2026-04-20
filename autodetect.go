@@ -294,15 +294,6 @@ func detectFamily(arch string) string {
 	return arch
 }
 
-// isFlagSet returns true if a flag was explicitly provided on the command line.
-func isFlagSet(fs *flag.FlagSet, name string) bool {
-	found := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == name { found = true }
-	})
-	return found
-}
-
 func countParams(p *ModelProfile) int64 {
 	if p.Dim == 0 || p.Layers == 0 {
 		return 0

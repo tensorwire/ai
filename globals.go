@@ -228,21 +228,6 @@ func SelectBackend() string {
 	}
 }
 
-// PrintGlobalStatus shows active global settings (when non-default).
-func PrintGlobalStatus() {
-	var parts []string
-	if GlobalDevice != "auto" { parts = append(parts, fmt.Sprintf("device=%s", GlobalDevice)) }
-	if GlobalPrecision != "auto" { parts = append(parts, fmt.Sprintf("precision=%s", GlobalPrecision)) }
-	if GlobalOutDir != "" { parts = append(parts, fmt.Sprintf("out=%s", GlobalOutDir)) }
-	if GlobalDryRun { parts = append(parts, "dry-run") }
-	if GlobalVerbose { parts = append(parts, "verbose") }
-	if len(parts) > 0 {
-		fmt.Printf("  [%s]\n", strings.Join(parts, ", "))
-	}
-}
-
-// Shared utility functions (onesSlice, zeroSlice, mvFn, selectEngine,
-// resolveModel, rmsNormFwdFn) defined earlier in this file by Metal session.
 
 // int32ToFloat32Bits reinterprets int32 as float32 via math.
 func int32ToFloat32Bits(v int32) float32 {

@@ -98,7 +98,7 @@ func cmdCheckpointLs(args map[string]string) {
 	dir := args["_1"]
 	if dir == "" {
 		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".tesseract", "checkpoints")
+		dir = filepath.Join(home, ".ai", "checkpoints")
 	}
 
 	ckpts := listCheckpoints(dir)
