@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,130 +14,219 @@ import (
 	"github.com/open-ai-org/gguf"
 )
 
-// ModelSource abstracts over SafeTensors directories and GGUF files.
-// All tensor reads return float32 regardless of source format.
+// ModelSource abstracts over SafeTensors and GGUF in any packaging.
+// All tensor reads return float32 regardless of storage format.
 type ModelSource struct {
-	format   string // "safetensors" or "gguf"
-	st       *gguf.SafeTensors
-	gr       *gguf.GGUFReader
-	nameMap  map[string]string // HF name → GGUF name (only for GGUF)
-	config   map[string]interface{}
-	dir      string // directory containing the model (for tokenizer, config)
-	nLayers  int
+	format  string // "safetensors" or "gguf"
+	st      *gguf.SafeTensors
+	gr      *gguf.GGUFReader
+	nameMap map[string]string // HF name → GGUF name
+	config  map[string]interface{}
+	dir     string // directory containing model files (for tokenizer)
+	nLayers int
+	tmpDir  string // non-empty if we extracted a zip (cleanup on Close)
 }
 
-// OpenModel auto-detects and opens a model from a path.
-// Supports: SafeTensors directory, single .gguf file, directory containing .gguf.
+// OpenModel auto-detects format and opens a model from any source:
+//   - SafeTensors directory (with or without config.json)
+//   - Single .safetensors file
+//   - Single .gguf file
+//   - Directory containing .gguf
+//   - .zip archive containing any of the above
+//   - Raw file (detected by magic bytes)
 func OpenModel(path string) (*ModelSource, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("not found: %s", path)
 	}
 
-	// Single GGUF file
-	if !info.IsDir() && strings.HasSuffix(path, ".gguf") {
-		return openGGUFModel(path)
-	}
-
-	// Directory — check for safetensors first, then GGUF
 	if info.IsDir() {
-		// SafeTensors?
-		if hasSafeTensors(path) {
-			return openSafeTensorsModel(path)
-		}
-		// GGUF file in directory?
-		if ggufPath := findGGUFInDir(path); ggufPath != "" {
-			return openGGUFModel(ggufPath)
-		}
-		return nil, fmt.Errorf("no model files found in %s (need .safetensors or .gguf)", path)
+		return openDir(path)
 	}
-
-	return nil, fmt.Errorf("unsupported model path: %s", path)
+	return openFile(path)
 }
 
-func hasSafeTensors(dir string) bool {
-	entries, err := os.ReadDir(dir)
+func openFile(path string) (*ModelSource, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".gguf":
+		return openGGUFFile(path)
+	case ".safetensors":
+		return openSingleSafeTensors(path)
+	case ".zip":
+		return openZip(path)
+	default:
+		return openByMagic(path)
+	}
+}
+
+func openDir(path string) (*ModelSource, error) {
+	// SafeTensors first (most common for HuggingFace models)
+	if hasSafeTensors(path) {
+		return openSafeTensorsDir(path)
+	}
+	// GGUF file in directory
+	if p := findGGUFInDir(path); p != "" {
+		return openGGUFFile(p)
+	}
+	// Zip file in directory
+	if p := findFileByExt(path, ".zip"); p != "" {
+		return openZip(p)
+	}
+	return nil, fmt.Errorf("no model files found in %s (need .safetensors, .gguf, or .zip)", path)
+}
+
+// openByMagic detects format from file header bytes.
+func openByMagic(path string) (*ModelSource, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return nil, err
 	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".safetensors") || e.Name() == "model.safetensors.index.json" {
-			return true
-		}
+	var magic [4]byte
+	f.Read(magic[:])
+	f.Close()
+
+	// GGUF magic: "GGUF" (0x46554747)
+	if magic[0] == 'G' && magic[1] == 'G' && magic[2] == 'U' && magic[3] == 'F' {
+		return openGGUFFile(path)
 	}
-	return false
+	// Zip magic: "PK\x03\x04"
+	if magic[0] == 'P' && magic[1] == 'K' && magic[2] == 0x03 && magic[3] == 0x04 {
+		return openZip(path)
+	}
+	// SafeTensors starts with a JSON header length (little-endian uint64)
+	// The first 8 bytes are a small number (header size), so bytes 4-7 are usually 0
+	if magic[2] == 0 && magic[3] == 0 {
+		return openSingleSafeTensors(path)
+	}
+
+	return nil, fmt.Errorf("unknown model format: %s (unrecognized magic bytes)", path)
 }
 
-func findGGUFInDir(dir string) string {
-	entries, err := os.ReadDir(dir)
+// openZip extracts a zip to a temp dir and opens the model inside.
+func openZip(path string) (*ModelSource, error) {
+	tmpDir, err := os.MkdirTemp("", "ai-model-*")
 	if err != nil {
-		return ""
+		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".gguf") {
-			return filepath.Join(dir, e.Name())
+
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("open zip: %w", err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
 		}
+		// Flatten: strip leading directory from zip entries
+		name := filepath.Base(f.Name)
+		// But keep subdirectory structure for sharded safetensors
+		relPath := f.Name
+		if idx := strings.Index(relPath, "/"); idx >= 0 {
+			relPath = relPath[idx+1:]
+		}
+		if relPath == "" {
+			relPath = name
+		}
+
+		destPath := filepath.Join(tmpDir, relPath)
+		os.MkdirAll(filepath.Dir(destPath), 0755)
+
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		out, err := os.Create(destPath)
+		if err != nil {
+			rc.Close()
+			continue
+		}
+		io.Copy(out, rc)
+		out.Close()
+		rc.Close()
 	}
-	return ""
+
+	m, err := openDir(tmpDir)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("open extracted model: %w", err)
+	}
+	m.tmpDir = tmpDir
+	return m, nil
 }
 
-func openSafeTensorsModel(dir string) (*ModelSource, error) {
+// openSingleSafeTensors opens a lone .safetensors file (no directory).
+func openSingleSafeTensors(path string) (*ModelSource, error) {
+	dir := filepath.Dir(path)
+	st, err := gguf.OpenSafeTensors(dir)
+	if err != nil {
+		// Try opening as if the file IS the model directory
+		// Create a temp dir with a symlink
+		tmpDir, _ := os.MkdirTemp("", "ai-model-*")
+		dst := filepath.Join(tmpDir, filepath.Base(path))
+		// Copy file (symlink may not work cross-device)
+		data, err2 := os.ReadFile(path)
+		if err2 != nil {
+			os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("read safetensors: %w", err2)
+		}
+		os.WriteFile(dst, data, 0644)
+		st, err = gguf.OpenSafeTensors(tmpDir)
+		if err != nil {
+			os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("open safetensors: %w", err)
+		}
+		cfg := inferConfigFromTensors(st)
+		nLayers := configInt(cfg, "num_hidden_layers", 0)
+		return &ModelSource{
+			format: "safetensors", st: st, config: cfg,
+			dir: tmpDir, nLayers: nLayers, tmpDir: tmpDir,
+		}, nil
+	}
+
+	cfg := loadConfig(dir)
+	if cfg == nil {
+		cfg = inferConfigFromTensors(st)
+	}
+	nLayers := configInt(cfg, "num_hidden_layers", 0)
+
+	return &ModelSource{
+		format: "safetensors", st: st, config: cfg,
+		dir: dir, nLayers: nLayers,
+	}, nil
+}
+
+func openSafeTensorsDir(dir string) (*ModelSource, error) {
 	st, err := gguf.OpenSafeTensors(dir)
 	if err != nil {
 		return nil, fmt.Errorf("open safetensors: %w", err)
 	}
 
 	cfg := loadConfig(dir)
+	if cfg == nil {
+		cfg = inferConfigFromTensors(st)
+	}
 	nLayers := configInt(cfg, "num_hidden_layers", 0)
 
 	return &ModelSource{
-		format:  "safetensors",
-		st:      st,
-		config:  cfg,
-		dir:     dir,
-		nLayers: nLayers,
+		format: "safetensors", st: st, config: cfg,
+		dir: dir, nLayers: nLayers,
 	}, nil
 }
 
-func openGGUFModel(path string) (*ModelSource, error) {
+func openGGUFFile(path string) (*ModelSource, error) {
 	gr, err := gguf.OpenGGUF(path)
 	if err != nil {
 		return nil, fmt.Errorf("open gguf: %w", err)
 	}
 
-	// Try to read config from GGUF metadata
-	cfg := make(map[string]interface{})
+	cfg := inferConfigFromGGUF(gr)
 
-	// Standard GGUF metadata keys
-	if v := gr.MetadataUint32("llama.embedding_length"); v > 0 {
-		cfg["hidden_size"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.block_count"); v > 0 {
-		cfg["num_hidden_layers"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.attention.head_count"); v > 0 {
-		cfg["num_attention_heads"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.attention.head_count_kv"); v > 0 {
-		cfg["num_key_value_heads"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.feed_forward_length"); v > 0 {
-		cfg["intermediate_size"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.vocab_size"); v > 0 {
-		cfg["vocab_size"] = float64(v)
-	}
-	if v := gr.MetadataUint32("llama.context_length"); v > 0 {
-		cfg["max_position_embeddings"] = float64(v)
-	}
-	if v := gr.MetadataFloat32("llama.rope.freq_base"); v > 0 {
-		cfg["rope_theta"] = float64(v)
-	}
-	if v := gr.MetadataFloat32("llama.attention.layer_norm_rms_epsilon"); v > 0 {
-		cfg["rms_norm_eps"] = float64(v)
-	}
-
-	// Also check for config.json alongside the GGUF file
+	// Merge with config.json if present alongside
 	dir := filepath.Dir(path)
 	if fileCfg := loadConfig(dir); fileCfg != nil {
 		for k, v := range fileCfg {
@@ -145,22 +237,149 @@ func openGGUFModel(path string) (*ModelSource, error) {
 	}
 
 	nLayers := configInt(cfg, "num_hidden_layers", 0)
-
-	// Build name map: HF → GGUF
 	nameMap := buildGGUFNameMap(nLayers)
 
 	return &ModelSource{
-		format:  "gguf",
-		gr:      gr,
-		nameMap: nameMap,
-		config:  cfg,
-		dir:     dir,
-		nLayers: nLayers,
+		format: "gguf", gr: gr, nameMap: nameMap,
+		config: cfg, dir: dir, nLayers: nLayers,
 	}, nil
 }
 
-// ReadTensorFloat32 reads a tensor by HuggingFace name, auto-translating for GGUF.
-// Always returns float32 regardless of storage format (dequantizes Q8/Q4/F16).
+// inferConfigFromGGUF extracts model config from GGUF metadata.
+func inferConfigFromGGUF(gr *gguf.GGUFReader) map[string]interface{} {
+	cfg := make(map[string]interface{})
+	meta := gr.Metadata()
+
+	// Map GGUF metadata keys → HuggingFace config keys
+	ggufToHF := map[string]string{
+		"llama.embedding_length":                    "hidden_size",
+		"llama.block_count":                         "num_hidden_layers",
+		"llama.attention.head_count":                "num_attention_heads",
+		"llama.attention.head_count_kv":             "num_key_value_heads",
+		"llama.feed_forward_length":                 "intermediate_size",
+		"llama.vocab_size":                          "vocab_size",
+		"llama.context_length":                      "max_position_embeddings",
+		"llama.rope.freq_base":                      "rope_theta",
+		"llama.attention.layer_norm_rms_epsilon":    "rms_norm_eps",
+		// Qwen/generic prefixes
+		"qwen2.embedding_length":                    "hidden_size",
+		"qwen2.block_count":                         "num_hidden_layers",
+		"qwen2.attention.head_count":                "num_attention_heads",
+		"qwen2.attention.head_count_kv":             "num_key_value_heads",
+		"qwen2.feed_forward_length":                 "intermediate_size",
+	}
+
+	for ggufKey, hfKey := range ggufToHF {
+		if v, ok := meta[ggufKey]; ok {
+			switch val := v.(type) {
+			case uint32:
+				cfg[hfKey] = float64(val)
+			case float32:
+				cfg[hfKey] = float64(val)
+			case uint64:
+				cfg[hfKey] = float64(val)
+			case int32:
+				cfg[hfKey] = float64(val)
+			}
+		}
+	}
+
+	if _, ok := cfg["hidden_act"]; !ok {
+		cfg["hidden_act"] = "silu"
+	}
+
+	return cfg
+}
+
+// inferConfigFromTensors guesses model config from tensor names and shapes.
+// Used when no config.json is available.
+func inferConfigFromTensors(st *gguf.SafeTensors) map[string]interface{} {
+	cfg := make(map[string]interface{})
+
+	// Count layers
+	maxLayer := -1
+	for _, name := range st.TensorNames {
+		if strings.HasPrefix(name, "model.layers.") {
+			parts := strings.Split(name, ".")
+			if len(parts) >= 3 {
+				var n int
+				fmt.Sscanf(parts[2], "%d", &n)
+				if n > maxLayer {
+					maxLayer = n
+				}
+			}
+		}
+	}
+	if maxLayer >= 0 {
+		cfg["num_hidden_layers"] = float64(maxLayer + 1)
+	}
+
+	// Infer dim from embed_tokens or layer 0 q_proj
+	if info, err := st.GetInfo("model.embed_tokens.weight"); err == nil && info != nil {
+		if len(info.Shape) == 2 {
+			cfg["vocab_size"] = float64(info.Shape[0])
+			cfg["hidden_size"] = float64(info.Shape[1])
+		}
+	}
+	if info, err := st.GetInfo("model.layers.0.self_attn.q_proj.weight"); err == nil && info != nil {
+		if len(info.Shape) == 2 {
+			dim := info.Shape[0]
+			cfg["hidden_size"] = float64(dim)
+		}
+	}
+	if info, err := st.GetInfo("model.layers.0.self_attn.k_proj.weight"); err == nil && info != nil {
+		if len(info.Shape) == 2 {
+			kvDim := info.Shape[0]
+			dim := info.Shape[1]
+			cfg["hidden_size"] = float64(dim)
+			// Infer heads: assume headDim = 64 or 128
+			for _, hd := range []int{128, 64, 32} {
+				if dim%hd == 0 {
+					cfg["num_attention_heads"] = float64(dim / hd)
+					cfg["num_key_value_heads"] = float64(kvDim / hd)
+					break
+				}
+			}
+		}
+	}
+	if info, err := st.GetInfo("model.layers.0.mlp.gate_proj.weight"); err == nil && info != nil {
+		if len(info.Shape) == 2 {
+			cfg["intermediate_size"] = float64(info.Shape[0])
+		}
+	}
+
+	dim := configInt(cfg, "hidden_size", 0)
+	if dim > 0 {
+		cfg["max_position_embeddings"] = float64(2048)
+		cfg["rope_theta"] = float64(10000.0)
+		cfg["rms_norm_eps"] = float64(1e-6)
+		cfg["hidden_act"] = "silu"
+	}
+
+	// Also try GGUF-style tensor names
+	if maxLayer < 0 {
+		for _, name := range st.TensorNames {
+			if strings.HasPrefix(name, "blk.") {
+				parts := strings.Split(name, ".")
+				if len(parts) >= 2 {
+					var n int
+					fmt.Sscanf(parts[1], "%d", &n)
+					if n > maxLayer {
+						maxLayer = n
+					}
+				}
+			}
+		}
+		if maxLayer >= 0 {
+			cfg["num_hidden_layers"] = float64(maxLayer + 1)
+		}
+	}
+
+	return cfg
+}
+
+// ReadTensorFloat32 reads a tensor by HuggingFace name.
+// Auto-translates names for GGUF. Dequantizes Q8/Q4/F16 to float32.
 func (m *ModelSource) ReadTensorFloat32(name string) ([]float32, error) {
 	switch m.format {
 	case "safetensors":
@@ -173,7 +392,6 @@ func (m *ModelSource) ReadTensorFloat32(name string) ([]float32, error) {
 		}
 		data, _, err := m.gr.ReadTensorFloat32(ggufName)
 		if err != nil {
-			// Try original name as fallback
 			data, _, err = m.gr.ReadTensorFloat32(name)
 		}
 		return data, err
@@ -198,33 +416,17 @@ func (m *ModelSource) HasTensor(name string) bool {
 	}
 }
 
-// Config returns the model configuration.
 func (m *ModelSource) Config() map[string]interface{} { return m.config }
+func (m *ModelSource) Format() string                 { return m.format }
+func (m *ModelSource) Dir() string                    { return m.dir }
+func (m *ModelSource) NLayers() int                   { return m.nLayers }
 
-// Format returns "safetensors" or "gguf".
-func (m *ModelSource) Format() string { return m.format }
-
-// Dir returns the directory containing the model (for tokenizer files).
-func (m *ModelSource) Dir() string { return m.dir }
-
-// Close releases resources.
-func (m *ModelSource) Close() {
-	if m.gr != nil {
-		m.gr.Close()
-	}
-}
-
-// ConfigInt reads an int from the config with a default.
 func (m *ModelSource) ConfigInt(key string, def int) int {
 	return configInt(m.config, key, def)
 }
-
-// ConfigFloat reads a float from the config with a default.
 func (m *ModelSource) ConfigFloat(key string, def float64) float64 {
 	return configFloat(m.config, key, def)
 }
-
-// ConfigString reads a string from the config with a default.
 func (m *ModelSource) ConfigString(key string, def string) string {
 	if v, ok := m.config[key].(string); ok {
 		return v
@@ -232,7 +434,46 @@ func (m *ModelSource) ConfigString(key string, def string) string {
 	return def
 }
 
+func (m *ModelSource) Close() {
+	if m.gr != nil {
+		m.gr.Close()
+	}
+	if m.tmpDir != "" {
+		os.RemoveAll(m.tmpDir)
+	}
+}
+
 // helpers
+
+func hasSafeTensors(dir string) bool {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".safetensors") || e.Name() == "model.safetensors.index.json" {
+			return true
+		}
+	}
+	return false
+}
+
+func findGGUFInDir(dir string) string {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gguf") {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
+
+func findFileByExt(dir, ext string) string {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(strings.ToLower(e.Name()), ext) {
+			return filepath.Join(dir, e.Name())
+		}
+	}
+	return ""
+}
 
 func loadConfig(dir string) map[string]interface{} {
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
@@ -265,17 +506,14 @@ func configFloat(cfg map[string]interface{}, key string, def float64) float64 {
 }
 
 // ResolveAndOpen resolves a model name and opens it.
-// Handles: direct paths, model names, Ollama-style names.
 func ResolveAndOpen(name string) *ModelSource {
-	// Direct GGUF file path
-	if strings.HasSuffix(name, ".gguf") {
-		if _, err := os.Stat(name); err == nil {
-			m, err := OpenModel(name)
-			if err != nil {
-				log.Fatalf("open model: %v", err)
-			}
-			return m
+	// Direct file path (any format)
+	if _, err := os.Stat(name); err == nil {
+		m, err := OpenModel(name)
+		if err != nil {
+			log.Fatalf("open model: %v", err)
 		}
+		return m
 	}
 
 	// Try resolveModel (searches ~/.ai/models, etc.)
@@ -285,4 +523,57 @@ func ResolveAndOpen(name string) *ModelSource {
 		log.Fatalf("open model %s: %v", path, err)
 	}
 	return m
+}
+
+// EstimateParamCount estimates the parameter count from config.
+func (m *ModelSource) EstimateParamCount() int64 {
+	dim := int64(m.ConfigInt("hidden_size", 0))
+	layers := int64(m.ConfigInt("num_hidden_layers", 0))
+	heads := int64(m.ConfigInt("num_attention_heads", 0))
+	kvHeads := int64(m.ConfigInt("num_key_value_heads", int(heads)))
+	ffnDim := int64(m.ConfigInt("intermediate_size", 0))
+	vocabSize := int64(m.ConfigInt("vocab_size", 0))
+
+	if dim == 0 || layers == 0 {
+		return 0
+	}
+
+	headDim := dim / heads
+	kvDim := kvHeads * headDim
+
+	nParams := vocabSize * dim * 2 // embed + lm_head
+	for l := int64(0); l < layers; l++ {
+		nParams += dim*dim*2 + kvDim*dim*2 + ffnDim*dim*3 + dim*2
+	}
+	return nParams
+}
+
+// SizeCategory returns "small" (<1B), "medium" (1-4B), "large" (4-13B), "xl" (13B+).
+func (m *ModelSource) SizeCategory() string {
+	n := m.EstimateParamCount()
+	switch {
+	case n > 13_000_000_000:
+		return "xl"
+	case n > 4_000_000_000:
+		return "large"
+	case n > 1_000_000_000:
+		return "medium"
+	default:
+		return "small"
+	}
+}
+
+// FormatParamCount returns a human-readable parameter count.
+func (m *ModelSource) FormatParamCount() string {
+	n := float64(m.EstimateParamCount())
+	switch {
+	case n >= 1e9:
+		return fmt.Sprintf("%.1fB", n/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1fM", n/1e6)
+	case n >= 1e3:
+		return fmt.Sprintf("%.1fK", n/1e3)
+	default:
+		return fmt.Sprintf("%.0f", math.Max(n, 0))
+	}
 }
