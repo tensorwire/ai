@@ -182,9 +182,24 @@ func cmdTrainCUDA() {
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	totalSteps := *stepsFlag
+	warmupSteps := totalSteps / 10
+	if warmupSteps < 10 { warmupSteps = 10 }
+	minLR := lr / 10.0
+
+	getLR := func(step int) float32 {
+		if step < warmupSteps {
+			return lr * float32(step) / float32(warmupSteps)
+		}
+		progress := float64(step-warmupSteps) / float64(totalSteps-warmupSteps)
+		cosine := 0.5 * (1.0 + math.Cos(math.Pi*progress))
+		return minLR + float32(cosine)*float32(lr-minLR)
+	}
+
 	adamW := func(param, grad, mS, vS *mongoose.Tensor, step int) {
+		stepLR := getLR(step)
 		mongoose.KAdamW(param.DevicePtr(), grad.DevicePtr(), mS.DevicePtr(), vS.DevicePtr(),
-			lr, 0.01, step, param.Size)
+			stepLR, 0.1, step, param.Size)
 	}
 
 	zero := func(t *mongoose.Tensor) {
@@ -375,7 +390,7 @@ func cmdTrainCUDA() {
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
-				step, *stepsFlag, stepLoss, lr, elapsed.Seconds(), float64(step)/elapsed.Seconds())
+				step, *stepsFlag, stepLoss, getLR(step), elapsed.Seconds(), float64(step)/elapsed.Seconds())
 		}
 	}
 
