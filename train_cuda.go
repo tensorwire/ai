@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+	"unsafe"
 
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/helix"
@@ -79,6 +80,14 @@ func cmdTrainCUDA() {
 	}
 	log.Println("[ai] CUDA kernels loaded")
 
+	// Multi-GPU: split layers across devices
+	mc := mongoose.NewMultiCUDA()
+	nGPUs := 0
+	if mc != nil {
+		nGPUs = mc.DeviceCount
+		log.Printf("[ai] multi-GPU: %d devices available", nGPUs)
+	}
+
 	sched := mongoose.NewScheduler(eng)
 	_ = sched
 
@@ -107,22 +116,22 @@ func cmdTrainCUDA() {
 	totalParams := int64(vocabSize*dim) + int64(dim) + int64(nLayers)*layerParams
 	// FP32: weights + gradients + Adam M + Adam V = 4x params
 	fp32Bytes := totalParams * 4 * 4
-	// FP16 weights + FP16 Adam + FP32 gradients = params*(2+4+4) = 10 bytes/param
-	fp16Bytes := totalParams * 10
-	// Buffer overhead ~5%
-	fp32Need := float64(fp32Bytes) * 1.05
-	fp16Need := float64(fp16Bytes) * 1.05
+	// FP16 weights + FP32 grads + FP32 Adam M + FP32 Adam V = params*(2+4+4+4) = 14 bytes/param
+	fp16Bytes := totalParams * 14
+	// Activation buffers: hidden, normed, Q, K, V, attnOut, ffnMid, etc. per layer
+	bufBytes := int64(n) * int64(dim) * 4 * 20 * int64(nLayers) // ~20 buffers per layer
+	fp32Need := float64(fp32Bytes+bufBytes) * 1.1
+	fp16Need := float64(fp16Bytes+bufBytes) * 1.1
 
 	useFP16Training := false
-	if fp32Need > float64(vramBytes) {
+	if fp32Need > float64(vramBytes) && vramBytes > 0 {
 		if fp16Need <= float64(vramBytes) {
 			useFP16Training = true
 			log.Printf("[ai] FP32 needs %.1f GB but only %.1f GB VRAM — switching to mixed precision (FP16 weights + FP32 grads)",
 				fp32Need/(1024*1024*1024), vramGB)
 		} else {
-			log.Printf("[ai] WARNING: model needs %.1f GB (FP16) but only %.1f GB VRAM — may OOM. Consider reducing dim or layers.",
+			log.Fatalf("[ai] model needs %.1f GB (FP16) but only %.1f GB VRAM. Reduce dim or layers, or use multi-GPU.",
 				fp16Need/(1024*1024*1024), vramGB)
-			useFP16Training = true
 		}
 	}
 
@@ -193,7 +202,7 @@ func cmdTrainCUDA() {
 		}
 	}
 
-	// FP16 weight copies for tensor core GEMMs
+	// FP16 weight copies for tensor core GEMMs (GPU 0 — primary)
 	type fp16W struct{ wq, wk, wv, wo, gate, up, down *mongoose.Tensor }
 	fp16 := make([]fp16W, nLayers)
 	for l := range fp16 {
@@ -215,6 +224,33 @@ func cmdTrainCUDA() {
 	if n*vocabSize > maxActSize { maxActSize = n * vocabSize }
 	fp16Scratch := cuda.AllocFP16Tensor(maxActSize, []int{maxActSize})
 
+	// Multi-GPU: replicate FP16 weights to GPU 1 for parallel dispatch.
+	// Independent GEMM pairs (Q+K, gate+up) fire simultaneously across devices.
+	// Activations P2P-copied to GPU 1 before paired GEMMs, results copied back.
+	type gpu1Weights struct {
+		wq, wk, wv, wo, gate, up, down unsafe.Pointer
+		actBuf, outBuf                  unsafe.Pointer // FP16 scratch on GPU 1
+	}
+	var gpu1 []gpu1Weights
+	if nGPUs >= 2 && useFP16Training {
+		gpu1 = make([]gpu1Weights, nLayers)
+		for l := 0; l < nLayers; l++ {
+			wqH := te.ToHost(lays[l].wq); wkH := te.ToHost(lays[l].wk)
+			wvH := te.ToHost(lays[l].wv); woH := te.ToHost(lays[l].wo)
+			gH := te.ToHost(lays[l].gate); uH := te.ToHost(lays[l].up)
+			dH := te.ToHost(lays[l].down)
+			gpu1[l] = gpu1Weights{
+				wq: mc.Upload(1, wqH).Ptr, wk: mc.Upload(1, wkH).Ptr,
+				wv: mc.Upload(1, wvH).Ptr, wo: mc.Upload(1, woH).Ptr,
+				gate: mc.Upload(1, gH).Ptr, up: mc.Upload(1, uH).Ptr,
+				down: mc.Upload(1, dH).Ptr,
+			}
+		}
+		gpu1[0].actBuf = mc.Alloc(1, (maxActSize*2+3)/4)
+		gpu1[0].outBuf = mc.Alloc(1, (maxActSize*2+3)/4)
+		log.Printf("[multi-gpu] FP16 weights replicated to GPU 1, parallel dispatch enabled")
+	}
+
 	// Forward GEMM: FP16 tensor cores at dim>=512, FP32 TF32 at dim<512
 	gemmBT := func(out, act *mongoose.Tensor, wFP32 *mongoose.Tensor, wFP16 *mongoose.Tensor, m, k, nn int) {
 		if useFP16Training && wFP16 != nil {
@@ -226,6 +262,7 @@ func cmdTrainCUDA() {
 			cuda.MatMulTransposeBTInto(out, act, wFP32, m, k, nn)
 		}
 	}
+
 
 	// Sync FP32 master weights → FP16 copies after optimizer step
 	syncFP16Weights := func() {
@@ -239,6 +276,22 @@ func cmdTrainCUDA() {
 			mongoose.KFP32ToFP16(lays[l].down.DevicePtr(), fp16[l].down.DevicePtr(), lays[l].down.Size)
 		}
 		mongoose.KFP32ToFP16(embed.DevicePtr(), embedFP16.DevicePtr(), embed.Size)
+		// P2P sync GPU 0 FP16 → GPU 1 FP16
+		if gpu1 != nil {
+			cuda.Sync()
+			for l := range lays {
+				src := []unsafe.Pointer{fp16[l].wq.DevicePtr(), fp16[l].wk.DevicePtr(),
+					fp16[l].wv.DevicePtr(), fp16[l].wo.DevicePtr(),
+					fp16[l].gate.DevicePtr(), fp16[l].up.DevicePtr(), fp16[l].down.DevicePtr()}
+				dst := []unsafe.Pointer{gpu1[l].wq, gpu1[l].wk, gpu1[l].wv, gpu1[l].wo,
+					gpu1[l].gate, gpu1[l].up, gpu1[l].down}
+				sizes := []int{lays[l].wq.Size, lays[l].wk.Size, lays[l].wv.Size, lays[l].wo.Size,
+					lays[l].gate.Size, lays[l].up.Size, lays[l].down.Size}
+				for i := range src {
+					mc.PeerCopyInto(0, src[i], 1, dst[i], sizes[i]*2)
+				}
+			}
+		}
 	}
 
 	// Helix optimizer — DNA-coupled gradient descent
@@ -602,6 +655,8 @@ func cmdTrainCUDA() {
 		stepLoss /= float32(n)
 
 		// === BACKWARD ===
+		// All backward GEMMs use FP32 — FP16 backward blocked on FP16 element-wise kernels.
+		// The dHidden chain will go FP16 when RMSNorm/RoPE/attention kernels get __half variants.
 		cuda.MatMulTransposeATInto(dEmbed, gradGPU, normedFinal, n, vocabSize, dim)
 		cuda.MatMulTInto(dHidden, gradGPU, embed, n, vocabSize, dim)
 
