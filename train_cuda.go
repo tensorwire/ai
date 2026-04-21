@@ -126,7 +126,12 @@ func cmdTrainCUDA() {
 		}
 	}
 
+	// FP16 GEMMs (cublasLt) give 2x tensor core throughput but add FP32→FP16
+	// conversion overhead per GEMM. At dim>=512 the GEMM compute dominates
+	// and FP16 wins. At dim<512 the conversion overhead dominates and FP32 wins.
+	useFP16Training = dim >= 512
 	_ = useFP16Training
+
 	conductor := mongoose.NewConductor(vocabSize, 100)
 
 	halfHead := headDim / 2
@@ -186,6 +191,54 @@ func cmdTrainCUDA() {
 			norm1: loadOrOnes(pfx+"input_layernorm.weight", dim),
 			norm2: loadOrOnes(pfx+"post_attention_layernorm.weight", dim),
 		}
+	}
+
+	// FP16 weight copies for tensor core GEMMs
+	type fp16W struct{ wq, wk, wv, wo, gate, up, down *mongoose.Tensor }
+	fp16 := make([]fp16W, nLayers)
+	for l := range fp16 {
+		fp16[l] = fp16W{
+			wq: cuda.FromHostFP16(te.ToHost(lays[l].wq), lays[l].wq.Shape),
+			wk: cuda.FromHostFP16(te.ToHost(lays[l].wk), lays[l].wk.Shape),
+			wv: cuda.FromHostFP16(te.ToHost(lays[l].wv), lays[l].wv.Shape),
+			wo: cuda.FromHostFP16(te.ToHost(lays[l].wo), lays[l].wo.Shape),
+			gate: cuda.FromHostFP16(te.ToHost(lays[l].gate), lays[l].gate.Shape),
+			up: cuda.FromHostFP16(te.ToHost(lays[l].up), lays[l].up.Shape),
+			down: cuda.FromHostFP16(te.ToHost(lays[l].down), lays[l].down.Shape),
+		}
+	}
+	embedFP16 := cuda.FromHostFP16(te.ToHost(embed), embed.Shape)
+
+	// FP16 scratch for activation conversion before GEMMs
+	maxActSize := n * dim
+	if n*ffnDim > maxActSize { maxActSize = n * ffnDim }
+	if n*vocabSize > maxActSize { maxActSize = n * vocabSize }
+	fp16Scratch := cuda.AllocFP16Tensor(maxActSize, []int{maxActSize})
+
+	// Forward GEMM: FP16 tensor cores at dim>=512, FP32 TF32 at dim<512
+	gemmBT := func(out, act *mongoose.Tensor, wFP32 *mongoose.Tensor, wFP16 *mongoose.Tensor, m, k, nn int) {
+		if useFP16Training && wFP16 != nil {
+			mongoose.KFP32ToFP16(act.DevicePtr(), fp16Scratch.DevicePtr(), m*k)
+			result := cuda.MatMulFP16TransposeBT(fp16Scratch, wFP16, m, k, nn)
+			mongoose.KCopy(out.DevicePtr(), result.DevicePtr(), m*nn*4)
+			te.Release(result)
+		} else {
+			cuda.MatMulTransposeBTInto(out, act, wFP32, m, k, nn)
+		}
+	}
+
+	// Sync FP32 master weights → FP16 copies after optimizer step
+	syncFP16Weights := func() {
+		for l := range lays {
+			mongoose.KFP32ToFP16(lays[l].wq.DevicePtr(), fp16[l].wq.DevicePtr(), lays[l].wq.Size)
+			mongoose.KFP32ToFP16(lays[l].wk.DevicePtr(), fp16[l].wk.DevicePtr(), lays[l].wk.Size)
+			mongoose.KFP32ToFP16(lays[l].wv.DevicePtr(), fp16[l].wv.DevicePtr(), lays[l].wv.Size)
+			mongoose.KFP32ToFP16(lays[l].wo.DevicePtr(), fp16[l].wo.DevicePtr(), lays[l].wo.Size)
+			mongoose.KFP32ToFP16(lays[l].gate.DevicePtr(), fp16[l].gate.DevicePtr(), lays[l].gate.Size)
+			mongoose.KFP32ToFP16(lays[l].up.DevicePtr(), fp16[l].up.DevicePtr(), lays[l].up.Size)
+			mongoose.KFP32ToFP16(lays[l].down.DevicePtr(), fp16[l].down.DevicePtr(), lays[l].down.Size)
+		}
+		mongoose.KFP32ToFP16(embed.DevicePtr(), embedFP16.DevicePtr(), embed.Size)
 	}
 
 	// Helix optimizer — DNA-coupled gradient descent
@@ -500,9 +553,9 @@ func cmdTrainCUDA() {
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed.DevicePtr(),
 				l.norm1.DevicePtr(), b.rmsScale1.DevicePtr(), n, dim)
 
-			cuda.MatMulTransposeBTInto(b.Q, b.normed, l.wq, n, dim, dim)
-			cuda.MatMulTransposeBTInto(b.K, b.normed, l.wk, n, dim, kvDim)
-			cuda.MatMulTransposeBTInto(b.V, b.normed, l.wv, n, dim, kvDim)
+			gemmBT(b.Q, b.normed, l.wq, fp16[li].wq, n, dim, dim)
+			gemmBT(b.K, b.normed, l.wk, fp16[li].wk, n, dim, kvDim)
+			gemmBT(b.V, b.normed, l.wv, fp16[li].wv, n, dim, kvDim)
 
 			mongoose.KRoPE(b.Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
 			mongoose.KRoPE(b.K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
@@ -511,7 +564,7 @@ func cmdTrainCUDA() {
 			mongoose.KCausalAttentionGQA(b.Q.DevicePtr(), b.K.DevicePtr(), b.V.DevicePtr(), b.attnOut.DevicePtr(),
 				n, dim, kvDim, heads, kvHeads)
 
-			cuda.MatMulTransposeBTInto(b.dx, b.attnOut, l.wo, n, dim, dim)
+			gemmBT(b.dx, b.attnOut, l.wo, fp16[li].wo, n, dim, dim)
 			te.AddInPlace(hidden, b.dx)
 
 			cuda.CopyInto(b.xMid, hidden)
@@ -520,13 +573,13 @@ func cmdTrainCUDA() {
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), b.normed2.DevicePtr(),
 				l.norm2.DevicePtr(), b.rmsScale2.DevicePtr(), n, dim)
 
-			cuda.MatMulTransposeBTInto(b.gatePre, b.normed2, l.gate, n, dim, ffnDim)
-			cuda.MatMulTransposeBTInto(b.upOut, b.normed2, l.up, n, dim, ffnDim)
+			gemmBT(b.gatePre, b.normed2, l.gate, fp16[li].gate, n, dim, ffnDim)
+			gemmBT(b.upOut, b.normed2, l.up, fp16[li].up, n, dim, ffnDim)
 
 			zero(b.ffnMid)
 			mongoose.KSiLUGateMul(b.gatePre.DevicePtr(), b.upOut.DevicePtr(), b.ffnMid.DevicePtr(), n*ffnDim)
 
-			cuda.MatMulTransposeBTInto(b.dx, b.ffnMid, l.down, n, ffnDim, dim)
+			gemmBT(b.dx, b.ffnMid, l.down, fp16[li].down, n, ffnDim, dim)
 			te.AddInPlace(hidden, b.dx)
 		}
 
@@ -534,7 +587,7 @@ func cmdTrainCUDA() {
 		mongoose.KRMSNormOutSave(hidden.DevicePtr(), normedFinal.DevicePtr(),
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), n, dim)
 
-		cuda.MatMulTransposeBTInto(logitsBuf, normedFinal, embed, n, dim, vocabSize)
+		gemmBT(logitsBuf, normedFinal, embed, embedFP16, n, dim, vocabSize)
 
 		zero(lossesGPU); zero(gradGPU)
 		invN := float32(1.0) / float32(n)
@@ -736,6 +789,10 @@ func cmdTrainCUDA() {
 		}
 
 		adamW(embed, dEmbed, embedAS.m, embedAS.v, step)
+
+		// Sync FP32 master weights → FP16 for next forward
+		syncFP16Weights()
+
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
