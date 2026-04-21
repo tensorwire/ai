@@ -185,7 +185,7 @@ The INT8 quantization noise contributes additional stochasticity that prevents c
 
 ## 9. Conclusion
 
-Dense training is a choice, not a necessity. Neural network computation is naturally sparse — most gradients are near-zero, most parameters don't change meaningfully on any given step, most embedding rows are silent. Sparse-first training builds every component of the pipeline around this observation: sparse observation via the Conductor, sparse backward via masked GEMM, sparse optimization via Needle INT8, sparse writeback via fused dequantization.
+Sparisty all the way down. Dense training is a choice, not a necessity. Neural network computation is naturally sparse — most gradients are near-zero, most parameters don't change meaningfully on any given step, most embedding rows are silent. Sparse-first training builds every component of the pipeline around this observation: sparse observation via the Conductor, sparse backward via masked GEMM, sparse optimization via Needle INT8, sparse writeback via fused dequantization.
 
 The result is a training system that achieves competitive throughput with a fundamentally different compute profile: work scales with the active parameter subset, not the total parameter count. As models grow from millions to billions of parameters while batch sparsity remains constant, the advantage of sparse-first training grows proportionally.
 
