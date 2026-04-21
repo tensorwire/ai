@@ -305,7 +305,7 @@ func cmdTrainCUDA() {
 		nParams += dim + dim*dim + kvDim*dim*2 + dim*dim + dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Println("ai train — GPU kernels + Helix DNA optimizer")
+	fmt.Printf("ai train — GPU kernels + Helix DNA optimizer (FP16=%v)\n", useFP16Training)
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
