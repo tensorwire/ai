@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -19,6 +20,7 @@ func cmdTrainCUDA() {
 	fs := flag.NewFlagSet("train-cuda", flag.ExitOnError)
 
 	dataPath := fs.String("data", "", "Training data (text file)")
+	resumePath := fs.String("resume", "", "Resume from checkpoint directory")
 	dimFlag := fs.Int("dim", 128, "Model dimension")
 	headsFlag := fs.Int("heads", 4, "Attention heads")
 	kvHeadsFlag := fs.Int("kv-heads", 2, "KV heads (GQA)")
@@ -30,6 +32,33 @@ func cmdTrainCUDA() {
 	logEvery := fs.Int("log-every", 100, "Log every N steps")
 
 	fs.Parse(os.Args[2:])
+
+	var resumeST *gguf.SafeTensors
+	if *resumePath != "" {
+		ckptDir := *resumePath
+		if _, err := os.Stat(filepath.Join(ckptDir, "config.json")); err != nil {
+			latest := findLatestCheckpoint(ckptDir)
+			if latest == "" { log.Fatalf("No checkpoint found in %s", ckptDir) }
+			ckptDir = latest
+		}
+		cfgData, err := os.ReadFile(filepath.Join(ckptDir, "config.json"))
+		if err != nil { log.Fatalf("No config.json in %s", ckptDir) }
+		var cfg map[string]interface{}
+		json.Unmarshal(cfgData, &cfg)
+		getInt := func(key string, def int) int {
+			if v, ok := cfg[key].(float64); ok { return int(v) }
+			return def
+		}
+		*dimFlag = getInt("hidden_size", *dimFlag)
+		*layersFlag = getInt("num_hidden_layers", *layersFlag)
+		*headsFlag = getInt("num_attention_heads", *headsFlag)
+		*kvHeadsFlag = getInt("num_key_value_heads", *kvHeadsFlag)
+		*ffnDimFlag = getInt("intermediate_size", *ffnDimFlag)
+		stPath := filepath.Join(ckptDir, "model.safetensors")
+		resumeST, err = gguf.OpenSafeTensors(stPath)
+		if err != nil { log.Fatalf("Load checkpoint: %v", err) }
+		fmt.Printf("Resuming from %s (dim=%d layers=%d)\n", ckptDir, *dimFlag, *layersFlag)
+	}
 
 	if *dataPath == "" {
 		*dataPath = "data/tinystories_hf.txt"
@@ -114,30 +143,48 @@ func cmdTrainCUDA() {
 	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
 	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
 
-	kaiming := func(rows, cols int) *mongoose.Tensor {
+	loadOrInit := func(name string, rows, cols int) *mongoose.Tensor {
+		if resumeST != nil && resumeST.HasTensor(name) {
+			data, _, err := resumeST.ReadTensorFloat32(name)
+			if err == nil && len(data) == rows*cols {
+				return te.FromHost(data, []int{rows, cols})
+			}
+			log.Printf("[resume] warning: %s load failed, using random init", name)
+		}
 		bound := float32(math.Sqrt(2.0 / float64(cols)))
 		d := make([]float32, rows*cols)
 		for i := range d { d[i] = bound * (2*rand.Float32() - 1) }
 		return te.FromHost(d, []int{rows, cols})
 	}
-	ones := func(sz int) *mongoose.Tensor {
+	loadOrOnes := func(name string, sz int) *mongoose.Tensor {
+		if resumeST != nil && resumeST.HasTensor(name) {
+			data, _, err := resumeST.ReadTensorFloat32(name)
+			if err == nil && len(data) == sz {
+				return te.FromHost(data, []int{1, sz})
+			}
+		}
 		d := make([]float32, sz)
 		for i := range d { d[i] = 1.0 }
 		return te.FromHost(d, []int{1, sz})
 	}
 
-	embedData := make([]float32, vocabSize*dim)
-	for i := range embedData { embedData[i] = float32(rand.NormFloat64()) * 0.02 }
-	embed := te.FromHost(embedData, []int{vocabSize, dim})
-	finalNorm := ones(dim)
+	embed := loadOrInit("model.embed_tokens.weight", vocabSize, dim)
+	finalNorm := loadOrOnes("model.norm.weight", dim)
 
 	type layer struct{ wq, wk, wv, wo, gate, up, down, norm1, norm2 *mongoose.Tensor }
 	lays := make([]layer, nLayers)
 	for l := range lays {
+		pfx := fmt.Sprintf("model.layers.%d.", l)
 		lays[l] = layer{
-			wq: kaiming(dim, dim), wk: kaiming(kvDim, dim), wv: kaiming(kvDim, dim),
-			wo: kaiming(dim, dim), gate: kaiming(ffnDim, dim), up: kaiming(ffnDim, dim),
-			down: kaiming(dim, ffnDim), norm1: ones(dim), norm2: ones(dim),
+			wq: loadOrInit(pfx+"self_attn.q_proj.weight", dim, dim),
+			wk: loadOrInit(pfx+"self_attn.k_proj.weight", kvDim, dim),
+			wv: loadOrInit(pfx+"self_attn.v_proj.weight", kvDim, dim),
+			wo: loadOrInit(pfx+"self_attn.o_proj.weight", dim, dim),
+			gate: loadOrInit(pfx+"mlp.gate_proj.weight", ffnDim, dim),
+			up: loadOrInit(pfx+"mlp.up_proj.weight", ffnDim, dim),
+			down: loadOrInit(pfx+"mlp.down_proj.weight", dim, ffnDim),
+			norm1: loadOrOnes(pfx+"input_layernorm.weight", dim),
+			norm2: loadOrOnes(pfx+"post_attention_layernorm.weight", dim),
 		}
 	}
 
