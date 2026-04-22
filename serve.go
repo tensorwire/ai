@@ -200,7 +200,8 @@ type ErrorDetail struct {
 
 // serveState holds the loaded model and engine state for the running server.
 type serveState struct {
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	inferMu sync.Mutex
 
 	// Model metadata
 	modelName string
@@ -721,9 +722,13 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Non-streaming response: run forward pass
+	// Non-streaming response: serialize inference (shared KV cache)
+	s.inferMu.Lock()
+	defer s.inferMu.Unlock()
+
 	s.mu.RLock()
 	fwd := s.fwd
+	resetKV := s.resetKV
 	s.mu.RUnlock()
 
 	temp := float32(0.7)
@@ -732,10 +737,6 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	}
 	topK := 40
 
-	// Reset KV cache before each request
-	s.mu.RLock()
-	resetKV := s.resetKV
-	s.mu.RUnlock()
 	if resetKV != nil {
 		resetKV()
 	}
