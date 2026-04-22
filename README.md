@@ -141,6 +141,22 @@ ai train data="/data/*.txt" --dim 512 --layers 8 --steps 5000 --lr 3e-4
 | `ai models` | List downloaded models |
 | `ai info <model>` | Show model architecture |
 
+## Platform Support Matrix
+
+Every command works on every backend. Optimized paths are used when available, with automatic fallback.
+
+| Command | Metal | CUDA | WebGPU (Vulkan) | CPU |
+|---------|-------|------|-----------------|-----|
+| train | yes | yes | yes | yes |
+| finetune | yes | yes | yes (CPU train) | yes (CPU train) |
+| chat | yes (fused/graph/generic) | yes (generic) | yes (generic) | yes (generic) |
+| infer | yes (fused/graph/tier2) | yes (Q8/tier2) | yes (tier2/3) | yes (tier3) |
+| serve | yes (fused/generic) | yes (generic) | yes (generic) | yes (generic) |
+| eval | yes (planned) | yes | planned | planned |
+| profile | planned | yes | planned | planned |
+| explain | yes | yes | yes | yes |
+| sweep | yes (graph) | yes (exec) | yes (exec) | yes (exec) |
+
 ## Performance
 
 ### Training convergence — dim=512, RTX 5090
