@@ -4,6 +4,8 @@ GPU-accelerated ML CLI. Train, infer, quantize, and serve LLMs. Zero Python, one
 
 Powered by the [mongoose](https://github.com/open-ai-org/mongoose) GPU compute engine.
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/swizzley)
+
 ## Install
 
 macOS (Metal — Apple Silicon):

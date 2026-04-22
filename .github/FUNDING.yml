@@ -1,0 +1,10 @@
+## Sponsor
+
+`ai` is built and maintained by a solo developer. If it saves you time
+or runs in your stack, consider sponsoring — it directly funds:
+
+- GPU time for benchmarking across Metal, CUDA, and Vulkan hardware
+- CI runners for the full backend matrix
+- Continued maintenance, kernel work, and new model support
+
+[Sponsor on GitHub](https://github.com/sponsors/swizzley)
