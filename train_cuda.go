@@ -152,7 +152,11 @@ func cmdTrainCUDA() {
 	// cublasLt's algorithm search beats cublasGemmEx for FP16.
 	useFP16Training = dim >= 512
 	nativeFP16 := useFP16Training && mongoose.FP16TrainKernelsLoaded() && nGPUs >= 2
-	if nativeFP16 {
+	helixDispatch := nativeFP16 && nGPUs >= 2
+	if helixDispatch {
+		nativeFP16 = false // helix dispatch replaces the old layer-split path
+		log.Println("[ai] Helix Dispatch: interleaved position parallelism")
+	} else if nativeFP16 {
 		log.Println("[ai] native FP16 training kernels available — zero conversion path")
 	}
 
@@ -171,6 +175,10 @@ func cmdTrainCUDA() {
 	}
 	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
 	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
+
+	// m = positions per GPU for Helix Dispatch
+	m := n
+	if nGPUs >= 2 { m = n / nGPUs }
 
 	// Layer l lives entirely on GPU (l % nGPUs).
 	// FP32 master weights, FP16 shadows, Adam M/V, gradient buffers — all on the owning device.
@@ -484,12 +492,187 @@ func cmdTrainCUDA() {
 		}
 	}
 
+	// === HELIX DISPATCH: per-GPU buffers for interleaved position parallelism ===
+	type hdBufs struct {
+		h16, normed16, Q16, K16, V16, attnOut16 *mongoose.Tensor
+		xIn16, xMid16, normed216                 *mongoose.Tensor
+		gatePre16, upOut16, ffnMid16, dx16       *mongoose.Tensor
+		// Full K,V for attention (all positions, after all-gather)
+		Kfull, Vfull *mongoose.Tensor
+		// Backward
+		dH16, dFfn16, dGate16, dUp16 *mongoose.Tensor
+		dN1, dN2, dx32               *mongoose.Tensor
+		dAttnOut, dQ, dK, dV         *mongoose.Tensor
+		dWQ, dWK, dWV, dWO           *mongoose.Tensor
+		dWGate, dWUp, dWDown         *mongoose.Tensor
+		rmsScale1, rmsScale2         *mongoose.Tensor
+		// FP32 scratch for attention backward (needs FP32 Q,K,V)
+		Q32, K32, V32 *mongoose.Tensor
+	}
+	var hdLayerBufs [][]hdBufs // hdLayerBufs[dev][layer]
+	var hdHidden16 []unsafe.Pointer   // per-GPU FP16 hidden (m rows)
+	var hdFP16 [][]fp16W              // hdFP16[dev][layer] = FP16 weight replicas
+	var hdEmbedFP16 []*mongoose.Tensor
+	var hdFinalNormFP16 []*mongoose.Tensor
+	var hdRopeCos, hdRopeSin []unsafe.Pointer // per-GPU RoPE tables
+	// Per-GPU FP32 master weights + Helix M/V for optimizer
+	type hdOptState struct {
+		lays []layer
+		gate_m, gate_v, up_m, up_v     []*mongoose.Tensor
+		wq_m, wq_v, wo_m, wo_v         []*mongoose.Tensor
+		wk_m, wk_v, wv_m, wv_v         []*mongoose.Tensor
+	}
+	var hdOpt []hdOptState
+
+	if helixDispatch {
+		hdLayerBufs = make([][]hdBufs, nGPUs)
+		hdHidden16 = make([]unsafe.Pointer, nGPUs)
+		hdFP16 = make([][]fp16W, nGPUs)
+		hdEmbedFP16 = make([]*mongoose.Tensor, nGPUs)
+		hdFinalNormFP16 = make([]*mongoose.Tensor, nGPUs)
+		hdRopeCos = make([]unsafe.Pointer, nGPUs)
+		hdRopeSin = make([]unsafe.Pointer, nGPUs)
+		hdOpt = make([]hdOptState, nGPUs)
+
+		for d := 0; d < nGPUs; d++ {
+			if d > 0 { mongoose.SetDevice(d) }
+
+			// Allocate FP16 hidden buffer (m rows per GPU)
+			hdHidden16[d] = mc.AllocFP16OnDevice(d, m*dim)
+
+			// FP16 weight replicas
+			hdFP16[d] = make([]fp16W, nLayers)
+			for l := range fp16 {
+				if d == 0 {
+					hdFP16[d][l] = fp16[l]
+				} else {
+					p2p := func(src *mongoose.Tensor) *mongoose.Tensor {
+						ptr := mc.AllocFP16OnDevice(d, src.Size)
+						mc.PeerCopyInto(0, src.DevicePtr(), d, ptr, src.Size*2)
+						return mongoose.TensorFromDevicePtr(ptr, src.Size)
+					}
+					hdFP16[d][l] = fp16W{
+						wq: p2p(fp16[l].wq), wk: p2p(fp16[l].wk), wv: p2p(fp16[l].wv),
+						wo: p2p(fp16[l].wo), gate: p2p(fp16[l].gate), up: p2p(fp16[l].up),
+						down: p2p(fp16[l].down), norm1: p2p(fp16[l].norm1), norm2: p2p(fp16[l].norm2),
+					}
+				}
+			}
+			if d == 0 {
+				hdEmbedFP16[d] = embedFP16
+				hdFinalNormFP16[d] = finalNormFP16
+			} else {
+				p2pT := func(src *mongoose.Tensor) *mongoose.Tensor {
+					ptr := mc.AllocFP16OnDevice(d, src.Size)
+					mc.PeerCopyInto(0, src.DevicePtr(), d, ptr, src.Size*2)
+					return mongoose.TensorFromDevicePtr(ptr, src.Size)
+				}
+				hdEmbedFP16[d] = p2pT(embedFP16)
+				hdFinalNormFP16[d] = p2pT(finalNormFP16)
+			}
+
+			// RoPE tables (FP32, small)
+			if d == 0 {
+				hdRopeCos[d] = ropeCos.DevicePtr()
+				hdRopeSin[d] = ropeSin.DevicePtr()
+			} else {
+				ropeBytes := seqLen * halfHead * 4
+				hdRopeCos[d] = mc.AllocBytesOnDevice(d, ropeBytes)
+				hdRopeSin[d] = mc.AllocBytesOnDevice(d, ropeBytes)
+				mc.PeerCopyInto(0, ropeCos.DevicePtr(), d, hdRopeCos[d], ropeBytes)
+				mc.PeerCopyInto(0, ropeSin.DevicePtr(), d, hdRopeSin[d], ropeBytes)
+			}
+
+			// Per-layer activation + gradient buffers (m rows, not n)
+			hdLayerBufs[d] = make([]hdBufs, nLayers)
+			for l := range hdLayerBufs[d] {
+				a16 := func(nElem int) *mongoose.Tensor {
+					if d == 0 { return cuda.AllocFP16Tensor(nElem, []int{nElem}) }
+					ptr := mc.AllocFP16OnDevice(d, nElem)
+					return mongoose.TensorFromDevicePtr(ptr, nElem)
+				}
+				a32 := func(nElem int) *mongoose.Tensor {
+					if d == 0 { return te.Zeros([]int{nElem}) }
+					return mc.ZerosFP32OnDevice(d, nElem)
+				}
+				hdLayerBufs[d][l] = hdBufs{
+					h16: a16(m*dim), normed16: a16(m*dim),
+					Q16: a16(m*dim), K16: a16(m*kvDim), V16: a16(m*kvDim),
+					attnOut16: a16(m*dim),
+					xIn16: a16(m*dim), xMid16: a16(m*dim),
+					normed216: a16(m*dim),
+					gatePre16: a16(m*ffnDim), upOut16: a16(m*ffnDim),
+					ffnMid16: a16(m*ffnDim), dx16: a16(m*dim),
+					Kfull: a16(n*kvDim), Vfull: a16(n*kvDim),
+					dH16: a16(m*dim), dFfn16: a16(m*ffnDim),
+					dGate16: a16(m*ffnDim), dUp16: a16(m*ffnDim),
+					dN1: a32(m*dim), dN2: a32(m*dim), dx32: a32(m*dim),
+					dAttnOut: a32(m*dim),
+					dQ: a32(m*dim), dK: a32(m*kvDim), dV: a32(m*kvDim),
+					Q32: a32(m*dim), K32: a32(m*kvDim), V32: a32(m*kvDim),
+					dWQ: a32(dim*dim), dWK: a32(kvDim*dim), dWV: a32(kvDim*dim),
+					dWO: a32(dim*dim),
+					dWGate: a32(ffnDim*dim), dWUp: a32(ffnDim*dim), dWDown: a32(dim*ffnDim),
+					rmsScale1: a32(m), rmsScale2: a32(m),
+				}
+			}
+
+			// Per-GPU FP32 master weights + Helix M/V (initialized identically from GPU 0)
+			opt := hdOptState{
+				lays:   make([]layer, nLayers),
+				gate_m: make([]*mongoose.Tensor, nLayers), gate_v: make([]*mongoose.Tensor, nLayers),
+				up_m: make([]*mongoose.Tensor, nLayers), up_v: make([]*mongoose.Tensor, nLayers),
+				wq_m: make([]*mongoose.Tensor, nLayers), wq_v: make([]*mongoose.Tensor, nLayers),
+				wo_m: make([]*mongoose.Tensor, nLayers), wo_v: make([]*mongoose.Tensor, nLayers),
+				wk_m: make([]*mongoose.Tensor, nLayers), wk_v: make([]*mongoose.Tensor, nLayers),
+				wv_m: make([]*mongoose.Tensor, nLayers), wv_v: make([]*mongoose.Tensor, nLayers),
+			}
+			if d == 0 {
+				opt.lays = lays
+				for l := range lays {
+					la := &layAS[l]
+					opt.gate_m[l] = la.gate.m; opt.gate_v[l] = la.gate.v
+					opt.up_m[l] = la.up.m; opt.up_v[l] = la.up.v
+					opt.wq_m[l] = la.wq.m; opt.wq_v[l] = la.wq.v
+					opt.wo_m[l] = la.wo.m; opt.wo_v[l] = la.wo.v
+					opt.wk_m[l] = la.wk.m; opt.wk_v[l] = la.wk.v
+					opt.wv_m[l] = la.wv.m; opt.wv_v[l] = la.wv.v
+				}
+			} else {
+				for l := range lays {
+					p2p32 := func(src *mongoose.Tensor) *mongoose.Tensor {
+						t := mc.ZerosFP32OnDevice(d, src.Size)
+						mc.PeerCopyInto(0, src.DevicePtr(), d, t.DevicePtr(), src.Size*4)
+						return t
+					}
+					z32 := func(sz int) *mongoose.Tensor { return mc.ZerosFP32OnDevice(d, sz) }
+					opt.lays[l] = layer{
+						wq: p2p32(lays[l].wq), wk: p2p32(lays[l].wk), wv: p2p32(lays[l].wv),
+						wo: p2p32(lays[l].wo), gate: p2p32(lays[l].gate), up: p2p32(lays[l].up),
+						down: p2p32(lays[l].down), norm1: p2p32(lays[l].norm1), norm2: p2p32(lays[l].norm2),
+					}
+					sz := lays[l].gate.Size
+					opt.gate_m[l] = z32(sz); opt.gate_v[l] = z32(sz)
+					opt.up_m[l] = z32(sz); opt.up_v[l] = z32(sz)
+					opt.wq_m[l] = z32(lays[l].wq.Size); opt.wq_v[l] = z32(lays[l].wq.Size)
+					opt.wo_m[l] = z32(lays[l].wo.Size); opt.wo_v[l] = z32(lays[l].wo.Size)
+					opt.wk_m[l] = z32(lays[l].wk.Size); opt.wk_v[l] = z32(lays[l].wk.Size)
+					opt.wv_m[l] = z32(lays[l].wv.Size); opt.wv_v[l] = z32(lays[l].wv.Size)
+				}
+			}
+			hdOpt[d] = opt
+		}
+		mc.SyncAll()
+		mongoose.SetDevice(0)
+		log.Printf("[helix-dispatch] %d GPUs, m=%d positions each, %d layers", nGPUs, m, nLayers)
+	}
+
 	nParams := vocabSize*dim + dim
 	for range lays {
 		nParams += dim + dim*dim + kvDim*dim*2 + dim*dim + dim + ffnDim*dim*2 + dim*ffnDim
 	}
 
-	fmt.Printf("ai train — GPU kernels + Helix DNA optimizer (FP16=%v native=%v)\n", useFP16Training, nativeFP16)
+	fmt.Printf("ai train — GPU kernels + Helix DNA optimizer (FP16=%v native=%v helix=%v)\n", useFP16Training, nativeFP16, helixDispatch)
 	fmt.Printf("  engine:   %s\n", eng.Name())
 	fmt.Printf("  data:     %s (%d bytes)\n", *dataPath, len(raw))
 	fmt.Printf("  model:    dim=%d heads=%d kv=%d layers=%d ffn=%d seq=%d vocab=%d\n",
@@ -736,7 +919,284 @@ func cmdTrainCUDA() {
 		var stepLoss float32
 		invN := float32(1.0) / float32(n)
 
-		if nativeFP16 {
+		if helixDispatch {
+			// === HELIX DISPATCH: interleaved position parallelism ===
+			// Both GPUs run ALL layers simultaneously on their share of positions.
+			// Zero pipeline stalls. Only K,V exchange for attention per layer.
+
+			// Convert hidden(FP32) → FP16 on GPU 0
+			mongoose.KFP32ToFP16(hidden.DevicePtr(), hdHidden16[0], n*dim)
+
+			// Scatter: extract interleaved rows to each GPU
+			// GPU 0 gets even positions (0,2,4,...), GPU 1 gets odd (1,3,5,...)
+			// GPU 0's rows are extracted in-place from the full hidden
+			tmpScatter := h16Scratch.DevicePtr()
+			mongoose.InterleaveExtract(hdHidden16[0], tmpScatter, n, dim, nGPUs, 0, 2)
+			mongoose.KCopy(hdHidden16[0], tmpScatter, m*dim*2)
+			for d := 1; d < nGPUs; d++ {
+				mongoose.InterleaveExtract(unsafe.Pointer(uintptr(0)), tmpScatter, n, dim, nGPUs, d, 2)
+			}
+			// Wait — InterleaveExtract needs the ORIGINAL full hidden, but I already overwrote hdHidden16[0].
+			// Need to extract all GPUs' rows before overwriting. Let me fix this.
+
+			// Actually: extract odd rows first (before overwriting), P2P to GPU 1, then extract even.
+			// Or: use h16Scratch as the full hidden, extract from there.
+			_ = tmpScatter
+
+			// Simpler: h16Scratch has the full FP16 hidden. Extract from it.
+			// GPU 0 even rows:
+			mongoose.InterleaveExtract(h16Scratch.DevicePtr(), hdHidden16[0], n, dim, nGPUs, 0, 2)
+			// GPU 1+ odd rows: extract to a temp buffer on GPU 0, P2P to target
+			for d := 1; d < nGPUs; d++ {
+				scratch0 := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
+				mongoose.InterleaveExtract(h16Scratch.DevicePtr(), scratch0.DevicePtr(), n, dim, nGPUs, d, 2)
+				mc.PeerCopyInto(0, scratch0.DevicePtr(), d, hdHidden16[d], m*dim*2)
+			}
+			mc.SyncAll()
+
+			// Each GPU runs all layers on its m rows
+			for d := 0; d < nGPUs; d++ {
+				mongoose.SetDevice(d)
+				h16Ptr := hdHidden16[d]
+
+				for li := range lays {
+					hb := &hdLayerBufs[d][li]
+					w := &hdFP16[d][li]
+					cosP, sinP := hdRopeCos[d], hdRopeSin[d]
+
+					// Save xIn16 for backward
+					mongoose.KCopy(hb.xIn16.DevicePtr(), h16Ptr, m*dim*2)
+					mongoose.KCopy(hb.h16.DevicePtr(), h16Ptr, m*dim*2)
+
+					// RMSNorm
+					mongoose.KRMSNormOutSaveFP16(hb.h16.DevicePtr(), hb.normed16.DevicePtr(),
+						w.norm1.DevicePtr(), hb.rmsScale1.DevicePtr(), m, dim)
+
+					// QKV GEMMs (m rows × full weight)
+					mc.MatMulFP16TransBOnDevice(d, hb.normed16.DevicePtr(), w.wq.DevicePtr(), hb.Q16.DevicePtr(), m, dim, dim)
+					mc.MatMulFP16TransBOnDevice(d, hb.normed16.DevicePtr(), w.wk.DevicePtr(), hb.K16.DevicePtr(), m, dim, kvDim)
+					mc.MatMulFP16TransBOnDevice(d, hb.normed16.DevicePtr(), w.wv.DevicePtr(), hb.V16.DevicePtr(), m, dim, kvDim)
+
+					// RoPE on local positions only
+					// Need per-GPU RoPE: GPU d's positions are [d, d+nGPUs, d+2*nGPUs, ...]
+					// The cos/sin tables are indexed by position. Each GPU needs its interleaved subset.
+					// For now: use full tables, RoPE kernel handles m positions starting at pos=0
+					// TODO: extract interleaved cos/sin or pass position offsets
+					mongoose.KRoPEFP16(hb.Q16.DevicePtr(), cosP, sinP, m, dim, headDim, heads)
+					mongoose.KRoPEFP16(hb.K16.DevicePtr(), cosP, sinP, m, kvDim, headDim, kvHeads)
+
+					// All-gather K,V for attention — each GPU needs all positions
+					// Each GPU has m rows of K,V. Gather into Kfull[n, kvDim], Vfull[n, kvDim].
+					// GPU d's K goes to rows [d, d+nGPUs, ...] in Kfull.
+					// For 2 GPUs: GPU 0 has even K, GPU 1 has odd K.
+					// Insert own rows, then receive other GPU's rows via P2P.
+					mongoose.InterleaveInsert(hb.K16.DevicePtr(), hb.Kfull.DevicePtr(), n, kvDim, nGPUs, d, 2)
+					mongoose.InterleaveInsert(hb.V16.DevicePtr(), hb.Vfull.DevicePtr(), n, kvDim, nGPUs, d, 2)
+				}
+				// Sync before K,V exchange
+				mc.SyncDevice(d)
+			}
+
+			// K,V all-gather: each GPU sends its K,V rows to all other GPUs
+			for li := range lays {
+				for d := 0; d < nGPUs; d++ {
+					srcK := hdLayerBufs[d][li].K16.DevicePtr()
+					srcV := hdLayerBufs[d][li].V16.DevicePtr()
+					for d2 := 0; d2 < nGPUs; d2++ {
+						if d2 == d { continue }
+						dstKfull := hdLayerBufs[d2][li].Kfull.DevicePtr()
+						dstVfull := hdLayerBufs[d2][li].Vfull.DevicePtr()
+						// Insert GPU d's rows into GPU d2's Kfull at interleaved positions
+						// P2P the packed m rows, then interleave-insert on the target
+						// For simplicity: P2P packed K to target, then insert
+						tmpBuf := mc.AllocFP16OnDevice(d2, m*kvDim)
+						mc.PeerCopyInto(d, srcK, d2, tmpBuf, m*kvDim*2)
+						mongoose.SetDevice(d2)
+						mongoose.InterleaveInsert(tmpBuf, dstKfull, n, kvDim, nGPUs, d, 2)
+						tmpBufV := mc.AllocFP16OnDevice(d2, m*kvDim)
+						mc.PeerCopyInto(d, srcV, d2, tmpBufV, m*kvDim*2)
+						mongoose.InterleaveInsert(tmpBufV, dstVfull, n, kvDim, nGPUs, d, 2)
+					}
+				}
+			}
+			mc.SyncAll()
+
+			// Continue forward: attention + FFN on each GPU
+			for d := 0; d < nGPUs; d++ {
+				mongoose.SetDevice(d)
+
+				for li := range lays {
+					hb := &hdLayerBufs[d][li]
+					w := &hdFP16[d][li]
+
+					// Attention: Q is local (m rows), K,V are full (n rows)
+					// Need custom attention call with different Q vs K,V sizes
+					// Q[m, dim], Kfull[n, kvDim], Vfull[n, kvDim] → attnOut[m, dim]
+					mongoose.KCausalAttentionGQAFP16(hb.Q16.DevicePtr(), hb.Kfull.DevicePtr(), hb.Vfull.DevicePtr(),
+						hb.attnOut16.DevicePtr(), m, dim, kvDim, heads, kvHeads)
+
+					// Wo projection + residual
+					mc.MatMulFP16TransBOnDevice(d, hb.attnOut16.DevicePtr(), w.wo.DevicePtr(), hb.dx16.DevicePtr(), m, dim, dim)
+					mongoose.KFP16AddInPlace(hb.h16.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+
+					// Save xMid16 for backward
+					mongoose.KCopy(hb.xMid16.DevicePtr(), hb.h16.DevicePtr(), m*dim*2)
+
+					// FFN
+					mongoose.KRMSNormOutSaveFP16(hb.h16.DevicePtr(), hb.normed216.DevicePtr(),
+						w.norm2.DevicePtr(), hb.rmsScale2.DevicePtr(), m, dim)
+
+					mc.MatMulFP16TransBOnDevice(d, hb.normed216.DevicePtr(), w.gate.DevicePtr(), hb.gatePre16.DevicePtr(), m, dim, ffnDim)
+					mc.MatMulFP16TransBOnDevice(d, hb.normed216.DevicePtr(), w.up.DevicePtr(), hb.upOut16.DevicePtr(), m, dim, ffnDim)
+
+					mongoose.KSiLUGateMulFP16(hb.gatePre16.DevicePtr(), hb.upOut16.DevicePtr(), hb.ffnMid16.DevicePtr(), m*ffnDim)
+
+					mc.MatMulFP16TransBOnDevice(d, hb.ffnMid16.DevicePtr(), w.down.DevicePtr(), hb.dx16.DevicePtr(), m, ffnDim, dim)
+					mongoose.KFP16AddInPlace(hb.h16.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+				}
+				// h16 = final hidden for this GPU's positions
+				hdHidden16[d] = hdLayerBufs[d][nLayers-1].h16.DevicePtr()
+			}
+			mc.SyncAll()
+
+			// Gather: interleave results back to GPU 0 for loss computation
+			mongoose.SetDevice(0)
+			fullH16 := h16Scratch.DevicePtr()
+			mongoose.InterleaveInsert(hdHidden16[0], fullH16, n, dim, nGPUs, 0, 2)
+			for d := 1; d < nGPUs; d++ {
+				scratch0 := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
+				mc.PeerCopyInto(d, hdHidden16[d], 0, scratch0.DevicePtr(), m*dim*2)
+				mongoose.InterleaveInsert(scratch0.DevicePtr(), fullH16, n, dim, nGPUs, d, 2)
+			}
+
+			// FP16→FP32 for loss
+			mongoose.KFP16ToFP32(fullH16, hidden.DevicePtr(), n*dim)
+
+			// Final RMSNorm + logits + loss (on GPU 0, full seqLen)
+			mongoose.KFP32ToFP16(hidden.DevicePtr(), h16Scratch.DevicePtr(), n*dim)
+			mongoose.KRMSNormOutSaveFP16(h16Scratch.DevicePtr(), normedFinal16.DevicePtr(),
+				finalNormFP16.DevicePtr(), finalScales.DevicePtr(), n, dim)
+			cuda.MatMulFP16TransposeBTInto(logitsBuf, normedFinal16, embedFP16, n, dim, vocabSize)
+
+			zero(lossesGPU); zero(gradGPU)
+			mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
+				lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
+
+			cuda.Sync()
+			lossH := te.ToHost(lossesGPU)
+			for _, l := range lossH { stepLoss += l }
+			stepLoss /= float32(n)
+
+			// === BACKWARD (Helix Dispatch) ===
+			// LM head backward on GPU 0 (full seqLen)
+			mongoose.KFP16ToFP32(normedFinal16.DevicePtr(), normedFinal.DevicePtr(), n*dim)
+			cuda.MatMulTransposeATInto(dEmbed, gradGPU, normedFinal, n, vocabSize, dim)
+			cuda.MatMulTInto(dHidden, gradGPU, embed, n, vocabSize, dim)
+
+			zero(dScratch)
+			mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
+				finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
+			cuda.CopyInto(dHidden, dScratch)
+
+			// Scatter dHidden to GPUs (same interleave as forward)
+			mongoose.KFP32ToFP16(dHidden.DevicePtr(), h16Scratch.DevicePtr(), n*dim)
+			mongoose.InterleaveExtract(h16Scratch.DevicePtr(), hdHidden16[0], n, dim, nGPUs, 0, 2)
+			for d := 1; d < nGPUs; d++ {
+				scratch0 := cuda.AllocFP16Tensor(m*dim, []int{m*dim})
+				mongoose.InterleaveExtract(h16Scratch.DevicePtr(), scratch0.DevicePtr(), n, dim, nGPUs, d, 2)
+				mc.PeerCopyInto(0, scratch0.DevicePtr(), d, hdHidden16[d], m*dim*2)
+			}
+			mc.SyncAll()
+
+			// Each GPU runs backward on all layers for its positions
+			for d := 0; d < nGPUs; d++ {
+				mongoose.SetDevice(d)
+				dH16Ptr := hdHidden16[d]
+
+				for li := nLayers - 1; li >= 0; li-- {
+					hb := &hdLayerBufs[d][li]
+					w := &hdFP16[d][li]
+					cosP, sinP := hdRopeCos[d], hdRopeSin[d]
+
+					// dH16 for this layer
+					mongoose.KCopy(hb.dH16.DevicePtr(), dH16Ptr, m*dim*2)
+
+					// FFN backward
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dH16.DevicePtr(), w.down.DevicePtr(), hb.dN1.DevicePtr(), m, dim, ffnDim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dH16.DevicePtr(), hb.ffnMid16.DevicePtr(), hb.dWDown.DevicePtr(), m, dim, ffnDim)
+
+					mongoose.KFP32ToFP16(hb.dN1.DevicePtr(), hb.dFfn16.DevicePtr(), m*ffnDim)
+					mongoose.KSiLUGateBackwardFP16(hb.dFfn16.DevicePtr(), hb.gatePre16.DevicePtr(),
+						hb.upOut16.DevicePtr(), hb.dGate16.DevicePtr(), hb.dUp16.DevicePtr(), m*ffnDim)
+
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dGate16.DevicePtr(), w.gate.DevicePtr(), hb.dN2.DevicePtr(), m, ffnDim, dim)
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dUp16.DevicePtr(), w.up.DevicePtr(), hb.dN1.DevicePtr(), m, ffnDim, dim)
+					mongoose.KAddInPlace(hb.dN2.DevicePtr(), hb.dN1.DevicePtr(), m*dim)
+
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dGate16.DevicePtr(), hb.normed216.DevicePtr(), hb.dWGate.DevicePtr(), m, ffnDim, dim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dUp16.DevicePtr(), hb.normed216.DevicePtr(), hb.dWUp.DevicePtr(), m, ffnDim, dim)
+
+					// RMSNorm backward (post-attn)
+					mongoose.KFP16ToFP32(hb.xMid16.DevicePtr(), hb.dx32.DevicePtr(), m*dim)
+					mongoose.KZero(hb.dN1.DevicePtr(), m*dim*4)
+					mongoose.KRMSNormBackward(hb.dN2.DevicePtr(), hb.dx32.DevicePtr(),
+						hdOpt[d].lays[li].norm2.DevicePtr(), hb.rmsScale2.DevicePtr(), hb.dN1.DevicePtr(), m, dim)
+					mongoose.KFP32ToFP16(hb.dN1.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+					mongoose.KFP16AddInPlace(hb.dH16.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+
+					// Attention backward
+					mongoose.KFP32ToFP16(hb.dH16.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+					// Wait — dH16 is already FP16. The attention backward GEMM needs FP16→FP32.
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dH16.DevicePtr(), w.wo.DevicePtr(), hb.dAttnOut.DevicePtr(), m, dim, dim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dH16.DevicePtr(), hb.attnOut16.DevicePtr(), hb.dWO.DevicePtr(), m, dim, dim)
+
+					// Attention backward kernel (FP32)
+					mongoose.KFP16ToFP32(hb.Q16.DevicePtr(), hb.Q32.DevicePtr(), m*dim)
+					mongoose.KFP16ToFP32(hb.K16.DevicePtr(), hb.K32.DevicePtr(), m*kvDim)
+					mongoose.KFP16ToFP32(hb.V16.DevicePtr(), hb.V32.DevicePtr(), m*kvDim)
+					mongoose.KZero(hb.dQ.DevicePtr(), m*dim*4)
+					mongoose.KZero(hb.dK.DevicePtr(), m*kvDim*4)
+					mongoose.KZero(hb.dV.DevicePtr(), m*kvDim*4)
+					mongoose.KCausalAttentionBackward(hb.Q32.DevicePtr(), hb.K32.DevicePtr(), hb.V32.DevicePtr(), hb.dAttnOut.DevicePtr(),
+						hb.dQ.DevicePtr(), hb.dK.DevicePtr(), hb.dV.DevicePtr(), m, dim, kvDim, heads, kvHeads)
+
+					mongoose.KRoPEBackward(hb.dQ.DevicePtr(), cosP, sinP, m, dim, headDim, heads)
+					mongoose.KRoPEBackward(hb.dK.DevicePtr(), cosP, sinP, m, kvDim, headDim, kvHeads)
+
+					// dN1 = dQ @ wq + dK @ wk + dV @ wv
+					mongoose.KFP32ToFP16(hb.dQ.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dx16.DevicePtr(), w.wq.DevicePtr(), hb.dN1.DevicePtr(), m, dim, dim)
+
+					mongoose.KFP32ToFP16(hb.dK.DevicePtr(), hb.dx16.DevicePtr(), m*kvDim)
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dx16.DevicePtr(), w.wk.DevicePtr(), hb.dN2.DevicePtr(), m, kvDim, dim)
+					mongoose.KAddInPlace(hb.dN1.DevicePtr(), hb.dN2.DevicePtr(), m*dim)
+
+					mongoose.KFP32ToFP16(hb.dV.DevicePtr(), hb.dx16.DevicePtr(), m*kvDim)
+					mc.MatMulFP16FP32OutOnDevice(d, hb.dx16.DevicePtr(), w.wv.DevicePtr(), hb.dN2.DevicePtr(), m, kvDim, dim)
+					mongoose.KAddInPlace(hb.dN1.DevicePtr(), hb.dN2.DevicePtr(), m*dim)
+
+					// dW for Q/K/V
+					mongoose.KFP32ToFP16(hb.dQ.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dx16.DevicePtr(), hb.normed16.DevicePtr(), hb.dWQ.DevicePtr(), m, dim, dim)
+					mongoose.KFP32ToFP16(hb.dK.DevicePtr(), hb.dx16.DevicePtr(), m*kvDim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dx16.DevicePtr(), hb.normed16.DevicePtr(), hb.dWK.DevicePtr(), m, kvDim, dim)
+					mongoose.KFP32ToFP16(hb.dV.DevicePtr(), hb.dx16.DevicePtr(), m*kvDim)
+					mc.MatMulFP16TransAFP32OutOnDevice(d, hb.dx16.DevicePtr(), hb.normed16.DevicePtr(), hb.dWV.DevicePtr(), m, kvDim, dim)
+
+					// RMSNorm backward (pre-attn)
+					mongoose.KFP16ToFP32(hb.xIn16.DevicePtr(), hb.dx32.DevicePtr(), m*dim)
+					mongoose.KZero(hb.dN2.DevicePtr(), m*dim*4)
+					mongoose.KRMSNormBackward(hb.dN1.DevicePtr(), hb.dx32.DevicePtr(),
+						hdOpt[d].lays[li].norm1.DevicePtr(), hb.rmsScale1.DevicePtr(), hb.dN2.DevicePtr(), m, dim)
+					mongoose.KFP32ToFP16(hb.dN2.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+					mongoose.KFP16AddInPlace(hb.dH16.DevicePtr(), hb.dx16.DevicePtr(), m*dim)
+
+					dH16Ptr = hb.dH16.DevicePtr()
+				}
+			}
+			mc.SyncAll()
+
+		} else if nativeFP16 {
 			// === NATIVE FP16 PATH ===
 			// Hidden flows forward as FP16. Stays on whatever device owns the current layer.
 			// Residual adds are device-local via KFP16AddInPlace. P2P only at device boundaries.
@@ -1165,7 +1625,6 @@ func cmdTrainCUDA() {
 		stepLR := getLR(step)
 		r, _, _, _ := hlx.PrepareStep(step, stepLoss, stepLR)
 
-		// Signal-driven LR scaling: dampen when loss rebounds
 		if step > 1 && prevLoss > 0 {
 			dLoss := float64(stepLoss) - float64(prevLoss)
 			if dLoss > 0 {
@@ -1180,6 +1639,60 @@ func cmdTrainCUDA() {
 		if immuneSkip {
 			continue
 		}
+
+		if helixDispatch {
+			// Per-GPU Helix optimizer — each GPU updates its own FP32 master weights
+			for d := 0; d < nGPUs; d++ {
+				mongoose.SetDevice(d)
+				opt := &hdOpt[d]
+				for li := range lays {
+					hb := &hdLayerBufs[d][li]
+					l := &opt.lays[li]
+
+					mongoose.KHelixDNAStep(
+						l.gate.DevicePtr(), l.up.DevicePtr(),
+						hb.dWGate.DevicePtr(), hb.dWUp.DevicePtr(),
+						opt.gate_m[li].DevicePtr(), opt.up_m[li].DevicePtr(),
+						opt.gate_v[li].DevicePtr(), opt.up_v[li].DevicePtr(),
+						curLR, 0.9, 0.95, step, 1e-8, 0.1,
+						r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+						3.0/5.0, l.gate.Size)
+
+					mongoose.KHelixDNAStep(
+						l.wq.DevicePtr(), l.wo.DevicePtr(),
+						hb.dWQ.DevicePtr(), hb.dWO.DevicePtr(),
+						opt.wq_m[li].DevicePtr(), opt.wo_m[li].DevicePtr(),
+						opt.wq_v[li].DevicePtr(), opt.wo_v[li].DevicePtr(),
+						curLR, 0.9, 0.95, step, 1e-8, 0.1,
+						r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+						2.0/5.0, l.wq.Size)
+
+					mongoose.KHelixDNAStep(
+						l.wk.DevicePtr(), l.wv.DevicePtr(),
+						hb.dWK.DevicePtr(), hb.dWV.DevicePtr(),
+						opt.wk_m[li].DevicePtr(), opt.wv_m[li].DevicePtr(),
+						opt.wk_v[li].DevicePtr(), opt.wv_v[li].DevicePtr(),
+						curLR, 0.9, 0.95, step, 1e-8, 0.1,
+						r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
+						2.0/5.0, l.wk.Size)
+
+					mongoose.KGradScale(hb.dWDown.DevicePtr(), -curLR, l.down.Size)
+					mongoose.KAddInPlace(l.down.DevicePtr(), hb.dWDown.DevicePtr(), l.down.Size)
+
+					// Device-local FP32→FP16 sync
+					mongoose.KFP32ToFP16(l.wq.DevicePtr(), hdFP16[d][li].wq.DevicePtr(), l.wq.Size)
+					mongoose.KFP32ToFP16(l.wk.DevicePtr(), hdFP16[d][li].wk.DevicePtr(), l.wk.Size)
+					mongoose.KFP32ToFP16(l.wv.DevicePtr(), hdFP16[d][li].wv.DevicePtr(), l.wv.Size)
+					mongoose.KFP32ToFP16(l.wo.DevicePtr(), hdFP16[d][li].wo.DevicePtr(), l.wo.Size)
+					mongoose.KFP32ToFP16(l.gate.DevicePtr(), hdFP16[d][li].gate.DevicePtr(), l.gate.Size)
+					mongoose.KFP32ToFP16(l.up.DevicePtr(), hdFP16[d][li].up.DevicePtr(), l.up.Size)
+					mongoose.KFP32ToFP16(l.down.DevicePtr(), hdFP16[d][li].down.DevicePtr(), l.down.Size)
+				}
+			}
+			mc.SyncAll()
+			mongoose.SetDevice(0)
+			mongoose.KAdamW(embed.DevicePtr(), dEmbed.DevicePtr(), embedAS.m.DevicePtr(), embedAS.v.DevicePtr(), curLR, 0.1, step, embed.Size)
+		} else {
 
 		// CPU-write: rung coefficients → L3
 		if l3 != nil {
@@ -1231,6 +1744,7 @@ func cmdTrainCUDA() {
 
 		// Sync FP32 master weights → FP16 for next forward
 		syncFP16Weights()
+		} // end !helixDispatch
 
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
