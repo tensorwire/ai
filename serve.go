@@ -216,12 +216,14 @@ type serveState struct {
 	// Loaded components (nil until model is loaded)
 	tokenizer *tokenizer.Tokenizer
 	safetens  *gguf.SafeTensors
+	cfg       map[string]interface{}
 
 	// GPU engine (nil if CPU-only)
 	eng mongoose.Engine
 
 	// Inference pipeline
 	fwd       func(tokenID, pos int) []float32
+	resetKV   func()
 	embedData []float32
 	cosTab    []float32
 	sinTab    []float32
@@ -361,6 +363,7 @@ func (s *serveState) loadModel(name string) error {
 	}
 
 	s.modelName = name
+	s.cfg = cfg
 	s.modelDir = path
 	s.dim = getInt("hidden_size", 0)
 	s.layers = getInt("num_hidden_layers", 0)
@@ -451,6 +454,92 @@ func (s *serveState) loadModel(name string) error {
 		}
 	}
 
+	// Metal inference graph fallback
+	if s.fwd == nil {
+		kvDim := s.kvHeads * headDim
+		if metal, ok := s.eng.(*mongoose.Metal); ok {
+			ret := metal.BuildInferGraph(s.dim, kvDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, float64(ropeTheta))
+			if ret == 0 {
+				wi := 0
+				for l := 0; l < s.layers; l++ {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					loadW := func(n string) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d != nil { metal.InferSetWeight(wi, d) }; wi++ }
+					loadB := func(n string, sz int) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d == nil { d = make([]float32, sz) }; metal.InferSetWeight(wi, d); wi++ }
+					loadW("input_layernorm.weight")
+					loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
+					loadB("self_attn.q_proj.bias", s.dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
+					loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
+					loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
+				}
+				fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+				metal.InferSetWeight(wi, fnorm); wi++
+				metal.InferSetWeight(wi, lmHeadData); wi++
+
+				keyCache := make([][]float32, s.layers)
+				valCache := make([][]float32, s.layers)
+				for l := 0; l < s.layers; l++ {
+					keyCache[l] = make([]float32, s.maxSeq*kvDim)
+					valCache[l] = make([]float32, s.maxSeq*kvDim)
+				}
+				att := make([]float32, s.heads*s.maxSeq)
+				mHidden := make([]float32, s.dim)
+				mQBuf := make([]float32, s.dim)
+				mKBuf := make([]float32, kvDim)
+				mVBuf := make([]float32, kvDim)
+				mAttnOut := make([]float32, s.dim)
+				mLogits := make([]float32, s.vocabSize)
+				invSqrtHeadDim := float32(1.0 / math.Sqrt(float64(headDim)))
+				kvMulConst := s.heads / s.kvHeads
+
+				s.resetKV = func() {
+					for l := 0; l < s.layers; l++ {
+						for i := range keyCache[l] { keyCache[l][i] = 0 }
+						for i := range valCache[l] { valCache[l][i] = 0 }
+					}
+				}
+
+				s.fwd = func(tokenID, pos int) []float32 {
+					tokOff := tokenID * s.dim
+					if tokOff+s.dim > len(s.embedData) { return nil }
+					copy(mHidden, s.embedData[tokOff:tokOff+s.dim])
+					cosSlice := s.cosTab[pos*s.halfHead : pos*s.halfHead+s.halfHead]
+					sinSlice := s.sinTab[pos*s.halfHead : pos*s.halfHead+s.halfHead]
+
+					for l := 0; l < s.layers; l++ {
+						metal.InferForwardA(mHidden, cosSlice, sinSlice, mQBuf, mKBuf, mVBuf, l)
+						copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], mKBuf)
+						copy(valCache[l][pos*kvDim:(pos+1)*kvDim], mVBuf)
+
+						for i := range mAttnOut { mAttnOut[i] = 0 }
+						for h := 0; h < s.heads; h++ {
+							qOff := h * headDim
+							kvOff := (h / kvMulConst) * headDim
+							scores := att[h*(pos+1) : h*(pos+1)+(pos+1)]
+							for t := 0; t <= pos; t++ {
+								var dot float64
+								for j := 0; j < headDim; j++ {
+									dot += float64(mQBuf[qOff+j]) * float64(keyCache[l][t*kvDim+kvOff+j])
+								}
+								scores[t] = float32(dot) * invSqrtHeadDim
+							}
+							softmax(scores, pos+1)
+							for t := 0; t <= pos; t++ {
+								w := scores[t]
+								for j := 0; j < headDim; j++ {
+									mAttnOut[qOff+j] += w * valCache[l][t*kvDim+kvOff+j]
+								}
+							}
+						}
+						metal.InferForwardB(mHidden, mAttnOut, l)
+					}
+					metal.InferLogits(mHidden, mLogits)
+					return mLogits
+				}
+				log.Printf("[serve] Metal inference graph ready (%d weights)", wi)
+			}
+		}
+	}
+
 	// Generic fallback: any engine with MatMul
 	if s.fwd == nil {
 		log.Printf("[serve] using generic inference (weights streamed, CPU attention)")
@@ -484,6 +573,13 @@ func (s *serveState) loadModel(name string) error {
 		attnOut := make([]float32, dim)
 		ffnBuf := make([]float32, ffnDim)
 		ffnBuf2 := make([]float32, ffnDim)
+
+		s.resetKV = func() {
+			for l := 0; l < nLayers; l++ {
+				for i := range keyCache[l] { keyCache[l][i] = 0 }
+				for i := range valCache[l] { valCache[l][i] = 0 }
+			}
+		}
 
 		rmsNorm := func(data, weight []float32, eps float32) {
 			n := len(data)
@@ -609,18 +705,16 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		maxTokens = *req.MaxTokens
 	}
 
-	// TODO: Apply chat template to messages.
-	// Concatenate messages into a single prompt string for now.
-	// Real implementation should use the model's chat_template from tokenizer_config.json
-	// to format system/user/assistant messages with proper special tokens.
-	prompt := formatChatPrompt(req.Messages)
-
-	// Tokenize
 	s.mu.RLock()
 	tok := s.tokenizer
+	cfg := s.cfg
 	s.mu.RUnlock()
 
-	promptTokens := tok.Encode(prompt)
+	var chatMsgs []chatMessage
+	for _, m := range req.Messages {
+		chatMsgs = append(chatMsgs, chatMessage{Role: m.Role, Content: m.Content})
+	}
+	promptTokens := applyChatTemplate(tok, chatMsgs, cfg)
 
 	if req.Stream {
 		s.handleChatStream(w, req, promptTokens, maxTokens)
@@ -638,6 +732,14 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	}
 	topK := 40
 
+	// Reset KV cache before each request
+	s.mu.RLock()
+	resetKV := s.resetKV
+	s.mu.RUnlock()
+	if resetKV != nil {
+		resetKV()
+	}
+
 	// Prefill
 	var logits []float32
 	for i, tid := range promptTokens {
@@ -648,6 +750,8 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	stopTokens := discoverStopTokens(tok, cfg, s.modelDir)
+
 	// Generate
 	allTokens := make([]int, len(promptTokens))
 	copy(allTokens, promptTokens)
@@ -656,7 +760,7 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		nextToken := sampleTopK(logits, temp, topK)
 		allTokens = append(allTokens, nextToken)
 		genTokens = append(genTokens, nextToken)
-		if nextToken == tok.EOS || nextToken == 0 {
+		if stopTokens[nextToken] {
 			break
 		}
 		pos := len(allTokens) - 1
@@ -670,6 +774,10 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	}
 
 	generated := tok.Decode(genTokens)
+	if idx := findSpecialToken(generated); idx >= 0 {
+		generated = generated[:idx]
+	}
+	generated = strings.TrimSpace(generated)
 	completionTokens := len(genTokens)
 
 	resp := ChatCompletionResponse{
@@ -730,6 +838,7 @@ func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionR
 	s.mu.RLock()
 	fwd := s.fwd
 	tok := s.tokenizer
+	streamResetKV := s.resetKV
 	s.mu.RUnlock()
 
 	temp := float32(0.7)
@@ -737,6 +846,10 @@ func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionR
 		temp = float32(*req.Temperature)
 	}
 	topK := 40
+
+	if streamResetKV != nil {
+		streamResetKV()
+	}
 
 	// Prefill
 	var logits []float32
