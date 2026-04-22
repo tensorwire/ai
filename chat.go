@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,17 +19,13 @@ import (
 )
 
 func suppressOutput() (restore func()) {
-	origStderr, _ := syscall.Dup(2)
-	devNull, _ := os.Open(os.DevNull)
-	syscall.Dup2(int(devNull.Fd()), 2)
-	devNull.Close()
-
 	origLog := log.Writer()
+	origStderr := os.Stderr
 	log.SetOutput(io.Discard)
+	os.Stderr, _ = os.Open(os.DevNull)
 
 	return func() {
-		syscall.Dup2(origStderr, 2)
-		syscall.Close(origStderr)
+		os.Stderr = origStderr
 		log.SetOutput(origLog)
 	}
 }

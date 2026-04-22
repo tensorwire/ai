@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/open-ai-org/gguf"
@@ -1297,7 +1296,7 @@ func daemonize(host, port, modelName string) {
 	args = append(args, fmt.Sprintf("host=%s", host), fmt.Sprintf("port=%s", port))
 
 	cmd := exec.Command(exe, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	setSysProcAttr(cmd)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Stdin = nil
@@ -1335,12 +1334,12 @@ func stopExistingDaemon() {
 		os.Remove(servePidPath())
 		return
 	}
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if err := proc.Signal(os.Signal(os.Interrupt)); err != nil {
 		os.Remove(servePidPath())
 		return
 	}
-	proc.Signal(syscall.SIGTERM)
+	proc.Signal(os.Interrupt)
 	time.Sleep(500 * time.Millisecond)
-	proc.Signal(syscall.SIGKILL)
+	proc.Kill()
 	os.Remove(servePidPath())
 }
