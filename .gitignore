@@ -1,10 +1,27 @@
-# Binary
-ai
-tesseract
+# Binaries
+*.exe
+*.dylib
+*.so
+*.o
+*.a
 
-
-# Test logs
+# Test
 *.log
 
 # OS
 .DS_Store
+Thumbs.db
+
+# Models
+*.gguf
+*.safetensors
+*.bin
+
+# Built binaries
+ai
+tesseract
+
+# Python
+*.py
+*.pyc
+__pycache__/
