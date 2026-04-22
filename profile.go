@@ -28,15 +28,13 @@ func cmdProfile(args map[string]string) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
 	if te == nil {
-		log.Fatal("TensorEngine not available")
+		log.Fatalf("profile requires a GPU (detected: %s)", eng.Name())
 	}
 	cuda, ok := eng.(*mongoose.CUDA)
 	if !ok {
-		log.Fatal("profile requires CUDA")
+		log.Fatalf("profile currently requires CUDA (detected: %s). Metal and WebGPU support planned.", eng.Name())
 	}
-	if !mongoose.LoadKernels() {
-		log.Fatal("CUDA kernels required")
-	}
+	mongoose.LoadKernels()
 
 	fmt.Printf("ai profile — per-op GPU timing\n")
 	fmt.Printf("  engine:  %s\n", eng.Name())

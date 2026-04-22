@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	"github.com/open-ai-org/mongoose"
 )
 
 // cmdTrainUnified handles both from-scratch and fine-tuning via a single command:
@@ -100,23 +102,31 @@ func runFromScratch(dataPath string, args map[string]string) {
 		log.Println("[ai] using Metal kernel path")
 		injectArgs(args, dataPath)
 		cmdTrainMetal()
+	case "webgpu":
+		log.Println("[ai] using WebGPU/Vulkan path (CPU training with GPU matmul)")
+		injectArgs(args, dataPath)
+		cmdTrainAny()
 	default:
-		log.Println("[ai] using universal CPU path")
+		log.Println("[ai] using CPU path")
 		injectArgs(args, dataPath)
 		cmdTrainAny()
 	}
 }
 
-// detectBestBackend returns the best available training backend without full GPU init.
+// detectBestBackend probes available engines and returns the best training backend.
 func detectBestBackend() string {
-	switch {
-	case runtime.GOOS == "linux":
-		return "cuda-kernels"
-	case runtime.GOOS == "darwin":
-		return "metal"
-	default:
-		return "cpu"
+	if runtime.GOOS == "darwin" {
+		if m := mongoose.NewMetal(); m != nil {
+			return "metal"
+		}
 	}
+	if c := mongoose.NewCUDA(); c != nil {
+		return "cuda-kernels"
+	}
+	if w := mongoose.NewWebGPU(); w != nil {
+		return "webgpu"
+	}
+	return "cpu"
 }
 
 // runFinetune fine-tunes a pretrained model.
@@ -149,7 +159,10 @@ func runFinetune(modelPath, dataPath string, args map[string]string) {
 		cmdTrainMetal()
 
 	default:
-		log.Fatalf("finetune requires CUDA or Metal (detected: %s)", backend)
+		log.Printf("[ai] finetune: no optimized GPU path for %s — using CPU training with pretrained weights", backend)
+		args["resume"] = modelPath
+		injectArgs(args, dataPath)
+		cmdTrainAny()
 	}
 }
 

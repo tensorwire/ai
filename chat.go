@@ -258,8 +258,16 @@ func buildChatEngine(modelArg string) *chatEngine {
 		log.Fatal("could not read model dimensions from config.json")
 	}
 
-	eng := selectEngine("auto")
-	mongoose.LoadKernels()
+	var eng mongoose.Engine
+	if !GlobalVerbose {
+		restore := suppressOutput()
+		eng = selectEngine("auto")
+		mongoose.LoadKernels()
+		restore()
+	} else {
+		eng = selectEngine("auto")
+		mongoose.LoadKernels()
+	}
 
 	tok, err := tokenizer.LoadTokenizer(path)
 	if err != nil {
@@ -432,8 +440,217 @@ func buildChatEngine(modelArg string) *chatEngine {
 		}
 	}
 
+	// Generic fallback: works on any engine (CUDA, WebGPU, CPU)
+	// Weights in VRAM (if TensorEngine) or streamed from disk, CPU attention
 	if fwd == nil {
-		log.Fatal("[chat] no inference backend available")
+		normEps := float32(1e-6)
+		if v, ok := cfg["rms_norm_eps"].(float64); ok {
+			normEps = float32(v)
+		}
+
+		te := mongoose.AsTensorEngine(eng)
+		rwe := mongoose.AsResidentWeightEngine(eng)
+
+		keyCache := make([][]float32, nLayers)
+		valCache := make([][]float32, nLayers)
+		for l := 0; l < nLayers; l++ {
+			keyCache[l] = make([]float32, maxSeq*kvDim)
+			valCache[l] = make([]float32, maxSeq*kvDim)
+		}
+		att := make([]float32, heads*maxSeq)
+
+		type gpuLayer struct {
+			wq, wk, wv, wo, gate, up, down *mongoose.Tensor
+			norm1, norm2                    []float32
+		}
+
+		gpuResident := te != nil
+		var gpuLayers []gpuLayer
+		var gpuLMHead *mongoose.Tensor
+		var gpuFinalNorm []float32
+
+		if gpuResident {
+			gpuLayers = make([]gpuLayer, nLayers)
+			for l := 0; l < nLayers; l++ {
+				prefix := fmt.Sprintf("model.layers.%d.", l)
+				loadGPU := func(name string, rows, cols int) *mongoose.Tensor {
+					d, _, err := st.ReadTensorFloat32(prefix + name)
+					if err != nil { return nil }
+					return te.FromHost(d, []int{rows, cols})
+				}
+				loadCPU := func(name string) []float32 {
+					d, _, _ := st.ReadTensorFloat32(prefix + name)
+					return d
+				}
+				gpuLayers[l] = gpuLayer{
+					wq: loadGPU("self_attn.q_proj.weight", dim, dim),
+					wk: loadGPU("self_attn.k_proj.weight", kvDim, dim),
+					wv: loadGPU("self_attn.v_proj.weight", kvDim, dim),
+					wo: loadGPU("self_attn.o_proj.weight", dim, dim),
+					gate: loadGPU("mlp.gate_proj.weight", ffnDim, dim),
+					up:   loadGPU("mlp.up_proj.weight", ffnDim, dim),
+					down: loadGPU("mlp.down_proj.weight", dim, ffnDim),
+					norm1: loadCPU("input_layernorm.weight"),
+					norm2: loadCPU("post_attention_layernorm.weight"),
+				}
+			}
+			gpuLMHead = te.FromHost(lmHeadData, []int{vocabSize, dim})
+			gpuFinalNorm, _, _ = st.ReadTensorFloat32("model.norm.weight")
+		}
+
+		rmsNorm := func(data, weight []float32, eps float32) {
+			n := len(data)
+			var ss float32
+			for i := 0; i < n; i++ { ss += data[i] * data[i] }
+			ss = 1.0 / float32(math.Sqrt(float64(ss/float32(n)+eps)))
+			for i := 0; i < n; i++ { data[i] = data[i] * ss * weight[i] }
+		}
+
+		gpuMatVec := func(out []float32, tW *mongoose.Tensor, xIn []float32, rows, cols int) {
+			if rwe != nil {
+				copy(out, rwe.MatVecResidentW(tW, xIn, rows, cols))
+				return
+			}
+			tX := te.FromHost(xIn, []int{1, cols})
+			tY := te.MatMulT(tW, tX, rows, cols, 1)
+			copy(out, te.ToHost(tY))
+			te.Release(tX)
+			te.Release(tY)
+		}
+
+		streamMatVec := func(out []float32, W, xIn []float32, rows, cols int) {
+			copy(out, eng.MatMul(W, xIn, rows, cols, 1))
+		}
+
+		x := make([]float32, dim)
+		buf := make([]float32, dim)
+		q := make([]float32, dim)
+		k := make([]float32, kvDim)
+		v := make([]float32, kvDim)
+		attnOut := make([]float32, dim)
+		ffnBuf := make([]float32, ffnDim)
+		ffnBuf2 := make([]float32, ffnDim)
+
+		resetKV = func() {
+			for l := 0; l < nLayers; l++ {
+				for i := range keyCache[l] { keyCache[l][i] = 0 }
+				for i := range valCache[l] { valCache[l][i] = 0 }
+			}
+		}
+
+		fwd = func(tokenID, pos int) []float32 {
+			tokOff := tokenID * dim
+			if tokOff+dim > len(embedData) { return nil }
+			copy(x, embedData[tokOff:tokOff+dim])
+
+			for l := 0; l < nLayers; l++ {
+				copy(buf, x)
+				if gpuResident {
+					rmsNorm(buf, gpuLayers[l].norm1, normEps)
+					gpuMatVec(q, gpuLayers[l].wq, buf, dim, dim)
+					gpuMatVec(k[:kvDim], gpuLayers[l].wk, buf, kvDim, dim)
+					gpuMatVec(v[:kvDim], gpuLayers[l].wv, buf, kvDim, dim)
+				} else {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					normW, _, _ := st.ReadTensorFloat32(prefix + "input_layernorm.weight")
+					rmsNorm(buf, normW, normEps)
+					wq, _, _ := st.ReadTensorFloat32(prefix + "self_attn.q_proj.weight")
+					wk, _, _ := st.ReadTensorFloat32(prefix + "self_attn.k_proj.weight")
+					wv, _, _ := st.ReadTensorFloat32(prefix + "self_attn.v_proj.weight")
+					streamMatVec(q, wq, buf, dim, dim)
+					streamMatVec(k[:kvDim], wk, buf, kvDim, dim)
+					streamMatVec(v[:kvDim], wv, buf, kvDim, dim)
+				}
+
+				// Biases
+				for _, pair := range []struct{ name string; dst []float32; sz int }{
+					{"self_attn.q_proj.bias", q, dim},
+					{"self_attn.k_proj.bias", k[:kvDim], kvDim},
+					{"self_attn.v_proj.bias", v[:kvDim], kvDim},
+				} {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					if b, _, e := st.ReadTensorFloat32(prefix + pair.name); e == nil {
+						for i := range b { pair.dst[i] += b[i] }
+					}
+				}
+
+				applyRoPE(q, k[:kvDim], pos, headDim, ropeTheta, heads, kvHeads)
+
+				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], k[:kvDim])
+				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], v[:kvDim])
+
+				kvMul := heads / kvHeads
+				for i := range attnOut { attnOut[i] = 0 }
+				for h := 0; h < heads; h++ {
+					qOff := h * headDim
+					kvOff := (h / kvMul) * headDim
+					scale := float32(1.0 / math.Sqrt(float64(headDim)))
+					for t := 0; t <= pos; t++ {
+						var dot float64
+						for j := 0; j < headDim; j++ {
+							dot += float64(q[qOff+j]) * float64(keyCache[l][t*kvDim+kvOff+j])
+						}
+						att[h*(pos+1)+t] = float32(dot) * scale
+					}
+					softmax(att[h*(pos+1):h*(pos+1)+(pos+1)], pos+1)
+					for t := 0; t <= pos; t++ {
+						w := att[h*(pos+1)+t]
+						for j := 0; j < headDim; j++ {
+							attnOut[qOff+j] += w * valCache[l][t*kvDim+kvOff+j]
+						}
+					}
+				}
+
+				proj := make([]float32, dim)
+				if gpuResident {
+					gpuMatVec(proj, gpuLayers[l].wo, attnOut, dim, dim)
+				} else {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					wo, _, _ := st.ReadTensorFloat32(prefix + "self_attn.o_proj.weight")
+					streamMatVec(proj, wo, attnOut, dim, dim)
+				}
+				for i := 0; i < dim; i++ { x[i] += proj[i] }
+
+				copy(buf, x)
+				if gpuResident {
+					rmsNorm(buf, gpuLayers[l].norm2, normEps)
+					gpuMatVec(ffnBuf, gpuLayers[l].gate, buf, ffnDim, dim)
+					gpuMatVec(ffnBuf2, gpuLayers[l].up, buf, ffnDim, dim)
+				} else {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					normW2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
+					rmsNorm(buf, normW2, normEps)
+					gate, _, _ := st.ReadTensorFloat32(prefix + "mlp.gate_proj.weight")
+					up, _, _ := st.ReadTensorFloat32(prefix + "mlp.up_proj.weight")
+					streamMatVec(ffnBuf, gate, buf, ffnDim, dim)
+					streamMatVec(ffnBuf2, up, buf, ffnDim, dim)
+				}
+				for i := 0; i < ffnDim; i++ {
+					ffnBuf[i] = silu(ffnBuf[i]) * ffnBuf2[i]
+				}
+				downOut := make([]float32, dim)
+				if gpuResident {
+					gpuMatVec(downOut, gpuLayers[l].down, ffnBuf, dim, ffnDim)
+				} else {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					down, _, _ := st.ReadTensorFloat32(prefix + "mlp.down_proj.weight")
+					streamMatVec(downOut, down, ffnBuf, dim, ffnDim)
+				}
+				for i := 0; i < dim; i++ { x[i] += downOut[i] }
+			}
+
+			if gpuResident {
+				rmsNorm(x, gpuFinalNorm, normEps)
+				logits := make([]float32, vocabSize)
+				gpuMatVec(logits, gpuLMHead, x, vocabSize, dim)
+				return logits
+			}
+			finalNorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+			rmsNorm(x, finalNorm, normEps)
+			logits := make([]float32, vocabSize)
+			streamMatVec(logits, lmHeadData, x, vocabSize, dim)
+			return logits
+		}
 	}
 	if resetKV == nil {
 		resetKV = func() {}
@@ -717,11 +934,6 @@ func (m chatModel) View() string {
 
 func cmdChat(modelArg string) {
 	debug := GlobalVerbose
-
-	if !debug {
-		restore := suppressOutput()
-		defer restore()
-	}
 
 	ce := buildChatEngine(modelArg)
 

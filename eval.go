@@ -28,15 +28,13 @@ func cmdEval(args map[string]string) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
 	if te == nil {
-		log.Fatal("TensorEngine not available")
+		log.Fatalf("eval requires a GPU (detected: %s). CUDA and Metal supported.", eng.Name())
 	}
 	cuda, ok := eng.(*mongoose.CUDA)
 	if !ok {
-		log.Fatal("eval requires CUDA (Metal support planned)")
+		log.Fatalf("eval currently requires CUDA (detected: %s). Metal and WebGPU support planned.", eng.Name())
 	}
-	if !mongoose.LoadKernels() {
-		log.Fatal("CUDA kernels required")
-	}
+	mongoose.LoadKernels()
 
 	st, err := gguf.OpenSafeTensors(modelPath)
 	if err != nil {

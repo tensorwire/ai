@@ -6,6 +6,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,7 +115,7 @@ func cmdSweep(args map[string]string) {
 		fmt.Printf("[%d/%d] lr=%.1e dim=%d layers=%d ffn=%d ... ",
 			trial+1, len(configs), cfg.lr, cfg.dim, cfg.layers, cfg.ffnDim)
 
-		loss, elapsed := runSweepTrial(eng, graph, data, cfg.lr, cfg.dim, cfg.layers, cfg.ffnDim, stepsPerTrial)
+		loss, elapsed := runSweepTrial(eng, graph, data, dataPath, cfg.lr, cfg.dim, cfg.layers, cfg.ffnDim, stepsPerTrial)
 		stepsPS := float64(stepsPerTrial) / elapsed.Seconds()
 
 		results = append(results, trialResult{cfg, loss, elapsed, stepsPS})
@@ -147,7 +149,7 @@ func cmdSweep(args map[string]string) {
 		dataPath, best.config.lr, best.config.dim, best.config.layers, best.config.ffnDim)
 }
 
-func runSweepTrial(eng mongoose.Engine, graph mongoose.GraphTrainEngine, data []int,
+func runSweepTrial(eng mongoose.Engine, graph mongoose.GraphTrainEngine, data []int, dataPath string,
 	lr float64, dim, layers, ffnDim, steps int) (float32, time.Duration) {
 
 	heads := 4
@@ -164,7 +166,7 @@ func runSweepTrial(eng mongoose.Engine, graph mongoose.GraphTrainEngine, data []
 	seqLen := 64
 
 	if graph == nil {
-		return runSweepTrialCPU(eng, data, lr, dim, heads, kvHeads, layers, ffnDim, vocabSize, seqLen, steps)
+		return runSweepTrialExec(dataPath, lr, dim, layers, ffnDim, steps)
 	}
 
 	ropeTheta := 10000.0
@@ -281,6 +283,49 @@ func runSweepTrialCPU(eng mongoose.Engine, data []int,
 	}
 
 	return lastLoss, time.Since(t0)
+}
+
+var floorRe = regexp.MustCompile(`floor[=:]?\s*([\d.]+)`)
+
+// runSweepTrialExec runs a trial by execing `ai train` as a subprocess.
+// Works on any backend — the train command handles routing.
+func runSweepTrialExec(dataPath string, lr float64, dim, layers, ffnDim, steps int) (float32, time.Duration) {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Printf("[sweep] cannot find self: %v", err)
+		return 999.0, 0
+	}
+
+	args := []string{"train",
+		fmt.Sprintf("data=%s", dataPath),
+		fmt.Sprintf("--dim=%d", dim),
+		fmt.Sprintf("--layers=%d", layers),
+		fmt.Sprintf("--ffn-dim=%d", ffnDim),
+		fmt.Sprintf("--steps=%d", steps),
+		fmt.Sprintf("--lr=%e", lr),
+	}
+
+	t0 := time.Now()
+	cmd := exec.Command(exe, args...)
+	out, err := cmd.CombinedOutput()
+	elapsed := time.Since(t0)
+
+	if err != nil {
+		log.Printf("[sweep] trial failed: %v\n%s", err, string(out))
+		return 999.0, elapsed
+	}
+
+	// Parse "floor=X.XXX" or "floor: X.XXX" from output
+	matches := floorRe.FindSubmatch(out)
+	if len(matches) < 2 {
+		log.Printf("[sweep] could not parse loss from output")
+		return 999.0, elapsed
+	}
+	loss, err := strconv.ParseFloat(string(matches[1]), 32)
+	if err != nil {
+		return 999.0, elapsed
+	}
+	return float32(loss), elapsed
 }
 
 func parseFloatList(s string, def []float64) []float64 {

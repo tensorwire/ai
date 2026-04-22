@@ -95,11 +95,18 @@ func selectEngine(hint string) mongoose.Engine {
 		return c
 	case "cpu":
 		return &mongoose.CPU{}
+	case "vulkan", "webgpu":
+		w := mongoose.NewWebGPU()
+		if w == nil {
+			log.Fatal("Vulkan/WebGPU not available")
+		}
+		return w
 	default:
 		if runtime.GOOS == "darwin" {
 			if m := mongoose.NewMetal(); m != nil { return m }
 		}
 		if c := mongoose.NewCUDA(); c != nil { return c }
+		if w := mongoose.NewWebGPU(); w != nil { return w }
 		return &mongoose.CPU{}
 	}
 }
