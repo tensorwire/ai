@@ -87,6 +87,27 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
 	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
 
+	// VRAM guard: estimate total before allocating
+	{
+		layerParams := int64(dim*dim*2 + kvDim*dim*2 + dim*dim + ffnDim*dim*2 + dim*ffnDim)
+		int8Bytes := layerParams * int64(nLayers)                                       // INT8 base (1 byte/param)
+		loraParams := int64(nLayers) * 7 * 2 * int64(rank) * int64(dim) * 4             // LoRA A+B FP32
+		loraAdam := loraParams * 2                                                       // Adam M+V for LoRA
+		embedBytes := int64(vocabSize) * int64(dim) * 4 * 2                              // embed + lm_head FP32
+		dequantBytes := int64(ffnDim) * int64(dim) * 4                                   // shared dequant buffer
+		actBytes := int64(n) * int64(dim) * 4 * 20                                       // ~20 activation buffers
+		gradBytes := int64(n) * int64(vocabSize) * 4 * 2                                 // logitsBuf + gradGPU
+		totalEst := int8Bytes + loraParams + loraAdam + embedBytes + dequantBytes + actBytes + gradBytes
+		vramBytes := eng.VRAM()
+		headroom := int64(float64(vramBytes) * 0.90)
+		if totalEst > headroom {
+			log.Fatalf("[q8+lora] estimated %.1f GB but only %.1f GB VRAM (90%% of %.1f GB). Reduce rank or seq length.",
+				float64(totalEst)/(1024*1024*1024), float64(headroom)/(1024*1024*1024), float64(vramBytes)/(1024*1024*1024))
+		}
+		log.Printf("[q8+lora] VRAM estimate: %.1f GB / %.1f GB available",
+			float64(totalEst)/(1024*1024*1024), float64(vramBytes)/(1024*1024*1024))
+	}
+
 	log.Printf("[q8+lora] loading %s (Q8 frozen base + LoRA rank-%d)", modelPath, rank)
 
 	// --- Frozen INT8 base weights (no optimizer state) ---
@@ -223,7 +244,7 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	gradGPU := te.Zeros([]int{n, vocabSize})
 	normedFinal := te.Zeros([]int{n, dim})
 	finalScales := te.Zeros([]int{n})
-	dLmHead := te.Zeros([]int{vocabSize, dim})
+	// lm_head frozen — no gradient buffer needed (saves 3.1GB for 14B)
 	dHidden := te.Zeros([]int{n, dim})
 	dScratch := te.Zeros([]int{n, dim})
 
@@ -260,9 +281,7 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	dA2 := te.Zeros([]int{rank * ffnDim}) // pair slot 2
 	dB2 := te.Zeros([]int{ffnDim * rank})
 
-	// lm_head Adam state
-	lmHeadM := te.Zeros([]int{vocabSize * dim})
-	lmHeadV := te.Zeros([]int{vocabSize * dim})
+	// lm_head + embed frozen — LoRA adapters handle all trainable params
 
 	hlx := helix.NewHelixOptimizer(float32(lr), 0.9, 0.95, 1e-8, 0.1)
 
@@ -431,7 +450,7 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		stepLoss /= float32(n)
 
 		// === BACKWARD ===
-		cuda.MatMulTransposeATInto(dLmHead, gradGPU, normedFinal, n, vocabSize, dim)
+		// lm_head is frozen — skip dLmHead, just backprop through it
 		cuda.MatMulTInto(dHidden, gradGPU, lmHead, n, vocabSize, dim)
 
 		zero(dScratch)
@@ -512,9 +531,7 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 			te.AddInPlace(dHidden, dx)
 		}
 
-		// lm_head update
-		mongoose.KAdamW(lmHead.DevicePtr(), dLmHead.DevicePtr(), lmHeadM.DevicePtr(), lmHeadV.DevicePtr(),
-			float32(lr), 0.1, step, lmHead.Size)
+		// lm_head frozen — no optimizer step
 
 		if step <= 3 || step%logEvery == 0 {
 			elapsed := time.Since(t0)
