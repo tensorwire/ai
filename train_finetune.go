@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -44,34 +45,49 @@ func cmdFinetune() {
 		log.Fatal("CUDA kernels required")
 	}
 
-	st, err := gguf.OpenSafeTensors(*modelPath)
+	ms, err := OpenModel(*modelPath)
 	if err != nil { log.Fatalf("open model: %v", err) }
 
 	dim := 2048
 	heads := 32
 	kvHeads := 4
-	headDim := dim / heads
-	kvDim := kvHeads * headDim
 	nLayers := 22
 	ffnDim := 5632
 	seqLen := 64
 	vocabSize := 32000
+
+	cfgPath := filepath.Join(*modelPath, "config.json")
+	if cfgData, err := os.ReadFile(cfgPath); err == nil {
+		var cfg map[string]interface{}
+		json.Unmarshal(cfgData, &cfg)
+		if v, ok := cfg["hidden_size"].(float64); ok { dim = int(v) }
+		if v, ok := cfg["num_attention_heads"].(float64); ok { heads = int(v) }
+		if v, ok := cfg["num_key_value_heads"].(float64); ok { kvHeads = int(v) }
+		if v, ok := cfg["num_hidden_layers"].(float64); ok { nLayers = int(v) }
+		if v, ok := cfg["intermediate_size"].(float64); ok { ffnDim = int(v) }
+		if v, ok := cfg["vocab_size"].(float64); ok { vocabSize = int(v) }
+		if v, ok := cfg["max_position_embeddings"].(float64); ok && int(v) < 2048 { seqLen = int(v) }
+		log.Printf("[finetune] config: dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d", dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
+	}
+
+	headDim := dim / heads
+	kvDim := kvHeads * headDim
 	lr := float32(*lrFlag)
 	n := seqLen
 
 	log.Printf("[finetune] loading %s", *modelPath)
 
-	embedData, _, err := st.ReadTensorFloat32("model.embed_tokens.weight")
+	embedData, err := ms.ReadTensorFloat32("model.embed_tokens.weight")
 	if err != nil { log.Fatalf("embed: %v", err) }
 	embed := te.FromHost(embedData, []int{vocabSize, dim})
 
-	lmHeadData, _, err := st.ReadTensorFloat32("lm_head.weight")
+	lmHeadData, err := ms.ReadTensorFloat32("lm_head.weight")
 	if err != nil {
 		lmHeadData = embedData
 	}
 	lmHead := te.FromHost(lmHeadData, []int{vocabSize, dim})
 
-	fnData, _, _ := st.ReadTensorFloat32("model.norm.weight")
+	fnData, _ := ms.ReadTensorFloat32("model.norm.weight")
 	if fnData == nil { fnData = make([]float32, dim); for i := range fnData { fnData[i] = 1 } }
 	finalNorm := te.FromHost(fnData, []int{1, dim})
 
@@ -108,12 +124,12 @@ func cmdFinetune() {
 	for l := 0; l < nLayers; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
 		loadQ := func(name string, rows, cols int) needleWeight {
-			d, _, err := st.ReadTensorFloat32(pfx + name)
+			d, err := ms.ReadTensorFloat32(pfx + name)
 			if err != nil { log.Fatalf("layer %d %s: %v", l, name, err) }
 			return quantLoad(d, rows, cols)
 		}
 		loadNorm := func(name string) *mongoose.Tensor {
-			d, _, _ := st.ReadTensorFloat32(pfx + name)
+			d, _ := ms.ReadTensorFloat32(pfx + name)
 			if d == nil { d = make([]float32, dim); for i := range d { d[i] = 1 } }
 			return te.FromHost(d, []int{1, dim})
 		}

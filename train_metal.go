@@ -71,8 +71,7 @@ func cmdTrainMetal() {
 		cfgInt("kv-heads", "num_key_value_heads", kvHeadsFlag)
 		cfgInt("ffn-dim", "intermediate_size", ffnDimFlag)
 
-		stPath := filepath.Join(ckptDir, "model.safetensors")
-		resumeST, err = gguf.OpenSafeTensors(stPath)
+		resumeST, err = gguf.OpenSafeTensors(ckptDir)
 		if err != nil {
 			log.Fatalf("Load checkpoint: %v", err)
 		}
