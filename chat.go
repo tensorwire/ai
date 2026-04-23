@@ -342,7 +342,7 @@ func buildChatEngine(modelArg string) *chatEngine {
 		}
 	}
 
-	// Metal inference graph fallback
+	// Metal inference graph fallback for Metal 3 (2 dispatches/layer, CPU attention)
 	if fwd == nil {
 		if metal, ok := eng.(*mongoose.Metal); ok {
 			ret := metal.BuildInferGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, float64(ropeTheta))

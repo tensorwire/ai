@@ -96,11 +96,14 @@ func cmdBenchmark() {
 	fmt.Println()
 
 	// Detect hardware
+	eng := selectEngine("auto")
 	cuda := mongoose.NewCUDA()
 	if cuda != nil {
 		fmt.Printf("  gpu:     %s\n", cuda.Name())
 		fmt.Printf("  vram:    %d MB\n", cuda.VRAM()/(1024*1024))
 		mongoose.LoadKernels()
+	} else if runtime.GOOS == "darwin" {
+		fmt.Printf("  gpu:     %s\n", eng.Name())
 	} else {
 		fmt.Printf("  gpu:     none (CPU inference)\n")
 	}
@@ -184,14 +187,11 @@ func cmdBenchmark() {
 // benchInfer runs inference and returns the generated text.
 // Wraps the existing inference machinery.
 func benchInfer(modelDir, prompt string, maxTokens int) string {
-	// Capture stdout from cmdInfer — hacky but avoids duplicating 500 lines
-	// TODO: factor inference into a reusable InferEngine
 	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
-	// Run inference (this prints to stdout)
-	cmdInfer(filepath.Base(modelDir), []string{prompt})
+	cmdInferGPU(filepath.Base(modelDir), []string{prompt})
 
 	w.Close()
 	os.Stdout = old
