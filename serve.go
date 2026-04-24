@@ -302,6 +302,8 @@ type serveState struct {
 
 	stopTokens map[int]bool
 
+	noStream bool // --no-stream: disable streaming weight load, wait for full model in VRAM
+
 	// Channel-based inference queue: serialize GPU access without mutex contention
 	inferQueue chan *inferRequest
 }
@@ -328,6 +330,7 @@ func cmdServe(args map[string]string) {
 	}
 
 	daemon := false
+	noStream := false
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -339,6 +342,8 @@ func cmdServe(args map[string]string) {
 			if i+1 < len(os.Args) { modelName = os.Args[i+1]; i++ }
 		case "--daemon", "-d":
 			daemon = true
+		case "--no-stream":
+			noStream = true
 		case "--stop":
 			stopExistingDaemon()
 			fmt.Println("ai serve stopped")
@@ -359,7 +364,7 @@ func cmdServe(args map[string]string) {
 		return
 	}
 
-	state := &serveState{}
+	state := &serveState{noStream: noStream}
 
 	if modelName != "" {
 		if err := state.loadModel(modelName); err != nil {
@@ -584,7 +589,8 @@ func (s *serveState) loadModel(name string) error {
 
 	s.stopTokens = discoverStopTokens(tok, cfg, path)
 
-	// Metal streaming + multi-slot path (preferred)
+	// Metal streaming + multi-slot path (preferred, unless --no-stream)
+	if !s.noStream {
 	if mi := buildMetalStreamingInference(s, st, lmHeadData); mi != nil {
 		s.fwd = func(tokenID, pos int) []float32 {
 			slot := mi.acquireSlot()
@@ -596,6 +602,7 @@ func (s *serveState) loadModel(name string) error {
 				mi.resetKV(i)
 			}
 		}
+	}
 	}
 
 	// Metal fused compute path (legacy fallback)

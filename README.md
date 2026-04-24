@@ -124,6 +124,7 @@ ai train data="/data/*.txt" --dim 512 --layers 8 --steps 5000 --lr 3e-4
 | Command | Description |
 |---------|-------------|
 | `ai serve <model>` | OpenAI-compatible API server |
+| `ai serve <model> --no-stream` | Serve without streaming weight load (full VRAM, max tok/s from first token) |
 
 ### Introspection
 
@@ -153,7 +154,7 @@ Every command works on every backend. Optimized paths are used when available, w
 | finetune | yes | yes | yes (CPU train) | yes (CPU train) |
 | chat | yes (fused/graph/generic) | yes (generic) | yes (generic) | yes (generic) |
 | infer | yes (fused/graph/tier2) | yes (Q8/tier2) | yes (tier2/3) | yes (tier3) |
-| serve | yes (fused/generic) | yes (generic) | yes (generic) | yes (generic) |
+| serve | yes (streaming/fused) | yes (Q8 fused) | yes (generic) | yes (generic) |
 | eval | yes (planned) | yes | planned | planned |
 | profile | planned | yes | planned | planned |
 | explain | yes | yes | yes | yes |
@@ -178,10 +179,38 @@ step 500   loss 1.95   floor 1.29   365 steps/s
 | `ai serve` throughput | 239–241 tok/s | 133–145 tok/s |
 | TTFT (streaming) | 4ms | 29ms |
 
+### Streaming inference — `ai serve`
+
+Weights stream into GPU memory in the background using ping-pong double buffers. The server accepts requests immediately — no cold start.
+
+| Mode | VRAM | Tok/s | When |
+|------|------|-------|------|
+| Streaming (cold) | 2 layers (~19x less) | ~9 tok/s | First request, weights still loading |
+| Resident (warm) | Full model | 125–135 tok/s | After background load finishes |
+
+Auto-switches from streaming to resident once all weights are loaded. Use `--no-stream` to skip streaming and wait for full load before accepting requests.
+
+```bash
+ai serve Qwen2.5-0.5B              # streaming (default) — instant cold start
+ai serve Qwen2.5-0.5B --no-stream  # wait for full model load, max speed from first token
+```
+
+### CUDA serve — RTX 5090
+
+| Path | Tok/s |
+|------|-------|
+| Generic (pre-v1.3.1) | 1.9 |
+| Q8 fused (v1.3.1+) | 189 |
+
+Zero-alloc hot path: all scratch buffers pre-allocated at model load.
+
+### Architecture
+
 - Automatic quantization: Q8 for models <4B params, Q4 for 7B+
 - Metal 4 `matmul2d` TensorOp on macOS 26+
 - Fused dequant-matvec kernels — zero intermediate buffers
 - Custom Metal/CUDA compute shaders for RMSNorm, RoPE, GQA attention, SiLU
+- Multi-slot inference: independent KV caches per request on separate Metal command queues
 
 ## GPU Support
 
