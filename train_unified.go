@@ -139,7 +139,7 @@ func runFinetune(modelPath, dataPath string, args map[string]string) {
 	case "cuda-kernels":
 		profile := AutoDetect(modelPath)
 		if profile.Precision == "int8" {
-			cmdFinetuneQ8(modelPath, dataPath,
+			cmdFinetuneNeedleXe(modelPath, dataPath,
 				kvInt(args, "steps", profile.Steps),
 				kvFloat(args, "lr", profile.LR),
 				kvInt(args, "log", 50))
