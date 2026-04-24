@@ -138,28 +138,10 @@ func runFinetune(modelPath, dataPath string, args map[string]string) {
 	switch backend {
 	case "cuda-kernels":
 		profile := AutoDetect(modelPath)
-		if profile.Precision == "int8" {
-			cmdFinetuneNeedleXe(modelPath, dataPath,
-				kvInt(args, "steps", profile.Steps),
-				kvFloat(args, "lr", profile.LR),
-				kvInt(args, "log", 50))
-		} else {
-			var finetuneArgs []string
-			finetuneArgs = append(finetuneArgs, os.Args[0], "finetune")
-			finetuneArgs = append(finetuneArgs, "--model", modelPath)
-			finetuneArgs = append(finetuneArgs, "--data", dataPath)
-			if v, ok := args["steps"]; ok {
-				finetuneArgs = append(finetuneArgs, "--steps", v)
-			}
-			if v, ok := args["lr"]; ok {
-				finetuneArgs = append(finetuneArgs, "--lr", v)
-			}
-			if v, ok := args["log"]; ok {
-				finetuneArgs = append(finetuneArgs, "--log-every", v)
-			}
-			os.Args = finetuneArgs
-			cmdFinetune()
-		}
+		cmdFinetuneCUDA(modelPath, dataPath,
+			kvInt(args, "steps", profile.Steps),
+			kvFloat(args, "lr", profile.LR),
+			kvInt(args, "log", 50))
 
 	case "metal":
 		args["resume"] = modelPath

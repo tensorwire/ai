@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
@@ -16,7 +17,7 @@ import (
 
 const maxHot = 49
 
-func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logEvery int) {
+func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery int) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
 	if te == nil {
@@ -24,7 +25,7 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	}
 	cuda, ok := eng.(*mongoose.CUDA)
 	if !ok {
-		log.Fatalf("finetune-needle-xe requires CUDA (detected: %s)", eng.Name())
+		log.Fatalf("finetune requires CUDA (detected: %s)", eng.Name())
 	}
 	if !mongoose.LoadKernels() {
 		log.Fatal("CUDA kernels required")
@@ -36,11 +37,12 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		log.Fatal("softmax+CE kernel not loaded")
 	}
 
+	// Xe daemon — optional coprocessor for CE
 	xe := mongoose.NewXeDaemon()
 	if xe != nil {
 		defer xe.Close()
 		if xe.HasArena() {
-			log.Printf("[needle-xe] Xe: %s, arena: %d MB", xe.Name(), 256)
+			log.Printf("[finetune] Xe: %s, arena: %d MB", xe.Name(), 256)
 		}
 	}
 
@@ -60,6 +62,7 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	vocabSize := profile.VocabSize
 	seqLen := profile.SeqLen
 	n := seqLen
+	precision := profile.Precision
 
 	tok, err := tokenizer.LoadTokenizer(modelPath)
 	if err != nil {
@@ -71,7 +74,7 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		log.Fatalf("read data: %v", err)
 	}
 	tokens := tok.Encode(string(raw))
-	log.Printf("[needle-xe] %d bytes → %d tokens (%.1fx)",
+	log.Printf("[finetune] %d bytes → %d tokens (%.1fx)",
 		len(raw), len(tokens), float64(len(raw))/float64(len(tokens)))
 	if len(tokens) < n+1 {
 		log.Fatalf("need at least %d tokens, got %d", n+1, len(tokens))
@@ -91,32 +94,43 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
 	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
 
-	log.Printf("[needle-xe] loading %s", modelPath)
+	log.Printf("[finetune] loading %s (%s precision)", modelPath, precision)
 
-	// q8Weight: INT8 on GPU + compacted FP16 mom/delta for 49 hot rows
-	type q8Weight struct {
-		q8   *mongoose.Int8Tensor
-		mom  *mongoose.Tensor // FP16 [maxHot, cols] — compacted to conductor hot rows
-		delta *mongoose.Tensor // FP16 [maxHot, cols]
-		rows int
-		cols int
+	// weight: holds either INT8 (q8 != nil) or FP32 (fp32 != nil).
+	// Needle operates on whichever is present.
+	// INT8: dequant → needle → matmul from shared buffer
+	// FP32/FP16: needle modifies fp32 tensor directly, matmul from it
+	type weight struct {
+		q8    *mongoose.Int8Tensor // non-nil for INT8
+		fp32  *mongoose.Tensor    // non-nil for FP32/FP16
+		mom   *mongoose.Tensor
+		delta *mongoose.Tensor
+		rows  int
+		cols  int
 	}
-	loadWeight := func(name string, rows, cols int) q8Weight {
+
+	loadWeight := func(name string, rows, cols int) weight {
 		data, err := ms.ReadTensorFloat32(name)
 		if err != nil {
 			log.Fatalf("load %s: %v", name, err)
 		}
-		qt := gguf.QuantizeToInt8(data, rows, cols)
-		q8 := cuda.FromHostInt8(&mongoose.QuantizedTensor{
-			DataInt8: qt.DataInt8, Scales: qt.Scales, Shape: qt.Shape,
-			Rows: qt.Rows, Cols: qt.Cols,
-		})
 		nElem := maxHot * cols
 		mom := cuda.AllocFP16Tensor(nElem, []int{maxHot, cols})
 		delta := cuda.AllocFP16Tensor(nElem, []int{maxHot, cols})
 		mongoose.KZero(mom.DevicePtr(), nElem*2)
 		mongoose.KZero(delta.DevicePtr(), nElem*2)
-		return q8Weight{q8: q8, mom: mom, delta: delta, rows: rows, cols: cols}
+
+		w := weight{mom: mom, delta: delta, rows: rows, cols: cols}
+		if precision == "int8" {
+			qt := gguf.QuantizeToInt8(data, rows, cols)
+			w.q8 = cuda.FromHostInt8(&mongoose.QuantizedTensor{
+				DataInt8: qt.DataInt8, Scales: qt.Scales, Shape: qt.Shape,
+				Rows: qt.Rows, Cols: qt.Cols,
+			})
+		} else {
+			w.fp32 = te.FromHost(data, []int{rows, cols})
+		}
+		return w
 	}
 
 	embedData, err := ms.ReadTensorFloat32("model.embed_tokens.weight")
@@ -141,7 +155,7 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	finalNorm := te.FromHost(fnData, []int{1, dim})
 
 	type layer struct {
-		wq, wk, wv, wo, gate, up, down q8Weight
+		wq, wk, wv, wo, gate, up, down weight
 		norm1, norm2                    *mongoose.Tensor
 	}
 	loadNorm := func(name string) *mongoose.Tensor {
@@ -170,19 +184,21 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 			norm2: loadNorm(pfx + "post_attention_layernorm.weight"),
 		}
 		if (l+1)%10 == 0 || l == nLayers-1 {
-			log.Printf("[needle-xe] loaded layer %d/%d", l+1, nLayers)
+			log.Printf("[finetune] loaded layer %d/%d", l+1, nLayers)
 		}
 	}
 
 	conductor := mongoose.NewConductor(vocabSize, 1)
 
-	// Shared dequant buffer — reused per projection
+	// Shared dequant buffer for INT8 path (reused per projection)
 	maxElems := ffnDim * dim
 	if dim*dim > maxElems {
 		maxElems = dim * dim
 	}
-	dequantBuf := te.Zeros([]int{maxElems})
-
+	var dequantBuf *mongoose.Tensor
+	if precision == "int8" {
+		dequantBuf = te.Zeros([]int{maxElems})
+	}
 
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
@@ -204,7 +220,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	finalScales := te.Zeros([]int{n})
 	dx := te.Zeros([]int{n, dim})
 
-	// L3 bridge for rung descriptors
 	l3 := cuda.AllocL3Bridge(6 * 4)
 	var rungL3 []float32
 	if l3 != nil {
@@ -217,17 +232,12 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
-
-	// Pre-compute mapped hot indices for each unique row count.
-	// Conductor hot rows are token IDs (0..vocabSize). Weight rows are 0..rows.
-	// Map: hotIdx % rows, deduplicated. Upload once per step, reuse across projections.
 	type hotBuf struct {
 		gpu *mongoose.Tensor
 		n   int
 	}
-	hotByRows := make(map[int]*hotBuf) // keyed by projection row count
-	rowCounts := []int{dim, kvDim, ffnDim}
-	for _, rc := range rowCounts {
+	hotByRows := make(map[int]*hotBuf)
+	for _, rc := range []int{dim, kvDim, ffnDim} {
 		hotByRows[rc] = &hotBuf{gpu: te.Zeros([]int{maxHot}), n: 0}
 	}
 	hotF := make([]float32, maxHot)
@@ -252,23 +262,39 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		}
 	}
 
-	// Dequant → KNeedleSparse on mapped hot rows → matmul
-	needleFwd := func(w *q8Weight, out, input *mongoose.Tensor, step, seqN, inDim, outDim int) {
-		cuda.DequantToFP32(w.q8, dequantBuf.DevicePtr())
-
-		if step > 1 {
-			hb := hotByRows[w.rows]
-			if hb != nil && hb.n > 0 {
-				ss := hlx.SignalScale()
-				mongoose.KNeedleSparse(
-					w.q8.DataPtr, w.q8.ScalePtr, dequantBuf.DevicePtr(),
-					w.mom.DevicePtr(), w.delta.DevicePtr(), hb.gpu.DevicePtr(),
-					ss, float32(lr), 0.9, 0.1,
-					hb.n, w.cols)
+	// needleFwd: dequant (if INT8) → KNeedleSparse on hot rows → matmul
+	// For FP32/FP16 weights, needle operates on the weight tensor directly.
+	needleFwd := func(w *weight, out, input *mongoose.Tensor, step, seqN, inDim, outDim int) {
+		var matB *mongoose.Tensor
+		if w.q8 != nil {
+			cuda.DequantToFP32(w.q8, dequantBuf.DevicePtr())
+			matB = dequantBuf
+			if step > 1 {
+				hb := hotByRows[w.rows]
+				if hb != nil && hb.n > 0 {
+					ss := hlx.SignalScale()
+					mongoose.KNeedleSparse(
+						w.q8.DataPtr, w.q8.ScalePtr, dequantBuf.DevicePtr(),
+						w.mom.DevicePtr(), w.delta.DevicePtr(), hb.gpu.DevicePtr(),
+						ss, float32(lr), 0.9, 0.1,
+						hb.n, w.cols)
+				}
+			}
+		} else {
+			matB = w.fp32
+			if step > 1 {
+				hb := hotByRows[w.rows]
+				if hb != nil && hb.n > 0 {
+					ss := hlx.SignalScale()
+					mongoose.KNeedleSparse(
+						w.fp32.DevicePtr(), w.fp32.DevicePtr(), w.fp32.DevicePtr(),
+						w.mom.DevicePtr(), w.delta.DevicePtr(), hb.gpu.DevicePtr(),
+						ss, float32(lr), 0.9, 0.1,
+						hb.n, w.cols)
+				}
 			}
 		}
-
-		cuda.MatMulTransposeBTInto(out, input, dequantBuf, seqN, inDim, outDim)
+		cuda.MatMulTransposeBTInto(out, input, matB, seqN, inDim, outDim)
 	}
 
 	xeName := "none"
@@ -281,16 +307,14 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	fmt.Printf("  data:       %s (%d tokens)\n", dataPath, len(tokens))
 	fmt.Printf("  arch:       dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d\n",
 		dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
+	fmt.Printf("  precision:  %s\n", precision)
 	fmt.Printf("  training:   steps=%d lr=%.0e seq=%d\n", steps, lr, seqLen)
 	fmt.Printf("  needle:     KNeedleSparse, %d hot rows, compacted FP16 mom/delta\n", maxHot)
 	fmt.Println()
 
-	// === Sparse immune system ===
-	// Checkpoint/restore only the 49 hot rows of INT8 weights + compacted mom/delta.
-	// Pattern from train_cuda.go: 5% rebound threshold, 20 max recoveries.
 	type sparseCheckpoint struct {
-		momData   map[string][]float32 // "layer.proj" → FP32 snapshot of compacted FP16 mom
-		deltaData map[string][]float32 // "layer.proj" → FP32 snapshot of compacted FP16 delta
+		momData   map[string][]float32
+		deltaData map[string][]float32
 		loss      float32
 		step      int
 	}
@@ -303,7 +327,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 	recoveryCount := 0
 	var prevLoss float32
 
-	// Temp FP32 buffer for FP16↔FP32 conversion (reused)
 	maxMomElems := maxHot * ffnDim
 	if maxHot*dim > maxMomElems {
 		maxMomElems = maxHot * dim
@@ -312,19 +335,18 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 
 	allWeights := func(li int) []struct {
 		name string
-		w    *q8Weight
+		w    *weight
 	} {
 		l := &lays[li]
 		return []struct {
 			name string
-			w    *q8Weight
+			w    *weight
 		}{
 			{"wq", &l.wq}, {"wk", &l.wk}, {"wv", &l.wv},
 			{"wo", &l.wo}, {"gate", &l.gate}, {"up", &l.up}, {"down", &l.down},
 		}
 	}
 
-	// Download FP16 tensor as []float32 via GPU conversion
 	downloadFP16 := func(src *mongoose.Tensor, nElem int) []float32 {
 		mongoose.KFP16ToFP32(src.DevicePtr(), fp32Scratch.DevicePtr(), nElem)
 		cuda.Sync()
@@ -334,7 +356,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		return out
 	}
 
-	// Upload []float32 into FP16 tensor via GPU conversion
 	uploadFP16 := func(dst *mongoose.Tensor, data []float32) {
 		cuda.UploadInto(fp32Scratch, data)
 		mongoose.KFP32ToFP16(fp32Scratch.DevicePtr(), dst.DevicePtr(), len(data))
@@ -401,7 +422,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		conductor.Observe(tokI32)
 		uploadAllHotIndices()
 
-		// === FORWARD (step 1 = noop for needle, step 2+ = KNeedleSparse fires) ===
 		zero(hidden)
 		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
 
@@ -449,7 +469,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 
 		cuda.MatMulTransposeBTInto(logitsBuf, normedFinal, lmHead, n, dim, vocabSize)
 
-		// === LOSS ===
 		var stepLoss float32
 		zero(lossesGPU)
 		invN := float32(1.0) / float32(n)
@@ -503,7 +522,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 			continue
 		}
 
-		// Loss-damped LR
 		stepLR := float32(lr)
 		if step > 1 && prevLoss > 0 {
 			dLoss := float64(stepLoss) - float64(prevLoss)
@@ -517,7 +535,6 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 		}
 		prevLoss = stepLoss
 
-		// === HELIX ===
 		hlx.ForwardOnlyStep(step, stepLoss, stepLR)
 
 		if l3 != nil && step > 1 {
@@ -550,19 +567,25 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 			w.AddTensorF32("output_norm.weight", te.ToHost(finalNorm), dim)
 			for l := 0; l < nLayers; l++ {
 				pfx := fmt.Sprintf("blk.%d.", l)
-				saveQ8 := func(name string, wt q8Weight) {
-					cuda.DequantToFP32(wt.q8, dequantBuf.DevicePtr())
-					fp32 := make([]float32, wt.rows*wt.cols)
-					copy(fp32, te.ToHost(dequantBuf)[:wt.rows*wt.cols])
+				saveW := func(name string, wt weight) {
+					var fp32 []float32
+					if wt.q8 != nil {
+						cuda.DequantToFP32(wt.q8, dequantBuf.DevicePtr())
+						host := te.ToHost(dequantBuf)
+						fp32 = make([]float32, wt.rows*wt.cols)
+						copy(fp32, host[:wt.rows*wt.cols])
+					} else {
+						fp32 = te.ToHost(wt.fp32)
+					}
 					w.AddTensorQ8_0(pfx+name, fp32, wt.rows, wt.cols)
 				}
-				saveQ8("attn_q.weight", lays[l].wq)
-				saveQ8("attn_k.weight", lays[l].wk)
-				saveQ8("attn_v.weight", lays[l].wv)
-				saveQ8("attn_output.weight", lays[l].wo)
-				saveQ8("ffn_gate.weight", lays[l].gate)
-				saveQ8("ffn_up.weight", lays[l].up)
-				saveQ8("ffn_down.weight", lays[l].down)
+				saveW("attn_q.weight", lays[l].wq)
+				saveW("attn_k.weight", lays[l].wk)
+				saveW("attn_v.weight", lays[l].wv)
+				saveW("attn_output.weight", lays[l].wo)
+				saveW("ffn_gate.weight", lays[l].gate)
+				saveW("ffn_up.weight", lays[l].up)
+				saveW("ffn_down.weight", lays[l].down)
 				w.AddTensorF32(pfx+"attn_norm.weight", te.ToHost(lays[l].norm1), dim)
 				w.AddTensorF32(pfx+"ffn_norm.weight", te.ToHost(lays[l].norm2), dim)
 			}
@@ -570,13 +593,13 @@ func cmdFinetuneNeedleXe(modelPath, dataPath string, steps int, lr float64, logE
 			if err := w.Write(outPath); err != nil {
 				log.Printf("WARN: save checkpoint: %v", err)
 			} else {
-				log.Printf("[needle-xe] checkpoint saved: %s", outPath)
+				log.Printf("[finetune] checkpoint saved: %s", outPath)
 			}
 		}
 	}
 
 	cuda.Sync()
 	total := time.Since(t0)
-	fmt.Printf("\ndone. %d steps in %.1fs (%.1f steps/s)\n",
-		steps, total.Seconds(), float64(steps)/total.Seconds())
+	fmt.Printf("\ndone. %d steps in %.1fs (%.1f steps/s)  floor=%.4f\n",
+		steps, total.Seconds(), float64(steps)/total.Seconds(), bestFloor)
 }
