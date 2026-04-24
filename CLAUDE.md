@@ -101,3 +101,31 @@ The `cmdInferGPU` function selects the fastest available path:
 ```bash
 go test -v ./...
 ```
+
+## Open Bugs (2026-04-23)
+
+### train_finetune.go (cmdFinetune — CUDA fine-tune path)
+
+1. **Hardcoded TinyLlama dimensions.** `dim=2048, heads=32, kvHeads=4, nLayers=22, vocabSize=32000` — any model that isn't TinyLlama loads with wrong dimensions. Fix: read `config.json` from model directory (same pattern as `train_cuda.go` and `train_metal.go` resume paths).
+
+2. **No GGUF support.** Uses `gguf.OpenSafeTensors()` directly. Should use `OpenModel()` from `model_loader.go` which handles SafeTensors, GGUF, sharded models, and zips.
+
+3. **No checkpoint/adapter saving.** Training loop runs to completion and exits. All trained weights are lost. Needs to save adapters or full model at end + periodic checkpoints.
+
+4. **Embed gradient uses wrong tensor.** Line 419: `adamW(embed, dLmHead, embedAS.m, embedAS.v)` passes `dLmHead` (the lm_head weight gradient) as the gradient for the embedding layer. Should be a scatter gradient from `dHidden` back through the embedding gather.
+
+5. **No VRAM pre-check.** Allocates all layers' INT8 weights + FP32 caches + FP16 mom/vel simultaneously without checking if they fit. Segfaults on GPU MMU fault instead of failing gracefully. `train_cuda.go` and `train_metal.go` both have VRAM guards.
+
+6. **No LoRA path.** Does full-weight INT8+needle training (~9 bytes/param for all layers resident). For 14B models on 32GB VRAM this OOMs at layer 11/48. The Apr 15 successful 14B training used Q8+LoRA (frozen INT8 base + rank-16 adapters = 15.5GB total). `autodetect.go` already computes `LoRAFit` and `LoRARank` but nothing wires to a LoRA training path.
+
+### train_cuda.go (cmdTrainCUDA — from-scratch CUDA path)
+
+7. **Sharded model loading broken on resume.** Line 65: `filepath.Join(ckptDir, "model.safetensors")` fails for models with multiple shards (e.g., Qwen2.5-14B has 8 shards). Fix: `gguf.OpenSafeTensors(ckptDir)` — the library handles directories with `model.safetensors.index.json`.
+
+### train_metal.go (cmdTrainMetal — from-scratch Metal path)
+
+8. **Same sharded model loading bug.** Line 74: same `filepath.Join(ckptDir, "model.safetensors")` hardcode. Same fix.
+
+### train_unified.go (routing)
+
+9. **CUDA fine-tune routes to broken cmdFinetune.** `runFinetune()` on CUDA calls `cmdFinetune()` which has bugs 1-6 above. For large models, should route to a Q8+LoRA path instead. Metal already routes via `--resume` to `cmdTrainMetal` which reads config.json correctly.
