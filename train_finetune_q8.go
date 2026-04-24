@@ -8,22 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
 	"github.com/open-ai-org/gguf"
 	"github.com/open-ai-org/helix"
 	"github.com/open-ai-org/mongoose"
 	"github.com/open-ai-org/tokenizer"
 )
 
-// cmdFinetuneQ8 fine-tunes a pretrained model on CUDA using Q8+LoRA.
-//
-// Memory model (matches Apr 15 successful 14B training):
-//   - Frozen INT8 base weights, all layers resident (~12.3GB for 14B)
-//   - Shared FP32 dequant buffer, one projection at a time (~2.97GB)
-//   - FP32 LoRA adapters (rank-N per projection, ~262MB at rank-16)
-//   - GPU arena for activations + gradients (~5GB)
-//   - No optimizer state on base weights — they're frozen
-//   - Helix DNA optimizer on LoRA params only
 func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery int) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
@@ -36,6 +26,12 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	}
 	if !mongoose.LoadKernels() {
 		log.Fatal("CUDA kernels required")
+	}
+	if !mongoose.NeedleSparseLoaded() {
+		log.Fatal("KNeedleSparse kernel not loaded")
+	}
+	if !mongoose.SoftmaxCELoaded() {
+		log.Fatal("softmax+CE kernel not loaded")
 	}
 
 	ms, err := OpenModel(modelPath)
@@ -54,7 +50,6 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	vocabSize := profile.VocabSize
 	seqLen := profile.SeqLen
 	n := seqLen
-	rank := profile.LoRARank
 
 	tok, err := tokenizer.LoadTokenizer(modelPath)
 	if err != nil {
@@ -66,13 +61,12 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		log.Fatalf("read data: %v", err)
 	}
 	tokens := tok.Encode(string(raw))
-	log.Printf("[q8+lora] BPE tokenized %d bytes → %d tokens (%.1fx compression)",
+	log.Printf("[needle] %d bytes → %d tokens (%.1fx)",
 		len(raw), len(tokens), float64(len(raw))/float64(len(tokens)))
 	if len(tokens) < n+1 {
-		log.Fatalf("training data too small: %d tokens, need at least %d", len(tokens), n+1)
+		log.Fatalf("need at least %d tokens, got %d", n+1, len(tokens))
 	}
 
-	// RoPE
 	halfHead := headDim / 2
 	cosTab := make([]float32, seqLen*halfHead)
 	sinTab := make([]float32, seqLen*halfHead)
@@ -87,35 +81,16 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	ropeCos := te.FromHost(cosTab, []int{seqLen, halfHead})
 	ropeSin := te.FromHost(sinTab, []int{seqLen, halfHead})
 
-	// VRAM guard: estimate total before allocating
-	{
-		layerParams := int64(dim*dim*2 + kvDim*dim*2 + dim*dim + ffnDim*dim*2 + dim*ffnDim)
-		int8Bytes := layerParams * int64(nLayers)                                       // INT8 base (1 byte/param)
-		loraParams := int64(nLayers) * 7 * 2 * int64(rank) * int64(dim) * 4             // LoRA A+B FP32
-		loraAdam := loraParams * 2                                                       // Adam M+V for LoRA
-		embedBytes := int64(vocabSize) * int64(dim) * 4 * 2                              // embed + lm_head FP32
-		dequantBytes := int64(ffnDim) * int64(dim) * 4                                   // shared dequant buffer
-		actBytes := int64(n) * int64(dim) * 4 * 20                                       // ~20 activation buffers
-		gradBytes := int64(n) * int64(vocabSize) * 4 * 2                                 // logitsBuf + gradGPU
-		totalEst := int8Bytes + loraParams + loraAdam + embedBytes + dequantBytes + actBytes + gradBytes
-		vramBytes := eng.VRAM()
-		headroom := int64(float64(vramBytes) * 0.90)
-		if totalEst > headroom {
-			log.Fatalf("[q8+lora] estimated %.1f GB but only %.1f GB VRAM (90%% of %.1f GB). Reduce rank or seq length.",
-				float64(totalEst)/(1024*1024*1024), float64(headroom)/(1024*1024*1024), float64(vramBytes)/(1024*1024*1024))
-		}
-		log.Printf("[q8+lora] VRAM estimate: %.1f GB / %.1f GB available",
-			float64(totalEst)/(1024*1024*1024), float64(vramBytes)/(1024*1024*1024))
-	}
+	log.Printf("[needle] loading %s", modelPath)
 
-	log.Printf("[q8+lora] loading %s (Q8 frozen base + LoRA rank-%d)", modelPath, rank)
-
-	// --- Frozen INT8 base weights (no optimizer state) ---
-	type frozenQ8 struct {
-		q8         *mongoose.Int8Tensor
-		rows, cols int
+	type q8Weight struct {
+		q8    *mongoose.Int8Tensor
+		mom   *mongoose.Tensor
+		delta *mongoose.Tensor
+		rows  int
+		cols  int
 	}
-	loadFrozen := func(name string, rows, cols int) frozenQ8 {
+	loadWeight := func(name string, rows, cols int) q8Weight {
 		data, err := ms.ReadTensorFloat32(name)
 		if err != nil {
 			log.Fatalf("load %s: %v", name, err)
@@ -125,34 +100,14 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 			DataInt8: qt.DataInt8, Scales: qt.Scales, Shape: qt.Shape,
 			Rows: qt.Rows, Cols: qt.Cols,
 		})
-		return frozenQ8{q8: q8, rows: rows, cols: cols}
+		nElem := maxHot * cols
+		mom := cuda.AllocFP16Tensor(nElem, []int{maxHot, cols})
+		delta := cuda.AllocFP16Tensor(nElem, []int{maxHot, cols})
+		mongoose.KZero(mom.DevicePtr(), nElem*2)
+		mongoose.KZero(delta.DevicePtr(), nElem*2)
+		return q8Weight{q8: q8, mom: mom, delta: delta, rows: rows, cols: cols}
 	}
 
-	// --- LoRA adapters: B[outDim, rank] @ A[rank, inDim] ---
-	type lora struct {
-		A, B   *mongoose.Tensor
-		aM, aV *mongoose.Tensor // Adam state for A
-		bM, bV *mongoose.Tensor // Adam state for B
-		out, in int
-	}
-	initLora := func(outDim, inDim int) lora {
-		// A: Kaiming init, B: zero (LoRA starts as identity)
-		scale := float32(math.Sqrt(2.0 / float64(rank)))
-		aData := make([]float32, rank*inDim)
-		for i := range aData {
-			aData[i] = scale * (2*rand.Float32() - 1)
-		}
-		bData := make([]float32, outDim*rank)
-		return lora{
-			A:  te.FromHost(aData, []int{rank, inDim}),
-			B:  te.FromHost(bData, []int{outDim, rank}),
-			aM: te.Zeros([]int{rank * inDim}), aV: te.Zeros([]int{rank * inDim}),
-			bM: te.Zeros([]int{outDim * rank}), bV: te.Zeros([]int{outDim * rank}),
-			out: outDim, in: inDim,
-		}
-	}
-
-	// --- FP32 embed + lm_head (trainable) ---
 	embedData, err := ms.ReadTensorFloat32("model.embed_tokens.weight")
 	if err != nil {
 		log.Fatalf("embed: %v", err)
@@ -168,86 +123,59 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	fnData, _ := ms.ReadTensorFloat32("model.norm.weight")
 	if fnData == nil {
 		fnData = make([]float32, dim)
-		for i := range fnData { fnData[i] = 1 }
+		for i := range fnData {
+			fnData[i] = 1
+		}
 	}
 	finalNorm := te.FromHost(fnData, []int{1, dim})
 
-	// --- Load layers: frozen Q8 base + LoRA adapters ---
 	type layer struct {
-		wq, wk, wv, wo, gate, up, down frozenQ8
+		wq, wk, wv, wo, gate, up, down q8Weight
 		norm1, norm2                    *mongoose.Tensor
-		lq, lk, lv, lo, lgate, lup, ldown lora
 	}
 	loadNorm := func(name string) *mongoose.Tensor {
 		d, _ := ms.ReadTensorFloat32(name)
 		if d == nil {
 			d = make([]float32, dim)
-			for i := range d { d[i] = 1 }
+			for i := range d {
+				d[i] = 1
+			}
 		}
 		return te.FromHost(d, []int{1, dim})
 	}
 
-	var intBytes, fpBytes, loraBytes int64
 	lays := make([]layer, nLayers)
 	for l := 0; l < nLayers; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
 		lays[l] = layer{
-			wq:    loadFrozen(pfx+"self_attn.q_proj.weight", dim, dim),
-			wk:    loadFrozen(pfx+"self_attn.k_proj.weight", kvDim, dim),
-			wv:    loadFrozen(pfx+"self_attn.v_proj.weight", kvDim, dim),
-			wo:    loadFrozen(pfx+"self_attn.o_proj.weight", dim, dim),
-			gate:  loadFrozen(pfx+"mlp.gate_proj.weight", ffnDim, dim),
-			up:    loadFrozen(pfx+"mlp.up_proj.weight", ffnDim, dim),
-			down:  loadFrozen(pfx+"mlp.down_proj.weight", dim, ffnDim),
+			wq:    loadWeight(pfx+"self_attn.q_proj.weight", dim, dim),
+			wk:    loadWeight(pfx+"self_attn.k_proj.weight", kvDim, dim),
+			wv:    loadWeight(pfx+"self_attn.v_proj.weight", kvDim, dim),
+			wo:    loadWeight(pfx+"self_attn.o_proj.weight", dim, dim),
+			gate:  loadWeight(pfx+"mlp.gate_proj.weight", ffnDim, dim),
+			up:    loadWeight(pfx+"mlp.up_proj.weight", ffnDim, dim),
+			down:  loadWeight(pfx+"mlp.down_proj.weight", dim, ffnDim),
 			norm1: loadNorm(pfx + "input_layernorm.weight"),
 			norm2: loadNorm(pfx + "post_attention_layernorm.weight"),
-			lq:    initLora(dim, dim),
-			lk:    initLora(kvDim, dim),
-			lv:    initLora(kvDim, dim),
-			lo:    initLora(dim, dim),
-			lgate: initLora(ffnDim, dim),
-			lup:   initLora(ffnDim, dim),
-			ldown: initLora(dim, ffnDim),
 		}
-		// Track memory
-		layerINT8 := int64(dim*dim + kvDim*dim*2 + dim*dim + ffnDim*dim*2 + dim*ffnDim) // bytes
-		layerLora := int64(7 * 2 * rank * dim * 4) // rough: 7 projections × (A+B) × rank × dim × 4
-		intBytes += layerINT8
-		loraBytes += layerLora
-
 		if (l+1)%10 == 0 || l == nLayers-1 {
-			log.Printf("[q8+lora] loaded layer %d/%d (INT8: %.1fGB, FP32: %.1fMB, LoRA: %.1fMB)",
-				l+1, nLayers,
-				float64(intBytes)/(1024*1024*1024),
-				float64(fpBytes)/(1024*1024),
-				float64(loraBytes)/(1024*1024))
+			log.Printf("[needle] loaded layer %d/%d", l+1, nLayers)
 		}
 	}
 
-	// --- Shared FP32 dequant buffer (one projection at a time) ---
+	conductor := mongoose.NewConductor(vocabSize, 1)
+
 	maxElems := ffnDim * dim
 	if dim*dim > maxElems {
 		maxElems = dim * dim
 	}
 	dequantBuf := te.Zeros([]int{maxElems})
 
-	// --- LoRA intermediate buffers ---
-	loraMid := te.Zeros([]int{n, rank})
-	loraAdd := te.Zeros([]int{n, ffnDim}) // sized for largest output dim
-
-	// --- Activation buffers ---
 	hidden := te.Zeros([]int{n, dim})
 	tokGPU := te.Zeros([]int{n})
 	targetsGPU := te.Zeros([]int{n})
 	logitsBuf := te.Zeros([]int{n, vocabSize})
 	lossesGPU := te.Zeros([]int{n})
-	gradGPU := te.Zeros([]int{n, vocabSize})
-	normedFinal := te.Zeros([]int{n, dim})
-	finalScales := te.Zeros([]int{n})
-	dHidden := te.Zeros([]int{n, dim})
-	dScratch := te.Zeros([]int{n, dim})
-
-	// Per-layer forward activations (reused, single set)
 	normed := te.Zeros([]int{n, dim})
 	Q := te.Zeros([]int{n, dim})
 	K := te.Zeros([]int{n, kvDim})
@@ -259,28 +187,9 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	ffnMid := te.Zeros([]int{n, ffnDim})
 	rmsScale1 := te.Zeros([]int{n})
 	rmsScale2 := te.Zeros([]int{n})
+	normedFinal := te.Zeros([]int{n, dim})
+	finalScales := te.Zeros([]int{n})
 	dx := te.Zeros([]int{n, dim})
-
-	// Saved hidden states at layer boundaries for sparse backprop (240MB for 14B)
-	savedHidden := make([]*mongoose.Tensor, nLayers)
-	savedMid := make([]*mongoose.Tensor, nLayers) // hidden after attention, before FFN
-	for i := range savedHidden {
-		savedHidden[i] = te.Zeros([]int{n, dim})
-		savedMid[i] = te.Zeros([]int{n, dim})
-	}
-
-	// Sparse backprop: only LoRA gradients needed
-	// dHidden propagation through frozen base uses shared dequant buffer
-	// LoRA grads: two sets for paired projections
-	dLoraMid := te.Zeros([]int{n, rank})
-	dA1 := te.Zeros([]int{rank * ffnDim})
-	dB1 := te.Zeros([]int{ffnDim * rank})
-	dA2 := te.Zeros([]int{rank * ffnDim})
-	dB2 := te.Zeros([]int{ffnDim * rank})
-
-	// Gradient buffers for dHidden propagation (reused)
-	dN1 := te.Zeros([]int{n, dim})
-	dN2 := te.Zeros([]int{n, dim})
 
 	hlx := helix.NewHelixOptimizer(float32(lr), 0.9, 0.95, 1e-8, 0.1)
 
@@ -288,93 +197,152 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
 	}
 
-	// loraForward: out = input @ dequant(W)^T + input @ A^T @ B^T
-	loraForward := func(out, input *mongoose.Tensor, fq frozenQ8, la lora, seqN, inDim, outDim int) {
-		cuda.DequantToFP32(fq.q8, dequantBuf.DevicePtr())
+	type hotBuf struct {
+		gpu *mongoose.Tensor
+		n   int
+	}
+	hotByRows := make(map[int]*hotBuf)
+	for _, rc := range []int{dim, kvDim, ffnDim} {
+		hotByRows[rc] = &hotBuf{gpu: te.Zeros([]int{maxHot}), n: 0}
+	}
+	hotF := make([]float32, maxHot)
+
+	uploadAllHotIndices := func() {
+		hotRows := conductor.HotRows()
+		for rc, hb := range hotByRows {
+			seen := make(map[int32]bool)
+			nh := 0
+			for _, h := range hotRows {
+				r := h % int32(rc)
+				if !seen[r] && nh < maxHot {
+					seen[r] = true
+					hotF[nh] = math.Float32frombits(uint32(r))
+					nh++
+				}
+			}
+			hb.n = nh
+			if nh > 0 {
+				cuda.UploadInto(hb.gpu, hotF[:nh])
+			}
+		}
+	}
+
+	needleFwd := func(w *q8Weight, out, input *mongoose.Tensor, step, seqN, inDim, outDim int) {
+		cuda.DequantToFP32(w.q8, dequantBuf.DevicePtr())
+
+		if step > 1 {
+			hb := hotByRows[w.rows]
+			if hb != nil && hb.n > 0 {
+				ss := hlx.SignalScale()
+				mongoose.KNeedleSparse(
+					w.q8.DataPtr, w.q8.ScalePtr, dequantBuf.DevicePtr(),
+					w.mom.DevicePtr(), w.delta.DevicePtr(), hb.gpu.DevicePtr(),
+					ss, float32(lr), 0.9, 0.1,
+					hb.n, w.cols)
+			}
+		}
+
 		cuda.MatMulTransposeBTInto(out, input, dequantBuf, seqN, inDim, outDim)
-		cuda.MatMulTransposeBTInto(loraMid, input, la.A, seqN, inDim, rank)
-		cuda.MatMulTransposeBTInto(loraAdd, loraMid, la.B, seqN, rank, outDim)
-		te.AddInPlace(out, loraAdd)
 	}
 
-	// loraBackward: compute dA and dB from output gradient into specified buffers
-	loraBackward := func(dOut, input *mongoose.Tensor, la lora, dABuf, dBBuf *mongoose.Tensor, seqN, inDim, outDim int) {
-		cuda.MatMulTransposeBTInto(loraMid, input, la.A, seqN, inDim, rank)
-		cuda.MatMulTransposeATInto(dBBuf, dOut, loraMid, seqN, outDim, rank)
-		cuda.MatMulTInto(dLoraMid, dOut, la.B, seqN, outDim, rank)
-		cuda.MatMulTransposeATInto(dABuf, dLoraMid, input, seqN, rank, inDim)
-	}
-
-	// loraStepPaired: Helix DNA paired update using two gradient slots
-	loraStepPaired := func(la1, la2 *lora, gA1, gB1, gA2, gB2 *mongoose.Tensor, r helix.Rung, bs float32, step int) {
-		mongoose.KHelixDNAStep(
-			la1.A.DevicePtr(), la2.A.DevicePtr(), gA1.DevicePtr(), gA2.DevicePtr(),
-			la1.aM.DevicePtr(), la2.aM.DevicePtr(),
-			la1.aV.DevicePtr(), la2.aV.DevicePtr(),
-			float32(lr), 0.9, 0.95, step, 1e-8, 0.1,
-			r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-			bs, la1.A.Size)
-		mongoose.KHelixDNAStep(
-			la1.B.DevicePtr(), la2.B.DevicePtr(), gB1.DevicePtr(), gB2.DevicePtr(),
-			la1.bM.DevicePtr(), la2.bM.DevicePtr(),
-			la1.bV.DevicePtr(), la2.bV.DevicePtr(),
-			float32(lr), 0.9, 0.95, step, 1e-8, 0.1,
-			r.Backbone1, r.Glyco1, r.Hbond1, r.Hbond2, r.Glyco2, r.Backbone2,
-			bs, la1.B.Size)
-	}
-
-	loraStepAdam := func(la *lora, gA, gB *mongoose.Tensor, step int) {
-		mongoose.KAdamW(la.A.DevicePtr(), gA.DevicePtr(), la.aM.DevicePtr(), la.aV.DevicePtr(),
-			float32(lr), 0.1, step, la.A.Size)
-		mongoose.KAdamW(la.B.DevicePtr(), gB.DevicePtr(), la.bM.DevicePtr(), la.bV.DevicePtr(),
-			float32(lr), 0.1, step, la.B.Size)
-	}
-
-	totalLoraParams := int64(nLayers) * 7 * 2 * int64(rank) * int64(dim)
-	fmt.Println("ai finetune — Q8 frozen base + LoRA + Helix DNA optimizer")
+	fmt.Println("ai finetune — needle + helix forward-only (CUDA)")
 	fmt.Printf("  engine:     %s\n", eng.Name())
 	fmt.Printf("  model:      %s\n", modelPath)
 	fmt.Printf("  data:       %s (%d tokens)\n", dataPath, len(tokens))
 	fmt.Printf("  arch:       dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d\n",
 		dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
-	fmt.Printf("  lora:       rank=%d (%.1fM trainable params)\n", rank, float64(totalLoraParams)/1e6)
 	fmt.Printf("  training:   steps=%d lr=%.0e seq=%d\n", steps, lr, seqLen)
+	fmt.Printf("  needle:     KNeedleSparse, %d hot rows, compacted FP16 mom/delta\n", maxHot)
 	fmt.Println()
 
-	// Checkpoint save closure
-	saveCheckpoint := func(step int) {
-		cuda.Sync()
-		outDir := filepath.Join(filepath.Dir(modelPath), fmt.Sprintf("lora-step-%d", step))
-		os.MkdirAll(outDir, 0755)
-		w := gguf.NewGGUFWriter()
-		w.AddString("general.architecture", "lora")
-		w.AddUint32("lora.rank", uint32(rank))
-		w.AddUint32("lora.layers", uint32(nLayers))
-		for l := 0; l < nLayers; l++ {
-			pfx := fmt.Sprintf("blk.%d.", l)
-			save := func(name string, la lora) {
-				w.AddTensorF32(pfx+name+".lora_a", te.ToHost(la.A), rank, la.in)
-				w.AddTensorF32(pfx+name+".lora_b", te.ToHost(la.B), la.out, rank)
-			}
-			save("attn_q", lays[l].lq)
-			save("attn_k", lays[l].lk)
-			save("attn_v", lays[l].lv)
-			save("attn_output", lays[l].lo)
-			save("ffn_gate", lays[l].lgate)
-			save("ffn_up", lays[l].lup)
-			save("ffn_down", lays[l].ldown)
+	type sparseCheckpoint struct {
+		momData   map[string][]float32
+		deltaData map[string][]float32
+		loss      float32
+		step      int
+	}
+	var ckpt *sparseCheckpoint
+	bestFloor := float32(1e30)
+	immuneActive := false
+	floorContactStep := 0
+	floorWindow := 10
+	maxRecoveries := 20
+	recoveryCount := 0
+	var prevLoss float32
+
+	maxMomElems := maxHot * ffnDim
+	if maxHot*dim > maxMomElems {
+		maxMomElems = maxHot * dim
+	}
+	fp32Scratch := te.Zeros([]int{maxMomElems})
+
+	allWeights := func(li int) []struct {
+		name string
+		w    *q8Weight
+	} {
+		l := &lays[li]
+		return []struct {
+			name string
+			w    *q8Weight
+		}{
+			{"wq", &l.wq}, {"wk", &l.wk}, {"wv", &l.wv},
+			{"wo", &l.wo}, {"gate", &l.gate}, {"up", &l.up}, {"down", &l.down},
 		}
-		outPath := filepath.Join(outDir, "adapters.gguf")
-		if err := w.Write(outPath); err != nil {
-			log.Printf("WARN: save checkpoint: %v", err)
+	}
+
+	downloadFP16 := func(src *mongoose.Tensor, nElem int) []float32 {
+		mongoose.KFP16ToFP32(src.DevicePtr(), fp32Scratch.DevicePtr(), nElem)
+		cuda.Sync()
+		host := te.ToHost(fp32Scratch)
+		out := make([]float32, nElem)
+		copy(out, host[:nElem])
+		return out
+	}
+
+	uploadFP16 := func(dst *mongoose.Tensor, data []float32) {
+		cuda.UploadInto(fp32Scratch, data)
+		mongoose.KFP32ToFP16(fp32Scratch.DevicePtr(), dst.DevicePtr(), len(data))
+	}
+
+	saveHotRows := func(hotRows []int32, loss float32, step int) {
+		ckpt = &sparseCheckpoint{
+			momData:   make(map[string][]float32),
+			deltaData: make(map[string][]float32),
+			loss:      loss,
+			step:      step,
+		}
+		cuda.Sync()
+		for li := range lays {
+			for _, pw := range allWeights(li) {
+				key := fmt.Sprintf("%d.%s", li, pw.name)
+				w := pw.w
+				nElem := maxHot * w.cols
+				ckpt.momData[key] = downloadFP16(w.mom, nElem)
+				ckpt.deltaData[key] = downloadFP16(w.delta, nElem)
+			}
+		}
+	}
+
+	restoreHotRows := func() {
+		if ckpt == nil {
 			return
 		}
-		log.Printf("[q8+lora] checkpoint saved: %s", outPath)
+		for li := range lays {
+			for _, pw := range allWeights(li) {
+				key := fmt.Sprintf("%d.%s", li, pw.name)
+				w := pw.w
+				if momF, ok := ckpt.momData[key]; ok {
+					uploadFP16(w.mom, momF)
+				}
+				if deltaF, ok := ckpt.deltaData[key]; ok {
+					uploadFP16(w.delta, deltaF)
+				}
+			}
+		}
 	}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	tokF := make([]float32, n)
-	targF := make([]float32, n)
+	tokI32 := make([]int32, n)
 
 	fmt.Println("Training...")
 	t0 := time.Now()
@@ -382,29 +350,35 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 	for step := 1; step <= steps; step++ {
 		start := rng.Intn(len(tokens) - n - 1)
 		for i := 0; i < n; i++ {
-			tokF[i] = math.Float32frombits(uint32(int32(tokens[start+i])))
+			tokI32[i] = int32(tokens[start+i])
+		}
+
+		tokF := make([]float32, n)
+		targF := make([]float32, n)
+		for i := 0; i < n; i++ {
+			tokF[i] = math.Float32frombits(uint32(tokI32[i]))
 			targF[i] = math.Float32frombits(uint32(int32(tokens[start+i+1])))
 		}
 		cuda.UploadInto(tokGPU, tokF)
 		cuda.UploadInto(targetsGPU, targF)
 
-		// === FORWARD ===
+		conductor.Observe(tokI32)
+		uploadAllHotIndices()
+
 		zero(hidden)
 		mongoose.KEmbedGather2(hidden.DevicePtr(), embed.DevicePtr(), tokGPU.DevicePtr(), n, dim)
 
 		for li := range lays {
 			l := &lays[li]
 
-			// Save hidden at layer entry (for backward recomputation)
-			cuda.CopyInto(savedHidden[li], hidden)
-
-			zero(normed); zero(rmsScale1)
+			zero(normed)
+			zero(rmsScale1)
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), normed.DevicePtr(),
 				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), n, dim)
 
-			loraForward(Q, normed, l.wq, l.lq, n, dim, dim)
-			loraForward(K, normed, l.wk, l.lk, n, dim, kvDim)
-			loraForward(V, normed, l.wv, l.lv, n, dim, kvDim)
+			needleFwd(&l.wq, Q, normed, step, n, dim, dim)
+			needleFwd(&l.wk, K, normed, step, n, dim, kvDim)
+			needleFwd(&l.wv, V, normed, step, n, dim, kvDim)
 
 			mongoose.KRoPE(Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
 			mongoose.KRoPE(K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
@@ -413,148 +387,140 @@ func cmdFinetuneQ8(modelPath, dataPath string, steps int, lr float64, logEvery i
 			mongoose.KCausalAttentionGQA(Q.DevicePtr(), K.DevicePtr(), V.DevicePtr(), attnOut.DevicePtr(),
 				n, dim, kvDim, heads, kvHeads)
 
-			loraForward(dx, attnOut, l.wo, l.lo, n, dim, dim)
+			needleFwd(&l.wo, dx, attnOut, step, n, dim, dim)
 			te.AddInPlace(hidden, dx)
 
-			// Save hidden after attention (for FFN backward recomputation)
-			cuda.CopyInto(savedMid[li], hidden)
-
-			zero(normed2); zero(rmsScale2)
+			zero(normed2)
+			zero(rmsScale2)
 			mongoose.KRMSNormOutSave(hidden.DevicePtr(), normed2.DevicePtr(),
 				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), n, dim)
 
-			loraForward(gatePre, normed2, l.gate, l.lgate, n, dim, ffnDim)
-			loraForward(upOut, normed2, l.up, l.lup, n, dim, ffnDim)
+			needleFwd(&l.gate, gatePre, normed2, step, n, dim, ffnDim)
+			needleFwd(&l.up, upOut, normed2, step, n, dim, ffnDim)
 
 			zero(ffnMid)
 			mongoose.KSiLUGateMul(gatePre.DevicePtr(), upOut.DevicePtr(), ffnMid.DevicePtr(), n*ffnDim)
 
-			loraForward(dx, ffnMid, l.down, l.ldown, n, ffnDim, dim)
+			needleFwd(&l.down, dx, ffnMid, step, n, ffnDim, dim)
 			te.AddInPlace(hidden, dx)
 		}
 
-		zero(normedFinal); zero(finalScales)
+		zero(normedFinal)
+		zero(finalScales)
 		mongoose.KRMSNormOutSave(hidden.DevicePtr(), normedFinal.DevicePtr(),
 			finalNorm.DevicePtr(), finalScales.DevicePtr(), n, dim)
 
 		cuda.MatMulTransposeBTInto(logitsBuf, normedFinal, lmHead, n, dim, vocabSize)
 
-		zero(lossesGPU); zero(gradGPU)
+		var stepLoss float32
+		zero(lossesGPU)
 		invN := float32(1.0) / float32(n)
 		mongoose.KSoftmaxCE(logitsBuf.DevicePtr(), targetsGPU.DevicePtr(),
-			lossesGPU.DevicePtr(), gradGPU.DevicePtr(), n, vocabSize, invN)
-
+			lossesGPU.DevicePtr(), logitsBuf.DevicePtr(), n, vocabSize, invN)
 		cuda.Sync()
-		var stepLoss float32
 		lossH := te.ToHost(lossesGPU)
 		for _, v := range lossH {
 			stepLoss += v
 		}
 		stepLoss /= float32(n)
 
-		// === SPARSE BACKWARD (recompute activations from saved hidden) ===
-		// Only LoRA gradients computed. dHidden propagated through frozen base.
-		cuda.MatMulTInto(dHidden, gradGPU, lmHead, n, vocabSize, dim)
+		hotRows := conductor.HotRows()
 
-		zero(dScratch)
-		mongoose.KRMSNormBackward(dHidden.DevicePtr(), hidden.DevicePtr(),
-			finalNorm.DevicePtr(), finalScales.DevicePtr(), dScratch.DevicePtr(), n, dim)
-		cuda.CopyInto(dHidden, dScratch)
-
-		hlx.Step(step, stepLoss, float32(lr))
-		r := hlx.CurrentRung()
-		skipPaired := true // TODO: debug KHelixDNAStep call convention for LoRA paired projections
-
-		for li := nLayers - 1; li >= 0; li-- {
-			l := &lays[li]
-
-			// --- Recompute FFN activations from savedMid[li] ---
-			zero(normed2); zero(rmsScale2)
-			mongoose.KRMSNormOutSave(savedMid[li].DevicePtr(), normed2.DevicePtr(),
-				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), n, dim)
-
-			loraForward(gatePre, normed2, l.gate, l.lgate, n, dim, ffnDim)
-			loraForward(upOut, normed2, l.up, l.lup, n, dim, ffnDim)
-			zero(ffnMid)
-			mongoose.KSiLUGateMul(gatePre.DevicePtr(), upOut.DevicePtr(), ffnMid.DevicePtr(), n*ffnDim)
-
-			// FFN LoRA backward: down projection
-			loraBackward(dHidden, ffnMid, l.ldown, dA1, dB1, n, ffnDim, dim)
-			loraStepAdam(&l.ldown, dA1, dB1, step)
-
-			// dHidden through frozen FFN for propagation
-			cuda.DequantToFP32(l.down.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dN2, dHidden, dequantBuf, n, dim, ffnDim)
-			// dN2 is now dFfnMid — but we only need it for gate/up LoRA grads, not full SiLU backward
-
-			// gate↔up LoRA backward (input was normed2)
-			loraBackward(dN2, normed2, l.lgate, dA1, dB1, n, dim, ffnDim)
-			loraBackward(dN2, normed2, l.lup, dA2, dB2, n, dim, ffnDim)
-			if !skipPaired {
-				loraStepPaired(&l.lgate, &l.lup, dA1, dB1, dA2, dB2, r, 3.0/5.0, step)
-			} else {
-				loraStepAdam(&l.lgate, dA1, dB1, step)
-				loraStepAdam(&l.lup, dA2, dB2, step)
+		if !immuneActive && step > 1 && stepLoss > 0 {
+			if stepLoss < bestFloor*1.1 {
+				saveHotRows(hotRows, stepLoss, step)
 			}
-
-			// Propagate dHidden through FFN RMSNorm
-			zero(dx)
-			mongoose.KRMSNormBackward(dHidden.DevicePtr(), savedMid[li].DevicePtr(),
-				l.norm2.DevicePtr(), rmsScale2.DevicePtr(), dx.DevicePtr(), n, dim)
-			cuda.CopyInto(dHidden, dx)
-
-			// --- Recompute attention activations from savedHidden[li] ---
-			zero(normed); zero(rmsScale1)
-			mongoose.KRMSNormOutSave(savedHidden[li].DevicePtr(), normed.DevicePtr(),
-				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), n, dim)
-
-			loraForward(Q, normed, l.wq, l.lq, n, dim, dim)
-			loraForward(K, normed, l.wk, l.lk, n, dim, kvDim)
-			loraForward(V, normed, l.wv, l.lv, n, dim, kvDim)
-			mongoose.KRoPE(Q.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, dim, headDim, heads)
-			mongoose.KRoPE(K.DevicePtr(), ropeCos.DevicePtr(), ropeSin.DevicePtr(), n, kvDim, headDim, kvHeads)
-			zero(attnOut)
-			mongoose.KCausalAttentionGQA(Q.DevicePtr(), K.DevicePtr(), V.DevicePtr(), attnOut.DevicePtr(),
-				n, dim, kvDim, heads, kvHeads)
-
-			// wo LoRA backward
-			loraBackward(dHidden, attnOut, l.lo, dA1, dB1, n, dim, dim)
-			loraStepAdam(&l.lo, dA1, dB1, step)
-
-			// Propagate dHidden through attention for Q/K/V LoRA grads
-			cuda.DequantToFP32(l.wo.q8, dequantBuf.DevicePtr())
-			cuda.MatMulTInto(dN1, dHidden, dequantBuf, n, dim, dim)
-			// dN1 is now dAttnOut — use for Q/K/V LoRA grads
-
-			// q↔k LoRA backward (input was normed)
-			loraBackward(dN1, normed, l.lq, dA1, dB1, n, dim, dim)
-			loraBackward(dN1, normed, l.lk, dA2, dB2, n, dim, kvDim)
-			if !skipPaired {
-				loraStepPaired(&l.lq, &l.lk, dA1, dB1, dA2, dB2, r, 2.0/5.0, step)
-			} else {
-				loraStepAdam(&l.lq, dA1, dB1, step)
-				loraStepAdam(&l.lk, dA2, dB2, step)
-			}
-
-			loraBackward(dN1, normed, l.lv, dA1, dB1, n, dim, kvDim)
-			loraStepAdam(&l.lv, dA1, dB1, step)
-
-			// Propagate dHidden through attention RMSNorm
-			zero(dx)
-			mongoose.KRMSNormBackward(dHidden.DevicePtr(), savedHidden[li].DevicePtr(),
-				l.norm1.DevicePtr(), rmsScale1.DevicePtr(), dx.DevicePtr(), n, dim)
-			cuda.CopyInto(dHidden, dx)
 		}
 
+		if stepLoss > 0 && stepLoss < bestFloor {
+			bestFloor = stepLoss
+			if !immuneActive {
+				immuneActive = true
+				floorContactStep = step
+				recoveryCount = 0
+			}
+		}
+
+		immuneSkip := false
+		if immuneActive && step-floorContactStep >= floorWindow {
+			rebound := stepLoss - bestFloor
+			threshold := bestFloor * 0.05
+			if rebound > threshold && recoveryCount < maxRecoveries && ckpt != nil {
+				restoreHotRows()
+				recoveryCount++
+				immuneActive = false
+				immuneSkip = true
+				elapsed := time.Since(t0)
+				fmt.Printf("step %5d/%d  loss=%.4f  lr=%.1e  %.0fs  (%.1f steps/s) [IMMUNE → floor %.4f]\n",
+					step, steps, stepLoss, lr, elapsed.Seconds(),
+					float64(step)/elapsed.Seconds(), ckpt.loss)
+			} else {
+				immuneActive = false
+			}
+		}
+
+		if immuneSkip {
+			prevLoss = stepLoss
+			continue
+		}
+
+		stepLR := float32(lr)
+		if step > 1 && prevLoss > 0 {
+			dLoss := float64(stepLoss) - float64(prevLoss)
+			if dLoss > 0 {
+				ratio := float32(dLoss / math.Max(float64(prevLoss), 1e-6))
+				if ratio > 1.0 {
+					ratio = 1.0
+				}
+				stepLR *= (1.0 - ratio)
+			}
+		}
+		prevLoss = stepLoss
+
+		hlx.ForwardOnlyStep(step, stepLoss, stepLR)
+
 		if step <= 3 || step%logEvery == 0 {
+			hot, dead, _ := conductor.Stats()
 			elapsed := time.Since(t0)
-			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s, %.0fms/step)\n",
+			fmt.Printf("step %5d/%d  loss=%.4f  lr=%.1e  %.0fs  (%.1f steps/s)  vocab: %d hot, %d dead\n",
 				step, steps, stepLoss, lr, elapsed.Seconds(),
-				float64(step)/elapsed.Seconds(), elapsed.Seconds()/float64(step)*1000)
+				float64(step)/elapsed.Seconds(), hot, dead)
 		}
 
 		if step%1000 == 0 || step == steps {
-			saveCheckpoint(step)
+			cuda.Sync()
+			outDir := filepath.Join(filepath.Dir(modelPath), fmt.Sprintf("needle-step-%d", step))
+			os.MkdirAll(outDir, 0755)
+			w := gguf.NewGGUFWriter()
+			w.AddString("general.architecture", "qwen2")
+			w.AddUint32("qwen2.block_count", uint32(nLayers))
+			w.AddTensorQ8_0("token_embd.weight", te.ToHost(embed), vocabSize, dim)
+			w.AddTensorQ8_0("output.weight", te.ToHost(lmHead), vocabSize, dim)
+			w.AddTensorF32("output_norm.weight", te.ToHost(finalNorm), dim)
+			for l := 0; l < nLayers; l++ {
+				pfx := fmt.Sprintf("blk.%d.", l)
+				saveQ8 := func(name string, wt q8Weight) {
+					cuda.DequantToFP32(wt.q8, dequantBuf.DevicePtr())
+					fp32 := make([]float32, wt.rows*wt.cols)
+					copy(fp32, te.ToHost(dequantBuf)[:wt.rows*wt.cols])
+					w.AddTensorQ8_0(pfx+name, fp32, wt.rows, wt.cols)
+				}
+				saveQ8("attn_q.weight", lays[l].wq)
+				saveQ8("attn_k.weight", lays[l].wk)
+				saveQ8("attn_v.weight", lays[l].wv)
+				saveQ8("attn_output.weight", lays[l].wo)
+				saveQ8("ffn_gate.weight", lays[l].gate)
+				saveQ8("ffn_up.weight", lays[l].up)
+				saveQ8("ffn_down.weight", lays[l].down)
+				w.AddTensorF32(pfx+"attn_norm.weight", te.ToHost(lays[l].norm1), dim)
+				w.AddTensorF32(pfx+"ffn_norm.weight", te.ToHost(lays[l].norm2), dim)
+			}
+			outPath := filepath.Join(outDir, "model.gguf")
+			if err := w.Write(outPath); err != nil {
+				log.Printf("WARN: save checkpoint: %v", err)
+			} else {
+				log.Printf("[needle] checkpoint saved: %s", outPath)
+			}
 		}
 	}
 
