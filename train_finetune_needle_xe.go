@@ -14,7 +14,16 @@ import (
 	"github.com/open-ai-org/tokenizer"
 )
 
-func cmdFinetuneCUDA(modelPath, dataPath string, steps int, lr float64, logEvery int) {
+func cmdFinetuneCUDA(modelPath, dataPath string, args map[string]string, steps int, lr float64, logEvery int) {
+	if _, ok := args["adamw"]; ok {
+		cmdFinetuneAdamW(modelPath, dataPath, steps, lr, logEvery)
+		return
+	}
+	// Default: LoRA-shaped helix fine-tuning (VRAM-efficient)
+	log.Fatal("helix LoRA fine-tuning not yet implemented — use --adamw for full AdamW path")
+}
+
+func cmdFinetuneAdamW(modelPath, dataPath string, steps int, lr float64, logEvery int) {
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
 	if te == nil {

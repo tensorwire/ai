@@ -138,7 +138,7 @@ func runFinetune(modelPath, dataPath string, args map[string]string) {
 	switch backend {
 	case "cuda-kernels":
 		profile := AutoDetect(modelPath)
-		cmdFinetuneCUDA(modelPath, dataPath,
+		cmdFinetuneCUDA(modelPath, dataPath, args,
 			kvInt(args, "steps", profile.Steps),
 			kvFloat(args, "lr", profile.LR),
 			kvInt(args, "log", 50))
