@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/open-ai-org/tokenizer"
 )
 
 func TestHealthEndpoint(t *testing.T) {
@@ -101,19 +105,24 @@ func TestEmbeddingsNoModel(t *testing.T) {
 	}
 }
 
-func TestFormatChatPrompt(t *testing.T) {
+func TestApplyTemplateViaServeState(t *testing.T) {
+	modelDir := filepath.Join(os.Getenv("HOME"), ".mongoose", "models", "Qwen2.5-0.5B")
+	if _, err := os.Stat(filepath.Join(modelDir, "tokenizer.json")); err != nil {
+		t.Skip("Qwen2.5-0.5B not available for template test")
+	}
+	tok, err := tokenizer.LoadTokenizer(modelDir)
+	if err != nil {
+		t.Skipf("tokenizer load failed: %v", err)
+	}
+	state := &serveState{tokenizer: tok, cfg: map[string]interface{}{}}
+
 	msgs := []ChatMessage{
 		{Role: "system", Content: "You are helpful."},
 		{Role: "user", Content: "Hi"},
 	}
-	got := formatChatPrompt(msgs)
-	if got == "" {
-		t.Error("formatChatPrompt returned empty")
-	}
-	// Should end with "Assistant: " for the model to continue
-	want := "Assistant: "
-	if len(got) < len(want) || got[len(got)-len(want):] != want {
-		t.Errorf("formatChatPrompt should end with %q, got %q", want, got[len(got)-20:])
+	tokens := state.applyTemplate(msgs)
+	if len(tokens) == 0 {
+		t.Error("applyTemplate returned no tokens")
 	}
 }
 

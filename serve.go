@@ -1,23 +1,28 @@
-// serve.go — OpenAI-compatible API server for mongoose.
+// serve.go — OpenAI + Ollama compatible API server for mongoose.
 //
-// Implements the OpenAI API surface that tools (LangChain, LiteLLM, Continue,
-// Open WebUI, etc.) expect. Drop-in replacement for Ollama's /v1 endpoints.
-//
-// Endpoints:
+// Endpoints (OpenAI):
 //   POST /v1/chat/completions   — streaming (SSE) + non-streaming
 //   POST /v1/completions        — legacy completions
-//   POST /v1/embeddings         — text embeddings
+//   POST /v1/embeddings         — text embeddings (stub)
 //   GET  /v1/models             — list loaded models
+//
+// Endpoints (Ollama-native):
+//   POST /api/chat              — streaming chat (NDJSON)
+//   POST /api/generate          — streaming generate (NDJSON)
+//   POST /api/show              — model info
+//   GET  /api/tags              — list models
+//
+// Common:
 //   GET  /health                — liveness probe
 //
 // Usage:
-//   ai serve [--host 0.0.0.0] [--port 11434] [--model <name>]
-//   ai serve Qwen2.5-0.5B --daemon     Run in background, write PID to ~/.ai/serve.pid
+//   ai serve Qwen2.5-0.5B
+//   ai serve Qwen2.5-0.5B port=8080
+//   ai serve Qwen2.5-0.5B --daemon
 
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -37,90 +42,80 @@ import (
 )
 
 // -----------------------------------------------------------------------
-// OpenAI API request/response types
+// OpenAI API types
 // -----------------------------------------------------------------------
 
-// ChatCompletionRequest matches the OpenAI chat completions request body.
 type ChatCompletionRequest struct {
-	Model            string            `json:"model"`
-	Messages         []ChatMessage     `json:"messages"`
-	Temperature      *float64          `json:"temperature,omitempty"`
-	TopP             *float64          `json:"top_p,omitempty"`
-	N                int               `json:"n,omitempty"`
-	Stream           bool              `json:"stream,omitempty"`
-	Stop             interface{}       `json:"stop,omitempty"` // string or []string
-	MaxTokens        *int              `json:"max_tokens,omitempty"`
-	PresencePenalty  float64           `json:"presence_penalty,omitempty"`
-	FrequencyPenalty float64           `json:"frequency_penalty,omitempty"`
-	User             string            `json:"user,omitempty"`
-	Seed             *int              `json:"seed,omitempty"`
-	ResponseFormat   *ResponseFormat   `json:"response_format,omitempty"`
+	Model            string          `json:"model"`
+	Messages         []ChatMessage   `json:"messages"`
+	Temperature      *float64        `json:"temperature,omitempty"`
+	TopP             *float64        `json:"top_p,omitempty"`
+	N                int             `json:"n,omitempty"`
+	Stream           bool            `json:"stream,omitempty"`
+	Stop             interface{}     `json:"stop,omitempty"`
+	MaxTokens        *int            `json:"max_tokens,omitempty"`
+	PresencePenalty  float64         `json:"presence_penalty,omitempty"`
+	FrequencyPenalty float64         `json:"frequency_penalty,omitempty"`
+	User             string          `json:"user,omitempty"`
+	Seed             *int            `json:"seed,omitempty"`
+	ResponseFormat   *ResponseFormat `json:"response_format,omitempty"`
 }
 
-// ChatMessage is a single message in a chat conversation.
 type ChatMessage struct {
-	Role    string `json:"role"`    // "system", "user", "assistant"
+	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// ResponseFormat constrains the output format.
 type ResponseFormat struct {
-	Type string `json:"type"` // "text" or "json_object"
+	Type string `json:"type"`
 }
 
-// ChatCompletionResponse is the non-streaming response.
 type ChatCompletionResponse struct {
-	ID      string             `json:"id"`
-	Object  string             `json:"object"`
-	Created int64              `json:"created"`
-	Model   string             `json:"model"`
-	Choices []ChatChoice       `json:"choices"`
-	Usage   UsageInfo          `json:"usage"`
+	ID      string       `json:"id"`
+	Object  string       `json:"object"`
+	Created int64        `json:"created"`
+	Model   string       `json:"model"`
+	Choices []ChatChoice `json:"choices"`
+	Usage   UsageInfo    `json:"usage"`
 }
 
-// ChatChoice is one completion choice.
 type ChatChoice struct {
 	Index        int         `json:"index"`
 	Message      ChatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"` // "stop", "length"
+	FinishReason string      `json:"finish_reason"`
 }
 
-// ChatCompletionChunk is one SSE chunk for streaming responses.
 type ChatCompletionChunk struct {
-	ID      string              `json:"id"`
-	Object  string              `json:"object"`
-	Created int64               `json:"created"`
-	Model   string              `json:"model"`
-	Choices []ChatChunkChoice   `json:"choices"`
+	ID      string            `json:"id"`
+	Object  string            `json:"object"`
+	Created int64             `json:"created"`
+	Model   string            `json:"model"`
+	Choices []ChatChunkChoice `json:"choices"`
 }
 
-// ChatChunkChoice is a streaming delta.
 type ChatChunkChoice struct {
-	Index        int            `json:"index"`
-	Delta        ChatDelta      `json:"delta"`
-	FinishReason *string        `json:"finish_reason"` // null until final chunk
+	Index        int     `json:"index"`
+	Delta        ChatDelta `json:"delta"`
+	FinishReason *string `json:"finish_reason"`
 }
 
-// ChatDelta is the incremental content in a streaming chunk.
 type ChatDelta struct {
 	Role    string `json:"role,omitempty"`
 	Content string `json:"content,omitempty"`
 }
 
-// CompletionRequest matches the legacy OpenAI completions endpoint.
 type CompletionRequest struct {
-	Model       string   `json:"model"`
-	Prompt      string   `json:"prompt"`
-	MaxTokens   *int     `json:"max_tokens,omitempty"`
-	Temperature *float64 `json:"temperature,omitempty"`
-	TopP        *float64 `json:"top_p,omitempty"`
-	N           int      `json:"n,omitempty"`
-	Stream      bool     `json:"stream,omitempty"`
+	Model       string      `json:"model"`
+	Prompt      string      `json:"prompt"`
+	MaxTokens   *int        `json:"max_tokens,omitempty"`
+	Temperature *float64    `json:"temperature,omitempty"`
+	TopP        *float64    `json:"top_p,omitempty"`
+	N           int         `json:"n,omitempty"`
+	Stream      bool        `json:"stream,omitempty"`
 	Stop        interface{} `json:"stop,omitempty"`
-	Suffix      string   `json:"suffix,omitempty"`
+	Suffix      string      `json:"suffix,omitempty"`
 }
 
-// CompletionResponse is the legacy completions response.
 type CompletionResponse struct {
 	ID      string             `json:"id"`
 	Object  string             `json:"object"`
@@ -130,21 +125,18 @@ type CompletionResponse struct {
 	Usage   UsageInfo          `json:"usage"`
 }
 
-// CompletionChoice is one legacy completion choice.
 type CompletionChoice struct {
 	Text         string `json:"text"`
 	Index        int    `json:"index"`
 	FinishReason string `json:"finish_reason"`
 }
 
-// EmbeddingRequest matches the OpenAI embeddings endpoint.
 type EmbeddingRequest struct {
 	Model          string      `json:"model"`
-	Input          interface{} `json:"input"`          // string or []string
-	EncodingFormat string      `json:"encoding_format"` // "float" or "base64"
+	Input          interface{} `json:"input"`
+	EncodingFormat string      `json:"encoding_format"`
 }
 
-// EmbeddingResponse is the embeddings response.
 type EmbeddingResponse struct {
 	Object string          `json:"object"`
 	Data   []EmbeddingData `json:"data"`
@@ -152,40 +144,34 @@ type EmbeddingResponse struct {
 	Usage  UsageInfo       `json:"usage"`
 }
 
-// EmbeddingData is one embedding vector.
 type EmbeddingData struct {
 	Object    string    `json:"object"`
 	Embedding []float32 `json:"embedding"`
 	Index     int       `json:"index"`
 }
 
-// UsageInfo tracks token consumption.
 type UsageInfo struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// ModelInfo describes one model for the /v1/models response.
 type ModelInfo struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
+	ID       string `json:"id"`
+	Object   string `json:"object"`
+	Created  int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
 
-// ModelsResponse is the /v1/models list response.
 type ModelsResponse struct {
 	Object string      `json:"object"`
 	Data   []ModelInfo `json:"data"`
 }
 
-// ErrorResponse matches the OpenAI error envelope.
 type ErrorResponse struct {
 	Error ErrorDetail `json:"error"`
 }
 
-// ErrorDetail is the inner error object.
 type ErrorDetail struct {
 	Message string  `json:"message"`
 	Type    string  `json:"type"`
@@ -194,15 +180,103 @@ type ErrorDetail struct {
 }
 
 // -----------------------------------------------------------------------
+// Ollama API types
+// -----------------------------------------------------------------------
+
+type OllamaChatRequest struct {
+	Model    string             `json:"model"`
+	Messages []OllamaChatMsg    `json:"messages"`
+	Stream   *bool              `json:"stream,omitempty"`
+	Options  *OllamaOptions     `json:"options,omitempty"`
+}
+
+type OllamaChatMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OllamaOptions struct {
+	Temperature float64 `json:"temperature,omitempty"`
+	TopK        int     `json:"top_k,omitempty"`
+	TopP        float64 `json:"top_p,omitempty"`
+	NumPredict  int     `json:"num_predict,omitempty"`
+	Seed        int     `json:"seed,omitempty"`
+}
+
+type OllamaChatResponse struct {
+	Model           string      `json:"model"`
+	CreatedAt       string      `json:"created_at"`
+	Message         OllamaChatMsg `json:"message"`
+	Done            bool        `json:"done"`
+	TotalDuration   int64       `json:"total_duration,omitempty"`
+	LoadDuration    int64       `json:"load_duration,omitempty"`
+	PromptEvalCount int         `json:"prompt_eval_count,omitempty"`
+	PromptEvalDur   int64       `json:"prompt_eval_duration,omitempty"`
+	EvalCount       int         `json:"eval_count,omitempty"`
+	EvalDuration    int64       `json:"eval_duration,omitempty"`
+}
+
+type OllamaGenerateRequest struct {
+	Model   string         `json:"model"`
+	Prompt  string         `json:"prompt"`
+	Stream  *bool          `json:"stream,omitempty"`
+	Options *OllamaOptions `json:"options,omitempty"`
+}
+
+type OllamaGenerateResponse struct {
+	Model           string `json:"model"`
+	CreatedAt       string `json:"created_at"`
+	Response        string `json:"response"`
+	Done            bool   `json:"done"`
+	TotalDuration   int64  `json:"total_duration,omitempty"`
+	LoadDuration    int64  `json:"load_duration,omitempty"`
+	PromptEvalCount int    `json:"prompt_eval_count,omitempty"`
+	PromptEvalDur   int64  `json:"prompt_eval_duration,omitempty"`
+	EvalCount       int    `json:"eval_count,omitempty"`
+	EvalDuration    int64  `json:"eval_duration,omitempty"`
+}
+
+type OllamaShowResponse struct {
+	Modelfile  string            `json:"modelfile"`
+	Parameters string            `json:"parameters"`
+	Template   string            `json:"template"`
+	Details    OllamaModelDetail `json:"details"`
+}
+
+type OllamaModelDetail struct {
+	Format            string   `json:"format"`
+	Family            string   `json:"family"`
+	Families          []string `json:"families"`
+	ParameterSize     string   `json:"parameter_size"`
+	QuantizationLevel string   `json:"quantization_level"`
+}
+
+// -----------------------------------------------------------------------
+// Inference request — internal channel-based queue
+// -----------------------------------------------------------------------
+
+type inferRequest struct {
+	tokens    []int
+	maxTokens int
+	temp      float32
+	topK      int
+	stopToks  map[int]bool
+	resultCh  chan inferToken
+}
+
+type inferToken struct {
+	tokenID int
+	done    bool
+	err     error
+}
+
+// -----------------------------------------------------------------------
 // Server state
 // -----------------------------------------------------------------------
 
-// serveState holds the loaded model and engine state for the running server.
 type serveState struct {
-	mu      sync.RWMutex
-	inferMu sync.Mutex
+	mu sync.RWMutex
 
-	// Model metadata
 	modelName string
 	modelDir  string
 	vocabSize int
@@ -213,34 +287,34 @@ type serveState struct {
 	ffnDim    int
 	maxSeq    int
 
-	// Loaded components (nil until model is loaded)
 	tokenizer *tokenizer.Tokenizer
 	safetens  *gguf.SafeTensors
 	cfg       map[string]interface{}
+	eng       mongoose.Engine
 
-	// GPU engine (nil if CPU-only)
-	eng mongoose.Engine
+	fwd     func(tokenID, pos int) []float32
+	resetKV func()
 
-	// Inference pipeline
-	fwd       func(tokenID, pos int) []float32
-	resetKV   func()
 	embedData []float32
 	cosTab    []float32
 	sinTab    []float32
 	halfHead  int
+
+	stopTokens map[int]bool
+
+	// Channel-based inference queue: serialize GPU access without mutex contention
+	inferQueue chan *inferRequest
 }
 
 // -----------------------------------------------------------------------
 // Server entrypoint
 // -----------------------------------------------------------------------
 
-// cmdServe starts the OpenAI-compatible API server.
 func cmdServe(args map[string]string) {
 	host := "0.0.0.0"
 	port := "11434"
 	modelName := ""
 
-	// key=value args: ai serve model=X host=0.0.0.0 port=8080
 	if v, ok := args["model"]; ok {
 		modelName = v
 	} else if v, ok := args["_0"]; ok && !strings.HasPrefix(v, "--") {
@@ -255,24 +329,14 @@ func cmdServe(args map[string]string) {
 
 	daemon := false
 
-	// Also support --flag syntax for backwards compat
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--host":
-			if i+1 < len(os.Args) {
-				host = os.Args[i+1]
-				i++
-			}
+			if i+1 < len(os.Args) { host = os.Args[i+1]; i++ }
 		case "--port":
-			if i+1 < len(os.Args) {
-				port = os.Args[i+1]
-				i++
-			}
+			if i+1 < len(os.Args) { port = os.Args[i+1]; i++ }
 		case "--model":
-			if i+1 < len(os.Args) {
-				modelName = os.Args[i+1]
-				i++
-			}
+			if i+1 < len(os.Args) { modelName = os.Args[i+1]; i++ }
 		case "--daemon", "-d":
 			daemon = true
 		case "--stop":
@@ -297,7 +361,6 @@ func cmdServe(args map[string]string) {
 
 	state := &serveState{}
 
-	// Pre-load model if specified
 	if modelName != "" {
 		if err := state.loadModel(modelName); err != nil {
 			log.Fatalf("Failed to load model %q: %v", modelName, err)
@@ -306,19 +369,25 @@ func cmdServe(args map[string]string) {
 			state.modelName, state.dim, state.layers, state.heads, state.vocabSize)
 	}
 
-	// Register routes
+	// Start inference worker goroutine
+	state.inferQueue = make(chan *inferRequest, 16)
+	go state.inferWorker()
+
 	mux := http.NewServeMux()
+
+	// OpenAI endpoints
 	mux.HandleFunc("/v1/chat/completions", state.handleChatCompletions)
 	mux.HandleFunc("/v1/completions", state.handleCompletions)
 	mux.HandleFunc("/v1/embeddings", state.handleEmbeddings)
 	mux.HandleFunc("/v1/models", state.handleModels)
-	mux.HandleFunc("/health", state.handleHealth)
 
-	// Also serve at root paths for Ollama-compatible clients
-	mux.HandleFunc("/api/chat", state.handleChatCompletions)
-	mux.HandleFunc("/api/generate", state.handleCompletions)
-	mux.HandleFunc("/api/embeddings", state.handleEmbeddings)
+	// Ollama-native endpoints
+	mux.HandleFunc("/api/chat", state.handleOllamaChat)
+	mux.HandleFunc("/api/generate", state.handleOllamaGenerate)
+	mux.HandleFunc("/api/show", state.handleOllamaShow)
 	mux.HandleFunc("/api/tags", state.handleModels)
+
+	mux.HandleFunc("/health", state.handleHealth)
 
 	addr := host + ":" + port
 	log.Printf("[serve] mongoose API server listening on %s", addr)
@@ -333,17 +402,117 @@ func cmdServe(args map[string]string) {
 }
 
 // -----------------------------------------------------------------------
-// Model loading
+// Inference worker — single goroutine owns GPU, processes queued requests
 // -----------------------------------------------------------------------
 
-// loadModel initializes the model, tokenizer, and GPU engine.
+func (s *serveState) inferWorker() {
+	for req := range s.inferQueue {
+		s.processInferRequest(req)
+	}
+}
+
+func (s *serveState) processInferRequest(req *inferRequest) {
+	defer close(req.resultCh)
+
+	s.mu.RLock()
+	fwd := s.fwd
+	resetKV := s.resetKV
+	s.mu.RUnlock()
+
+	if fwd == nil {
+		req.resultCh <- inferToken{err: fmt.Errorf("no model loaded")}
+		return
+	}
+
+	if resetKV != nil {
+		resetKV()
+	}
+
+	// Prefill: run all prompt tokens through the model
+	var logits []float32
+	for i, tid := range req.tokens {
+		logits = fwd(tid, i)
+	}
+	if logits == nil {
+		req.resultCh <- inferToken{err: fmt.Errorf("forward pass failed")}
+		return
+	}
+
+	// Decode: generate tokens one at a time, sending each to the channel
+	allTokens := make([]int, len(req.tokens))
+	copy(allTokens, req.tokens)
+
+	for step := 0; step < req.maxTokens; step++ {
+		nextToken := sampleTopK(logits, req.temp, req.topK)
+		allTokens = append(allTokens, nextToken)
+
+		if req.stopToks[nextToken] {
+			req.resultCh <- inferToken{tokenID: nextToken, done: true}
+			return
+		}
+
+		req.resultCh <- inferToken{tokenID: nextToken}
+
+		pos := len(allTokens) - 1
+		if pos >= s.maxSeq-1 {
+			req.resultCh <- inferToken{done: true}
+			return
+		}
+		logits = fwd(nextToken, pos)
+		if logits == nil {
+			req.resultCh <- inferToken{done: true}
+			return
+		}
+	}
+
+	req.resultCh <- inferToken{done: true}
+}
+
+// submitInfer sends an inference request to the worker and returns the result channel.
+func (s *serveState) submitInfer(tokens []int, maxTokens int, temp float32, topK int) chan inferToken {
+	s.mu.RLock()
+	stop := s.stopTokens
+	s.mu.RUnlock()
+
+	req := &inferRequest{
+		tokens:    tokens,
+		maxTokens: maxTokens,
+		temp:      temp,
+		topK:      topK,
+		stopToks:  stop,
+		resultCh:  make(chan inferToken, 64),
+	}
+	s.inferQueue <- req
+	return req.resultCh
+}
+
+// -----------------------------------------------------------------------
+// Chat template
+// -----------------------------------------------------------------------
+
+func (s *serveState) applyTemplate(messages []ChatMessage) []int {
+	s.mu.RLock()
+	tok := s.tokenizer
+	cfg := s.cfg
+	s.mu.RUnlock()
+
+	cms := make([]chatMessage, len(messages))
+	for i, m := range messages {
+		cms[i] = chatMessage{Role: m.Role, Content: m.Content}
+	}
+	return applyChatTemplate(tok, cms, cfg)
+}
+
+// -----------------------------------------------------------------------
+// Model loading (unchanged logic, cleaner structure)
+// -----------------------------------------------------------------------
+
 func (s *serveState) loadModel(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	path := resolveModel(name)
 
-	// Read config.json
 	configData, err := os.ReadFile(filepath.Join(path, "config.json"))
 	if err != nil {
 		return fmt.Errorf("no config.json: %w", err)
@@ -355,14 +524,12 @@ func (s *serveState) loadModel(name string) error {
 
 	getInt := func(key string, fallback int) int {
 		if v, ok := cfg[key]; ok {
-			if f, ok := v.(float64); ok {
-				return int(f)
-			}
+			if f, ok := v.(float64); ok { return int(f) }
 		}
 		return fallback
 	}
 
-	s.modelName = name
+	s.modelName = filepath.Base(path)
 	s.cfg = cfg
 	s.modelDir = path
 	s.dim = getInt("hidden_size", 0)
@@ -373,26 +540,22 @@ func (s *serveState) loadModel(name string) error {
 	s.vocabSize = getInt("vocab_size", 0)
 	s.maxSeq = getInt("max_position_embeddings", 2048)
 
-	// Load tokenizer
 	tok, err := tokenizer.LoadTokenizer(path)
 	if err != nil {
 		return fmt.Errorf("tokenizer: %w", err)
 	}
 	s.tokenizer = tok
 
-	// Open safetensors (lazy — headers only, no weight data read yet)
 	st, err := gguf.OpenSafeTensors(path)
 	if err != nil {
 		return fmt.Errorf("safetensors: %w", err)
 	}
 	s.safetens = st
 
-	// Init GPU
 	s.eng = selectEngine("auto")
 	mongoose.LoadKernels()
 	log.Printf("[serve] engine: %s", s.eng.Name())
 
-	// Load embeddings
 	embedData, _, _ := st.ReadTensorFloat32("model.embed_tokens.weight")
 	var lmHeadData []float32
 	lmHeadData, _, err = st.ReadTensorFloat32("lm_head.weight")
@@ -408,7 +571,6 @@ func (s *serveState) loadModel(name string) error {
 		ropeTheta = float32(v)
 	}
 
-	// RoPE tables
 	s.cosTab = make([]float32, s.maxSeq*s.halfHead)
 	s.sinTab = make([]float32, s.maxSeq*s.halfHead)
 	for pos := 0; pos < s.maxSeq; pos++ {
@@ -420,7 +582,9 @@ func (s *serveState) loadModel(name string) error {
 		}
 	}
 
-	// Set up forward pass using cmdInferGPU's Metal fused path or CPU fallback
+	s.stopTokens = discoverStopTokens(tok, cfg, path)
+
+	// Metal fused compute path
 	if metal, ok := s.eng.(*mongoose.Metal); ok {
 		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq)
 		if ret == 0 {
@@ -541,13 +705,11 @@ func (s *serveState) loadModel(name string) error {
 		}
 	}
 
-	// Generic fallback: any engine with MatMul
+	// Generic CPU fallback
 	if s.fwd == nil {
 		log.Printf("[serve] using generic inference (weights streamed, CPU attention)")
 		normEps := float32(1e-6)
-		if v, ok := cfg["rms_norm_eps"].(float64); ok {
-			normEps = float32(v)
-		}
+		if v, ok := cfg["rms_norm_eps"].(float64); ok { normEps = float32(v) }
 		dim := s.dim
 		nLayers := s.layers
 		heads := s.heads
@@ -557,7 +719,6 @@ func (s *serveState) loadModel(name string) error {
 		ffnDim := s.ffnDim
 		vocabSize := s.vocabSize
 		maxSeq := s.maxSeq
-		halfHead := s.halfHead
 
 		keyCache := make([][]float32, nLayers)
 		valCache := make([][]float32, nLayers)
@@ -569,8 +730,8 @@ func (s *serveState) loadModel(name string) error {
 		x := make([]float32, dim)
 		buf := make([]float32, dim)
 		q := make([]float32, dim)
-		k := make([]float32, kvDim)
-		v := make([]float32, kvDim)
+		kk := make([]float32, kvDim)
+		vv := make([]float32, kvDim)
 		attnOut := make([]float32, dim)
 		ffnBuf := make([]float32, ffnDim)
 		ffnBuf2 := make([]float32, ffnDim)
@@ -593,8 +754,6 @@ func (s *serveState) loadModel(name string) error {
 			copy(out, s.eng.MatMul(W, xIn, rows, cols, 1))
 		}
 
-		_ = halfHead
-
 		s.fwd = func(tokenID, pos int) []float32 {
 			tokOff := tokenID * dim
 			if tokOff+dim > len(s.embedData) { return nil }
@@ -610,13 +769,13 @@ func (s *serveState) loadModel(name string) error {
 				wk, _, _ := st.ReadTensorFloat32(prefix + "self_attn.k_proj.weight")
 				wv, _, _ := st.ReadTensorFloat32(prefix + "self_attn.v_proj.weight")
 				mv(q, wq, buf, dim, dim)
-				mv(k[:kvDim], wk, buf, kvDim, dim)
-				mv(v[:kvDim], wv, buf, kvDim, dim)
+				mv(kk[:kvDim], wk, buf, kvDim, dim)
+				mv(vv[:kvDim], wv, buf, kvDim, dim)
 
-				applyRoPE(q, k[:kvDim], pos, headDim, 10000.0, heads, kvHeads)
+				applyRoPE(q, kk[:kvDim], pos, headDim, 10000.0, heads, kvHeads)
 
-				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], k[:kvDim])
-				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], v[:kvDim])
+				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], kk[:kvDim])
+				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], vv[:kvDim])
 
 				kvMul := heads / kvHeads
 				for i := range attnOut { attnOut[i] = 0 }
@@ -674,10 +833,9 @@ func (s *serveState) loadModel(name string) error {
 }
 
 // -----------------------------------------------------------------------
-// Handlers
+// OpenAI handlers
 // -----------------------------------------------------------------------
 
-// handleChatCompletions implements POST /v1/chat/completions.
 func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -690,7 +848,6 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Resolve model — use pre-loaded if matches, otherwise lazy-load
 	if err := s.ensureModel(req.Model); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
 		return
@@ -702,80 +859,34 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	}
 
 	maxTokens := 256
-	if req.MaxTokens != nil {
-		maxTokens = *req.MaxTokens
+	if req.MaxTokens != nil { maxTokens = *req.MaxTokens }
+	temp := float32(0.7)
+	if req.Temperature != nil { temp = float32(*req.Temperature) }
+	topK := 40
+
+	promptTokens := s.applyTemplate(req.Messages)
+
+	if req.Stream {
+		s.streamChatCompletions(w, promptTokens, maxTokens, temp, topK)
+		return
 	}
+
+	// Non-streaming: collect all tokens, return at once
+	t0 := time.Now()
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
 
 	s.mu.RLock()
 	tok := s.tokenizer
-	cfg := s.cfg
 	s.mu.RUnlock()
 
-	// Build prompt: use last user message as raw text for now
-	// ChatML template produces garbage on small models via Metal graph path
-	var prompt string
-	for _, m := range req.Messages {
-		if m.Role == "user" {
-			prompt = m.Content
-		}
-	}
-	promptTokens := tok.Encode(prompt)
-
-	if req.Stream {
-		s.handleChatStream(w, req, promptTokens, maxTokens)
-		return
-	}
-
-	// Non-streaming response: serialize inference (shared KV cache)
-	s.inferMu.Lock()
-	defer s.inferMu.Unlock()
-
-	s.mu.RLock()
-	fwd := s.fwd
-	resetKV := s.resetKV
-	s.mu.RUnlock()
-
-	temp := float32(0.7)
-	if req.Temperature != nil {
-		temp = float32(*req.Temperature)
-	}
-	topK := 40
-
-	if resetKV != nil {
-		resetKV()
-	}
-
-	// Prefill
-	var logits []float32
-	for i, tid := range promptTokens {
-		logits = fwd(tid, i)
-	}
-	if logits == nil {
-		writeError(w, http.StatusInternalServerError, "inference failed — no GPU forward pass available", "server_error")
-		return
-	}
-
-	stopTokens := discoverStopTokens(tok, cfg, s.modelDir)
-
-	// Generate
-	allTokens := make([]int, len(promptTokens))
-	copy(allTokens, promptTokens)
 	var genTokens []int
-	for step := 0; step < maxTokens; step++ {
-		nextToken := sampleTopK(logits, temp, topK)
-		allTokens = append(allTokens, nextToken)
-		genTokens = append(genTokens, nextToken)
-		if stopTokens[nextToken] {
-			break
+	for it := range resultCh {
+		if it.err != nil {
+			writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
+			return
 		}
-		pos := len(allTokens) - 1
-		if pos >= s.maxSeq-1 {
-			break
-		}
-		logits = fwd(allTokens[pos], pos)
-		if logits == nil {
-			break
-		}
+		if it.done { break }
+		genTokens = append(genTokens, it.tokenID)
 	}
 
 	generated := tok.Decode(genTokens)
@@ -783,36 +894,34 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 		generated = generated[:idx]
 	}
 	generated = strings.TrimSpace(generated)
-	completionTokens := len(genTokens)
+	elapsed := time.Since(t0)
 
 	resp := ChatCompletionResponse{
 		ID:      generateID("chatcmpl"),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   s.modelName,
-		Choices: []ChatChoice{
-			{
-				Index: 0,
-				Message: ChatMessage{
-					Role:    "assistant",
-					Content: generated,
-				},
-				FinishReason: "stop",
-			},
-		},
+		Choices: []ChatChoice{{
+			Index:        0,
+			Message:      ChatMessage{Role: "assistant", Content: generated},
+			FinishReason: "stop",
+		}},
 		Usage: UsageInfo{
 			PromptTokens:     len(promptTokens),
-			CompletionTokens: completionTokens,
-			TotalTokens:      len(promptTokens) + completionTokens,
+			CompletionTokens: len(genTokens),
+			TotalTokens:      len(promptTokens) + len(genTokens),
 		},
 	}
+
+	log.Printf("[serve] chat: %d prompt + %d gen tokens in %v (%.1f tok/s)",
+		len(promptTokens), len(genTokens), elapsed.Round(time.Millisecond),
+		float64(len(genTokens))/elapsed.Seconds())
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleChatStream sends SSE chunks for streaming chat completions.
-func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionRequest, promptTokens []int, maxTokens int) {
+func (s *serveState) streamChatCompletions(w http.ResponseWriter, promptTokens []int, maxTokens int, temp float32, topK int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
@@ -826,103 +935,46 @@ func (s *serveState) handleChatStream(w http.ResponseWriter, req ChatCompletionR
 	id := generateID("chatcmpl")
 	now := time.Now().Unix()
 
-	// First chunk: role
+	// Role chunk
 	writeSSEChunk(w, flusher, ChatCompletionChunk{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: now,
-		Model:   s.modelName,
-		Choices: []ChatChunkChoice{
-			{
-				Index: 0,
-				Delta: ChatDelta{Role: "assistant"},
-			},
-		},
+		ID: id, Object: "chat.completion.chunk", Created: now, Model: s.modelName,
+		Choices: []ChatChunkChoice{{Index: 0, Delta: ChatDelta{Role: "assistant"}}},
 	})
 
 	s.mu.RLock()
-	fwd := s.fwd
 	tok := s.tokenizer
-	streamResetKV := s.resetKV
 	s.mu.RUnlock()
 
-	temp := float32(0.7)
-	if req.Temperature != nil {
-		temp = float32(*req.Temperature)
-	}
-	topK := 40
+	t0 := time.Now()
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
 
-	if streamResetKV != nil {
-		streamResetKV()
-	}
-
-	// Prefill
-	var logits []float32
-	for i, tid := range promptTokens {
-		logits = fwd(tid, i)
-	}
-	if logits == nil {
+	genCount := 0
+	for it := range resultCh {
+		if it.err != nil { break }
+		if it.done { break }
+		genCount++
+		text := tok.Decode([]int{it.tokenID})
 		writeSSEChunk(w, flusher, ChatCompletionChunk{
 			ID: id, Object: "chat.completion.chunk", Created: now, Model: s.modelName,
-			Choices: []ChatChunkChoice{{Index: 0, Delta: ChatDelta{Content: "[error: no GPU forward pass]"}}},
+			Choices: []ChatChunkChoice{{Index: 0, Delta: ChatDelta{Content: text}}},
 		})
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
 	}
 
-	// Generate token by token, streaming each
-	allTokens := make([]int, len(promptTokens))
-	copy(allTokens, promptTokens)
-	for step := 0; step < maxTokens; step++ {
-		nextToken := sampleTopK(logits, temp, topK)
-		allTokens = append(allTokens, nextToken)
-		if nextToken == tok.EOS || nextToken == 0 {
-			break
-		}
-		text := tok.Decode([]int{nextToken})
-		writeSSEChunk(w, flusher, ChatCompletionChunk{
-			ID:      id,
-			Object:  "chat.completion.chunk",
-			Created: now,
-			Model:   s.modelName,
-			Choices: []ChatChunkChoice{
-				{Index: 0, Delta: ChatDelta{Content: text}},
-			},
-		})
+	elapsed := time.Since(t0)
+	log.Printf("[serve] stream: %d prompt + %d gen tokens in %v (%.1f tok/s)",
+		len(promptTokens), genCount, elapsed.Round(time.Millisecond),
+		float64(genCount)/elapsed.Seconds())
 
-		pos := len(allTokens) - 1
-		if pos >= s.maxSeq-1 {
-			break
-		}
-		logits = fwd(allTokens[pos], pos)
-		if logits == nil {
-			break
-		}
-	}
-
-	// Final chunk: finish_reason
 	stop := "stop"
 	writeSSEChunk(w, flusher, ChatCompletionChunk{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: now,
-		Model:   s.modelName,
-		Choices: []ChatChunkChoice{
-			{
-				Index:        0,
-				Delta:        ChatDelta{},
-				FinishReason: &stop,
-			},
-		},
+		ID: id, Object: "chat.completion.chunk", Created: now, Model: s.modelName,
+		Choices: []ChatChunkChoice{{Index: 0, Delta: ChatDelta{}, FinishReason: &stop}},
 	})
 
-	// Terminator
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-// handleCompletions implements POST /v1/completions (legacy).
 func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -941,117 +993,54 @@ func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxTokens := 256
-	if req.MaxTokens != nil {
-		maxTokens = *req.MaxTokens
-	}
-	_ = maxTokens
+	if req.MaxTokens != nil { maxTokens = *req.MaxTokens }
+	temp := float32(0.7)
+	if req.Temperature != nil { temp = float32(*req.Temperature) }
+	topK := 40
 
 	s.mu.RLock()
 	tok := s.tokenizer
 	s.mu.RUnlock()
-
 	promptTokens := tok.Encode(req.Prompt)
 
-	s.inferMu.Lock()
-	defer s.inferMu.Unlock()
-
-	s.mu.RLock()
-	fwd := s.fwd
-	resetKV := s.resetKV
-	cfg := s.cfg
-	s.mu.RUnlock()
-
-	temp := float32(0.7)
-	if req.Temperature != nil {
-		temp = float32(*req.Temperature)
-	}
-	topK := 40
-
-	if resetKV != nil {
-		resetKV()
-	}
-
-	var logits []float32
-	for i, tid := range promptTokens {
-		logits = fwd(tid, i)
-	}
-	if logits == nil {
-		writeError(w, http.StatusInternalServerError, "inference failed", "server_error")
+	if req.Stream {
+		s.streamCompletions(w, req, promptTokens, maxTokens, temp, topK)
 		return
 	}
 
-	stopTokens := discoverStopTokens(tok, cfg, s.modelDir)
+	t0 := time.Now()
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
 
-	allTokens := make([]int, len(promptTokens))
-	copy(allTokens, promptTokens)
 	var genTokens []int
-	for step := 0; step < maxTokens; step++ {
-		nextToken := sampleTopK(logits, temp, topK)
-		allTokens = append(allTokens, nextToken)
-		genTokens = append(genTokens, nextToken)
-		if stopTokens[nextToken] {
-			break
+	for it := range resultCh {
+		if it.err != nil {
+			writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
+			return
 		}
-		pos := len(allTokens) - 1
-		if pos >= s.maxSeq-1 {
-			break
-		}
-		logits = fwd(allTokens[pos], pos)
-		if logits == nil {
-			break
-		}
+		if it.done { break }
+		genTokens = append(genTokens, it.tokenID)
 	}
 
 	generated := tok.Decode(genTokens)
 	if idx := findSpecialToken(generated); idx >= 0 {
 		generated = generated[:idx]
 	}
-	completionTokens := len(genTokens)
+	elapsed := time.Since(t0)
 
-	if req.Stream {
-		// TODO: SSE streaming for legacy completions
-		// Same pattern as chat streaming but with CompletionChunk format
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
-			return
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-
-		chunk := map[string]interface{}{
-			"id":      generateID("cmpl"),
-			"object":  "text_completion",
-			"created": time.Now().Unix(),
-			"model":   s.modelName,
-			"choices": []map[string]interface{}{
-				{"text": generated, "index": 0, "finish_reason": "stop"},
-			},
-		}
-		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
+	log.Printf("[serve] completion: %d prompt + %d gen tokens in %v (%.1f tok/s)",
+		len(promptTokens), len(genTokens), elapsed.Round(time.Millisecond),
+		float64(len(genTokens))/elapsed.Seconds())
 
 	resp := CompletionResponse{
 		ID:      generateID("cmpl"),
 		Object:  "text_completion",
 		Created: time.Now().Unix(),
 		Model:   s.modelName,
-		Choices: []CompletionChoice{
-			{
-				Text:         generated,
-				Index:        0,
-				FinishReason: "stop",
-			},
-		},
+		Choices: []CompletionChoice{{Text: generated, Index: 0, FinishReason: "stop"}},
 		Usage: UsageInfo{
 			PromptTokens:     len(promptTokens),
-			CompletionTokens: completionTokens,
-			TotalTokens:      len(promptTokens) + completionTokens,
+			CompletionTokens: len(genTokens),
+			TotalTokens:      len(promptTokens) + len(genTokens),
 		},
 	}
 
@@ -1059,7 +1048,50 @@ func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleEmbeddings implements POST /v1/embeddings.
+func (s *serveState) streamCompletions(w http.ResponseWriter, req CompletionRequest, promptTokens []int, maxTokens int, temp float32, topK int) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	id := generateID("cmpl")
+	now := time.Now().Unix()
+
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
+
+	for it := range resultCh {
+		if it.err != nil { break }
+		if it.done { break }
+		text := tok.Decode([]int{it.tokenID})
+		chunk := CompletionResponse{
+			ID: id, Object: "text_completion", Created: now, Model: s.modelName,
+			Choices: []CompletionChoice{{Text: text, Index: 0}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	// Final chunk
+	final := CompletionResponse{
+		ID: id, Object: "text_completion", Created: now, Model: s.modelName,
+		Choices: []CompletionChoice{{Text: "", Index: 0, FinishReason: "stop"}},
+	}
+	data, _ := json.Marshal(final)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
 func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -1077,16 +1109,13 @@ func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Normalize input to []string
 	var inputs []string
 	switch v := req.Input.(type) {
 	case string:
 		inputs = []string{v}
 	case []interface{}:
 		for _, item := range v {
-			if str, ok := item.(string); ok {
-				inputs = append(inputs, str)
-			}
+			if str, ok := item.(string); ok { inputs = append(inputs, str) }
 		}
 	default:
 		writeError(w, http.StatusBadRequest, "input must be string or array of strings", "invalid_request_error")
@@ -1102,37 +1131,302 @@ func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	for i, text := range inputs {
 		tokens := tok.Encode(text)
 		totalTokens += len(tokens)
-
-		// TODO: Generate embeddings:
-		//   1. Tokenize input text
-		//   2. Forward pass through all transformer layers (no generation)
-		//   3. Pool the hidden states: mean-pool over sequence positions,
-		//      or use the last token's hidden state (model-dependent)
-		//   4. Normalize the embedding vector (L2 norm)
-		//
-		// The forward pass is the same as inference but stops after the
-		// final layer norm — no lm_head projection, no sampling.
-		//
-		// For dedicated embedding models (e.g., nomic-embed, bge, gte),
-		// there's often a separate pooling head to load.
-
-		// Stub: return zero vector of model dimension
 		embedding := make([]float32, s.dim)
-
-		data = append(data, EmbeddingData{
-			Object:    "embedding",
-			Embedding: embedding,
-			Index:     i,
-		})
+		data = append(data, EmbeddingData{Object: "embedding", Embedding: embedding, Index: i})
 	}
 
 	resp := EmbeddingResponse{
-		Object: "list",
-		Data:   data,
-		Model:  s.modelName,
-		Usage: UsageInfo{
-			PromptTokens: totalTokens,
-			TotalTokens:  totalTokens,
+		Object: "list", Data: data, Model: s.modelName,
+		Usage: UsageInfo{PromptTokens: totalTokens, TotalTokens: totalTokens},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// -----------------------------------------------------------------------
+// Ollama-native handlers
+// -----------------------------------------------------------------------
+
+func (s *serveState) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var req OllamaChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+
+	if err := s.ensureModel(req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
+		return
+	}
+
+	stream := true
+	if req.Stream != nil { stream = *req.Stream }
+
+	maxTokens := 256
+	temp := float32(0.7)
+	topK := 40
+	if req.Options != nil {
+		if req.Options.NumPredict > 0 { maxTokens = req.Options.NumPredict }
+		if req.Options.Temperature > 0 { temp = float32(req.Options.Temperature) }
+		if req.Options.TopK > 0 { topK = req.Options.TopK }
+	}
+
+	msgs := make([]ChatMessage, len(req.Messages))
+	for i, m := range req.Messages {
+		msgs[i] = ChatMessage{Role: m.Role, Content: m.Content}
+	}
+	promptTokens := s.applyTemplate(msgs)
+
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+
+	tTotal := time.Now()
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
+
+	tEval := time.Now()
+	evalCount := 0
+
+	if stream {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+
+		for it := range resultCh {
+			if it.err != nil { break }
+			if it.done { break }
+			evalCount++
+			text := tok.Decode([]int{it.tokenID})
+			chunk := OllamaChatResponse{
+				Model:     s.modelName,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				Message:   OllamaChatMsg{Role: "assistant", Content: text},
+				Done:      false,
+			}
+			data, _ := json.Marshal(chunk)
+			w.Write(data)
+			w.Write([]byte("\n"))
+			flusher.Flush()
+		}
+
+		evalDur := time.Since(tEval)
+		totalDur := time.Since(tTotal)
+		final := OllamaChatResponse{
+			Model:           s.modelName,
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			Message:         OllamaChatMsg{Role: "assistant"},
+			Done:            true,
+			TotalDuration:   totalDur.Nanoseconds(),
+			PromptEvalCount: len(promptTokens),
+			PromptEvalDur:   tEval.Sub(tTotal).Nanoseconds(),
+			EvalCount:       evalCount,
+			EvalDuration:    evalDur.Nanoseconds(),
+		}
+		data, _ := json.Marshal(final)
+		w.Write(data)
+		w.Write([]byte("\n"))
+		flusher.Flush()
+
+		log.Printf("[serve] ollama chat: %d prompt + %d gen in %v (%.1f tok/s)",
+			len(promptTokens), evalCount, totalDur.Round(time.Millisecond),
+			float64(evalCount)/evalDur.Seconds())
+	} else {
+		var genTokens []int
+		for it := range resultCh {
+			if it.err != nil {
+				writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
+				return
+			}
+			if it.done { break }
+			genTokens = append(genTokens, it.tokenID)
+		}
+
+		generated := tok.Decode(genTokens)
+		if idx := findSpecialToken(generated); idx >= 0 { generated = generated[:idx] }
+		generated = strings.TrimSpace(generated)
+		evalDur := time.Since(tEval)
+		totalDur := time.Since(tTotal)
+
+		resp := OllamaChatResponse{
+			Model:           s.modelName,
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			Message:         OllamaChatMsg{Role: "assistant", Content: generated},
+			Done:            true,
+			TotalDuration:   totalDur.Nanoseconds(),
+			PromptEvalCount: len(promptTokens),
+			PromptEvalDur:   tEval.Sub(tTotal).Nanoseconds(),
+			EvalCount:       len(genTokens),
+			EvalDuration:    evalDur.Nanoseconds(),
+		}
+
+		log.Printf("[serve] ollama chat: %d prompt + %d gen in %v (%.1f tok/s)",
+			len(promptTokens), len(genTokens), totalDur.Round(time.Millisecond),
+			float64(len(genTokens))/evalDur.Seconds())
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func (s *serveState) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	var req OllamaGenerateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "invalid_request_error")
+		return
+	}
+
+	if err := s.ensureModel(req.Model); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "model_not_found")
+		return
+	}
+
+	stream := true
+	if req.Stream != nil { stream = *req.Stream }
+
+	maxTokens := 256
+	temp := float32(0.7)
+	topK := 40
+	if req.Options != nil {
+		if req.Options.NumPredict > 0 { maxTokens = req.Options.NumPredict }
+		if req.Options.Temperature > 0 { temp = float32(req.Options.Temperature) }
+		if req.Options.TopK > 0 { topK = req.Options.TopK }
+	}
+
+	s.mu.RLock()
+	tok := s.tokenizer
+	s.mu.RUnlock()
+	promptTokens := tok.Encode(req.Prompt)
+
+	tTotal := time.Now()
+	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
+
+	tEval := time.Now()
+	evalCount := 0
+
+	if stream {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "streaming not supported", "server_error")
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+
+		for it := range resultCh {
+			if it.err != nil { break }
+			if it.done { break }
+			evalCount++
+			text := tok.Decode([]int{it.tokenID})
+			chunk := OllamaGenerateResponse{
+				Model:     s.modelName,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+				Response:  text,
+				Done:      false,
+			}
+			data, _ := json.Marshal(chunk)
+			w.Write(data)
+			w.Write([]byte("\n"))
+			flusher.Flush()
+		}
+
+		evalDur := time.Since(tEval)
+		totalDur := time.Since(tTotal)
+		final := OllamaGenerateResponse{
+			Model:           s.modelName,
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			Response:        "",
+			Done:            true,
+			TotalDuration:   totalDur.Nanoseconds(),
+			PromptEvalCount: len(promptTokens),
+			PromptEvalDur:   tEval.Sub(tTotal).Nanoseconds(),
+			EvalCount:       evalCount,
+			EvalDuration:    evalDur.Nanoseconds(),
+		}
+		data, _ := json.Marshal(final)
+		w.Write(data)
+		w.Write([]byte("\n"))
+		flusher.Flush()
+
+		log.Printf("[serve] ollama generate: %d prompt + %d gen in %v (%.1f tok/s)",
+			len(promptTokens), evalCount, totalDur.Round(time.Millisecond),
+			float64(evalCount)/evalDur.Seconds())
+	} else {
+		var genTokens []int
+		for it := range resultCh {
+			if it.err != nil {
+				writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
+				return
+			}
+			if it.done { break }
+			genTokens = append(genTokens, it.tokenID)
+		}
+
+		generated := tok.Decode(genTokens)
+		if idx := findSpecialToken(generated); idx >= 0 { generated = generated[:idx] }
+		evalDur := time.Since(tEval)
+		totalDur := time.Since(tTotal)
+
+		resp := OllamaGenerateResponse{
+			Model:           s.modelName,
+			CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+			Response:        generated,
+			Done:            true,
+			TotalDuration:   totalDur.Nanoseconds(),
+			PromptEvalCount: len(promptTokens),
+			PromptEvalDur:   tEval.Sub(tTotal).Nanoseconds(),
+			EvalCount:       len(genTokens),
+			EvalDuration:    evalDur.Nanoseconds(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+func (s *serveState) handleOllamaShow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nParams := int64(s.vocabSize) * int64(s.dim)
+	for l := 0; l < s.layers; l++ {
+		nParams += int64(s.dim)*int64(s.dim)*2 + int64(s.kvHeads*(s.dim/s.heads))*int64(s.dim)*2 + int64(s.ffnDim)*int64(s.dim)*3
+	}
+
+	paramSize := fmt.Sprintf("%.1fB", float64(nParams)/1e9)
+	quantLevel := "Q8_0"
+	if nParams > 4000000000 { quantLevel = "Q4_0" }
+
+	family := "unknown"
+	if arch, ok := s.cfg["model_type"].(string); ok { family = arch }
+
+	resp := OllamaShowResponse{
+		Parameters: fmt.Sprintf("num_params %d", nParams),
+		Details: OllamaModelDetail{
+			Format:            "safetensors",
+			Family:            family,
+			Families:          []string{family},
+			ParameterSize:     paramSize,
+			QuantizationLevel: quantLevel,
 		},
 	}
 
@@ -1140,7 +1434,10 @@ func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleModels implements GET /v1/models.
+// -----------------------------------------------------------------------
+// Common handlers
+// -----------------------------------------------------------------------
+
 func (s *serveState) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -1149,56 +1446,31 @@ func (s *serveState) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	var models []ModelInfo
 
-	// List all downloaded models from ~/.mongoose/models/
 	entries, _ := os.ReadDir(modelsDir)
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
+		if !e.IsDir() { continue }
 		info, _ := e.Info()
 		created := int64(0)
-		if info != nil {
-			created = info.ModTime().Unix()
-		}
-		models = append(models, ModelInfo{
-			ID:      e.Name(),
-			Object:  "model",
-			Created: created,
-			OwnedBy: "mongoose",
-		})
+		if info != nil { created = info.ModTime().Unix() }
+		models = append(models, ModelInfo{ID: e.Name(), Object: "model", Created: created, OwnedBy: "mongoose"})
 	}
 
-	// If a model is loaded but not in the models dir (e.g., direct path), include it
 	s.mu.RLock()
 	if s.modelName != "" {
 		found := false
 		for _, m := range models {
-			if m.ID == s.modelName {
-				found = true
-				break
-			}
+			if m.ID == s.modelName { found = true; break }
 		}
 		if !found {
-			models = append(models, ModelInfo{
-				ID:      s.modelName,
-				Object:  "model",
-				Created: time.Now().Unix(),
-				OwnedBy: "mongoose",
-			})
+			models = append(models, ModelInfo{ID: s.modelName, Object: "model", Created: time.Now().Unix(), OwnedBy: "mongoose"})
 		}
 	}
 	s.mu.RUnlock()
 
-	resp := ModelsResponse{
-		Object: "list",
-		Data:   models,
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(ModelsResponse{Object: "list", Data: models})
 }
 
-// handleHealth implements GET /health.
 func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	modelLoaded := s.modelName != ""
@@ -1206,31 +1478,26 @@ func (s *serveState) handleHealth(w http.ResponseWriter, r *http.Request) {
 	hasGPU := s.eng != nil
 	s.mu.RUnlock()
 
-	status := map[string]interface{}{
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":       "ok",
 		"model_loaded": modelLoaded,
 		"model":        modelName,
 		"gpu":          hasGPU,
 		"version":      "ai v1.2.1",
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(status)
+	})
 }
 
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
 
-// ensureModel checks that the requested model is loaded, loading it if needed.
 func (s *serveState) ensureModel(requestedModel string) error {
 	if requestedModel == "" {
 		s.mu.RLock()
 		loaded := s.modelName != ""
 		s.mu.RUnlock()
-		if !loaded {
-			return fmt.Errorf("no model specified and none pre-loaded")
-		}
+		if !loaded { return fmt.Errorf("no model specified and none pre-loaded") }
 		return nil
 	}
 
@@ -1238,82 +1505,34 @@ func (s *serveState) ensureModel(requestedModel string) error {
 	current := s.modelName
 	s.mu.RUnlock()
 
-	// If already loaded, use it (treat any non-empty loaded model as match
-	// when the request model is a substring — handles "llama" matching "ReluLLaMA-7B")
 	if current != "" && (current == requestedModel || strings.Contains(strings.ToLower(current), strings.ToLower(requestedModel))) {
 		return nil
 	}
 
-	// TODO: Implement lazy model loading on first request.
-	// This would resolve the model name, load tokenizer + weights,
-	// and swap out the current model. Need to handle concurrent requests
-	// during model swap (queue them, don't drop them).
-
 	if current == "" {
 		return fmt.Errorf("model %q not loaded — start server with: ai serve %s", requestedModel, requestedModel)
 	}
-
-	// For now, use whatever model is loaded
 	return nil
 }
 
-// formatChatPrompt concatenates chat messages into a single prompt string.
-// TODO: Replace with proper chat template rendering from tokenizer_config.json.
-// Different models use different templates:
-//   - ChatML:    <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n
-//   - Llama:     [INST] <<SYS>>...<</SYS>> ... [/INST]
-//   - Mistral:   [INST] ... [/INST]
-//   - Qwen:      <|im_start|>system\n...<|im_end|>\n...
-func formatChatPrompt(messages []ChatMessage) string {
-	var b strings.Builder
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			b.WriteString(msg.Content)
-			b.WriteString("\n\n")
-		case "user":
-			b.WriteString("User: ")
-			b.WriteString(msg.Content)
-			b.WriteString("\n")
-		case "assistant":
-			b.WriteString("Assistant: ")
-			b.WriteString(msg.Content)
-			b.WriteString("\n")
-		}
-	}
-	b.WriteString("Assistant: ")
-	return b.String()
-}
-
-// generateID creates a unique ID with the given prefix.
 func generateID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-// writeError sends an OpenAI-format error response.
 func writeError(w http.ResponseWriter, status int, message, errType string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(ErrorResponse{
-		Error: ErrorDetail{
-			Message: message,
-			Type:    errType,
-		},
-	})
+	json.NewEncoder(w).Encode(ErrorResponse{Error: ErrorDetail{Message: message, Type: errType}})
 }
 
-// writeSSEChunk marshals a chunk and writes it as an SSE event.
 func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, chunk ChatCompletionChunk) {
 	data, err := json.Marshal(chunk)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }
 
-// Silence unused import warnings. These are used in the handler implementations.
-var _ = bufio.NewScanner
+// Silence unused import warnings.
 var _ = mongoose.Engine(nil)
 
 // -----------------------------------------------------------------------
@@ -1327,17 +1546,12 @@ func servePidPath() string {
 
 func daemonize(host, port, modelName string) {
 	exe, err := os.Executable()
-	if err != nil {
-		log.Fatalf("cannot find self: %v", err)
-	}
+	if err != nil { log.Fatalf("cannot find self: %v", err) }
 
-	// Kill existing daemon if running
 	stopExistingDaemon()
 
 	args := []string{"serve"}
-	if modelName != "" {
-		args = append(args, fmt.Sprintf("model=%s", modelName))
-	}
+	if modelName != "" { args = append(args, fmt.Sprintf("model=%s", modelName)) }
 	args = append(args, fmt.Sprintf("host=%s", host), fmt.Sprintf("port=%s", port))
 
 	cmd := exec.Command(exe, args...)
@@ -1346,9 +1560,7 @@ func daemonize(host, port, modelName string) {
 	cmd.Stderr = nil
 	cmd.Stdin = nil
 
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start daemon: %v", err)
-	}
+	if err := cmd.Start(); err != nil { log.Fatalf("failed to start daemon: %v", err) }
 
 	pid := cmd.Process.Pid
 
@@ -1357,32 +1569,19 @@ func daemonize(host, port, modelName string) {
 	os.WriteFile(servePidPath(), []byte(strconv.Itoa(pid)), 0644)
 
 	fmt.Printf("ai serve daemon started (pid=%d) on %s:%s\n", pid, host, port)
-	if modelName != "" {
-		fmt.Printf("  model: %s\n", modelName)
-	}
+	if modelName != "" { fmt.Printf("  model: %s\n", modelName) }
 	fmt.Printf("  pid:   %s\n", servePidPath())
 	fmt.Printf("  stop:  ai serve --stop\n")
 }
 
 func stopExistingDaemon() {
 	data, err := os.ReadFile(servePidPath())
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		os.Remove(servePidPath())
-		return
-	}
+	if err != nil { os.Remove(servePidPath()); return }
 	proc, err := os.FindProcess(pid)
-	if err != nil {
-		os.Remove(servePidPath())
-		return
-	}
-	if err := proc.Signal(os.Signal(os.Interrupt)); err != nil {
-		os.Remove(servePidPath())
-		return
-	}
+	if err != nil { os.Remove(servePidPath()); return }
+	if err := proc.Signal(os.Signal(os.Interrupt)); err != nil { os.Remove(servePidPath()); return }
 	proc.Signal(os.Interrupt)
 	time.Sleep(500 * time.Millisecond)
 	proc.Kill()

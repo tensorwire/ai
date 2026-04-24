@@ -170,13 +170,13 @@ step 300   loss 2.05   floor 1.76
 step 500   loss 1.95   floor 1.29   365 steps/s
 ```
 
-### Inference — Qwen2.5-0.5B (200 tokens)
+### Inference — Qwen2.5-0.5B, Q8, `ai serve`
 
-| Platform | tok/s |
-|----------|-------|
-| RTX 5090 Q8 | 182 |
-| M4 Max | 54 |
-| M1 Pro | 25 |
+| Metric | M4 Max | M1 Pro |
+|--------|--------|--------|
+| `ai benchmark` (avg) | 221.7 tok/s | 97.2 tok/s |
+| `ai serve` throughput | 239–241 tok/s | 133–145 tok/s |
+| TTFT (streaming) | 4ms | 29ms |
 
 - Automatic quantization: Q8 for models <4B params, Q4 for 7B+
 - Metal 4 `matmul2d` TensorOp on macOS 26+
