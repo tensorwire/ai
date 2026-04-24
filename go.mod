@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/open-ai-org/gguf v1.0.0
 	github.com/open-ai-org/helix v1.0.0
-	github.com/open-ai-org/mongoose v1.0.3
+	github.com/open-ai-org/mongoose v1.0.5
 	github.com/open-ai-org/tokenizer v1.0.1
 )
 
@@ -37,5 +37,3 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )
-
-replace github.com/open-ai-org/mongoose => ../mongoose

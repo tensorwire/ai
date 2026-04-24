@@ -46,8 +46,8 @@ github.com/open-ai-org/gguf v1.0.0 h1:ZLWlAYFfbyc32m/vD4Q7yfRBvfIwCzrAeKkkNT756p
 github.com/open-ai-org/gguf v1.0.0/go.mod h1:BRdCi2AgpV3IN6tVIOfm/XDrBz0uFr20p5AT0sccBDg=
 github.com/open-ai-org/helix v1.0.0 h1:iE7hTiXSBm5lWpg+c7XJQH5wq7jUDWqn/mjVBB+VFGI=
 github.com/open-ai-org/helix v1.0.0/go.mod h1:An9MQtAsMThR451nDZxPI2t7N/0ZycqQHeCU7Qb3GyY=
-github.com/open-ai-org/mongoose v1.0.3 h1:L1WgxllGVROi7hi05aT2y3TJ2u2TDcrZWOANZh8etMY=
-github.com/open-ai-org/mongoose v1.0.3/go.mod h1:P5qAmBXuR+pT6y/juAn+Z2sksJiUxlXPu487jHv548w=
+github.com/open-ai-org/mongoose v1.0.5 h1:Tgw7eVGh1Xe66EufEFijqFMElg27rKrPTu5iVHoLBFc=
+github.com/open-ai-org/mongoose v1.0.5/go.mod h1:Dsd9DI13iQyfWpVnR4plFKLcG8/fQPvAfH+3Q+3bA1g=
 github.com/open-ai-org/tokenizer v1.0.1 h1:qxLcRncX79L/jDI5boaQq9gSj90C/xzzrmw5GlYQbs8=
 github.com/open-ai-org/tokenizer v1.0.1/go.mod h1:hWQV8CgLBqhHLKZ/1Dmg4X9lTg/TlG7TPBFVTDvcZ0A=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
