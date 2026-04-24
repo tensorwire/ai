@@ -619,6 +619,16 @@ func (s *serveState) loadModel(name string) error {
 		}
 	}
 
+	// CUDA Q8/Q4 fused kernel path (zero-alloc hot path)
+	if s.fwd == nil {
+		if ci := buildCUDAQ8Inference(s, st, lmHeadData); ci != nil {
+			s.fwd = func(tokenID, pos int) []float32 {
+				return ci.forward(tokenID, pos, s.embedData)
+			}
+			s.resetKV = func() { ci.resetKV() }
+		}
+	}
+
 	// Metal inference graph fallback
 	if s.fwd == nil {
 		kvDim := s.kvHeads * headDim
