@@ -584,7 +584,22 @@ func (s *serveState) loadModel(name string) error {
 
 	s.stopTokens = discoverStopTokens(tok, cfg, path)
 
-	// Metal fused compute path
+	// Metal streaming + multi-slot path (preferred)
+	if mi := buildMetalStreamingInference(s, st, lmHeadData); mi != nil {
+		s.fwd = func(tokenID, pos int) []float32 {
+			slot := mi.acquireSlot()
+			defer mi.releaseSlot(slot)
+			return mi.forward(slot, tokenID, pos)
+		}
+		s.resetKV = func() {
+			for i := 0; i < mi.nSlots; i++ {
+				mi.resetKV(i)
+			}
+		}
+	}
+
+	// Metal fused compute path (legacy fallback)
+	if s.fwd == nil {
 	if metal, ok := s.eng.(*mongoose.Metal); ok {
 		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, float64(ropeTheta), 1e-6)
 		if ret == 0 {
@@ -617,6 +632,7 @@ func (s *serveState) loadModel(name string) error {
 			s.resetKV = func() { metal.FusedResetKV() }
 			log.Printf("[serve] Metal fused inference ready (%d weights)", wi)
 		}
+	}
 	}
 
 	// CUDA Q8/Q4 fused kernel path (zero-alloc hot path)
