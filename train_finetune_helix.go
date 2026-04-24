@@ -640,17 +640,12 @@ func cmdFinetuneHelix(modelPath, dataPath string, steps int, lr float64, rank in
 				pfx := fmt.Sprintf("blk.%d.", l)
 				saveW := func(name string, wt loraWeight) {
 					cuda.DequantToFP32(wt.q8, dequantBuf.DevicePtr())
-					// Merge LoRA into base for checkpoint: W_merged = W + A @ B * scale
-					loraRank := te.Zeros([]int{wt.rows, rank})
-					cuda.MatMulTInto(loraRank, wt.a, wt.b, wt.rows, rank, wt.cols)
-					mergeScale := alpha / float32(rank)
-					mongoose.KGradScale(loraRank.DevicePtr(), mergeScale, wt.rows*wt.cols)
-					// Wait — MatMulTInto gives [rows, cols] from [rows,rank]@[rank,cols].
-					// But loraRank was allocated as [rows, rank]. Need [rows, cols].
 					merged := te.Zeros([]int{wt.rows * wt.cols})
 					cuda.MatMulTInto(merged, wt.a, wt.b, wt.rows, rank, wt.cols)
+					mergeScale := alpha / float32(rank)
 					mongoose.KGradScale(merged.DevicePtr(), mergeScale, wt.rows*wt.cols)
 					mongoose.KAddInPlace(dequantBuf.DevicePtr(), merged.DevicePtr(), wt.rows*wt.cols)
+					te.Release(merged)
 
 					host := te.ToHost(dequantBuf)
 					fp32 := make([]float32, wt.rows*wt.cols)
