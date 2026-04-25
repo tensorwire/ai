@@ -115,7 +115,7 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 	case "-v", "--version", "version":
-		fmt.Println("ai v1.4.0 — powered by mongoose")
+		fmt.Println("ai v1.4.1 — powered by mongoose")
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
 		usage()

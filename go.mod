@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/open-ai-org/gguf v1.0.0
 	github.com/open-ai-org/helix v1.0.0
-	github.com/open-ai-org/mongoose v1.0.7
+	github.com/open-ai-org/mongoose v1.0.8
 	github.com/open-ai-org/tokenizer v1.0.1
 )
 
