@@ -1,5 +1,7 @@
 # ai
 
+> **This project has moved to [github.com/tensorwire/ai](https://github.com/tensorwire/ai).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
+
 GPU-accelerated ML CLI. Train, infer, quantize, and serve LLMs. Zero Python, one binary.
 
 Powered by the [mongoose](https://github.com/open-ai-org/mongoose) GPU compute engine.
