@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/helix"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/helix"
+	"github.com/tensorwire/mongoose"
 
 	"unsafe"
 )

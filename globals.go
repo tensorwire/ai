@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // trainCfg holds all training configuration — shared across CUDA and Metal backends.

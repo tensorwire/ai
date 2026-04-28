@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/open-ai-org/gguf"
+	"github.com/tensorwire/gguf"
 )
 
 // === resolveModel ===

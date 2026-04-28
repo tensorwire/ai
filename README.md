@@ -1,10 +1,8 @@
 # ai
 
-> **This project has moved to [github.com/tensorwire/ai](https://github.com/tensorwire/ai).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
-
 GPU-accelerated ML CLI. Train, infer, quantize, and serve LLMs. Zero Python, one binary.
 
-Powered by the [mongoose](https://github.com/open-ai-org/mongoose) GPU compute engine.
+Powered by the [mongoose](https://github.com/tensorwire/mongoose) GPU compute engine.
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/swizzley)
 
@@ -13,7 +11,7 @@ Powered by the [mongoose](https://github.com/open-ai-org/mongoose) GPU compute e
 macOS (Metal — Apple Silicon):
 
 ```bash
-go install github.com/open-ai-org/ai@latest
+go install github.com/tensorwire/ai@latest
 ```
 
 Linux (CUDA — NVIDIA GPUs):
@@ -21,25 +19,25 @@ Linux (CUDA — NVIDIA GPUs):
 ```bash
 CGO_CFLAGS="-I/usr/local/cuda/include" \
 CGO_LDFLAGS="-L/usr/local/cuda/lib64" \
-go install github.com/open-ai-org/ai@latest
+go install github.com/tensorwire/ai@latest
 ```
 
 Any GPU via Vulkan (WebGPU — AMD, Intel, NVIDIA):
 
 ```bash
-CGO_ENABLED=0 go install github.com/open-ai-org/ai@latest
+CGO_ENABLED=0 go install github.com/tensorwire/ai@latest
 ```
 
 CPU only:
 
 ```bash
-CGO_ENABLED=0 go install github.com/open-ai-org/ai@latest
+CGO_ENABLED=0 go install github.com/tensorwire/ai@latest
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/open-ai-org/ai.git
+git clone https://github.com/tensorwire/ai.git
 cd ai
 go build -o ai .
 ```
@@ -272,9 +270,9 @@ Replace `compute_90` with your GPU's compute capability (e.g., `compute_89` for 
 
 ## Dependencies
 
-- [mongoose](https://github.com/open-ai-org/mongoose) — GPU compute engine
-- [gguf](https://github.com/open-ai-org/gguf) — GGUF + SafeTensors I/O
-- [tokenizer](https://github.com/open-ai-org/tokenizer) — BPE tokenizer
+- [mongoose](https://github.com/tensorwire/mongoose) — GPU compute engine
+- [gguf](https://github.com/tensorwire/gguf) — GGUF + SafeTensors I/O
+- [tokenizer](https://github.com/tensorwire/tokenizer) — BPE tokenizer
 
 ## License
 

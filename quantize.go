@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/open-ai-org/gguf"
+	"github.com/tensorwire/gguf"
 )
 
 // cmdQuantize: ai quantize <model> [q8|q4|f16]

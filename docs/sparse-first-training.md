@@ -225,7 +225,7 @@ Sparisty all the way down. Dense training is a choice, not a necessity. Neural n
 
 The result is a training system that achieves competitive throughput with a fundamentally different compute profile: work scales with the active parameter subset, not the total parameter count. As models grow from millions to billions of parameters while batch sparsity remains constant, the advantage of sparse-first training grows proportionally.
 
-The code is open source at github.com/open-ai-org.
+The code is open source at github.com/tensorwire.
 
 ## References
 

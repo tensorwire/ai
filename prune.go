@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/open-ai-org/gguf"
+	"github.com/tensorwire/gguf"
 )
 
 // cmdPrune removes low-magnitude weights to produce a smaller, sparser model.

@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/open-ai-org/gguf"
+	"github.com/tensorwire/gguf"
 )
 
 // ModelSource abstracts over SafeTensors and GGUF in any packaging.

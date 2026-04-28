@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 var modelsDir string

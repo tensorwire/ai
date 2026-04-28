@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdTrainGraph trains from scratch using GraphTrainEngine (Metal MPSGraph or CUDA graph).

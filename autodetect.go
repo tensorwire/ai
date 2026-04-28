@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // ModelProfile contains everything mongoose needs to run a model.

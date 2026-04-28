@@ -5,8 +5,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 // metalStreamingForward provides ping-pong weight-buffered inference.

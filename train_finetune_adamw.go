@@ -9,9 +9,9 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
+	"github.com/tensorwire/tokenizer"
 )
 
 func cmdFinetuneCUDA(modelPath, dataPath string, args map[string]string, steps int, lr float64, logEvery int) {

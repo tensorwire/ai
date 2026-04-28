@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdEval runs a validation pass over a dataset and reports loss + perplexity.

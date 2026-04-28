@@ -10,10 +10,10 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/helix"
-	"github.com/open-ai-org/mongoose"
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/helix"
+	"github.com/tensorwire/mongoose"
+	"github.com/tensorwire/tokenizer"
 )
 
 func cmdFinetuneHelix(modelPath, dataPath string, steps int, lr float64, rank int, logEvery int) {

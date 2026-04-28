@@ -90,11 +90,11 @@ The `cmdInferGPU` function selects the fastest available path:
 
 ## Dependencies
 
-- `github.com/open-ai-org/mongoose` — GPU compute engine
-- `github.com/open-ai-org/gguf` — model serialization (GGUF + SafeTensors)
-- `github.com/open-ai-org/tokenizer` — BPE tokenizer
-- `github.com/open-ai-org/helix` — DNA optimizer (optional, --helix flag)
-- `github.com/open-ai-org/needle` — INT8 kernels (optional, --needle flag)
+- `github.com/tensorwire/mongoose` — GPU compute engine
+- `github.com/tensorwire/gguf` — model serialization (GGUF + SafeTensors)
+- `github.com/tensorwire/tokenizer` — BPE tokenizer
+- `github.com/tensorwire/helix` — DNA optimizer (optional, --helix flag)
+- `github.com/tensorwire/needle` — INT8 kernels (optional, --needle flag)
 
 ## Test
 

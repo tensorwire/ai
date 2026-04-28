@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/tokenizer"
 )
 
 func TestHealthEndpoint(t *testing.T) {

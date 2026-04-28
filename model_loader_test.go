@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/open-ai-org/gguf"
+	"github.com/tensorwire/gguf"
 )
 
 func TestOpenModelSafeTensors(t *testing.T) {

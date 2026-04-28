@@ -7,7 +7,7 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdProfile runs a training step with per-op GPU timing.

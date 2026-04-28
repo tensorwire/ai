@@ -11,9 +11,9 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
+	"github.com/tensorwire/tokenizer"
 )
 
 // cmdInferGPU runs inference with three tiers:

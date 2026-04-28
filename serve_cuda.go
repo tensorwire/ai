@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 // cudaQ8Inference holds pre-allocated GPU state for zero-alloc CUDA Q8 inference.

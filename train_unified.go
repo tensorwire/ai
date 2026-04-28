@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdTrainUnified handles both from-scratch and fine-tuning via a single command:

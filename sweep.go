@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdSweep runs a hyperparameter search over training configurations.

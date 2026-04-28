@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdDistill trains a small student model to mimic a larger teacher model.

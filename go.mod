@@ -1,14 +1,14 @@
-module github.com/open-ai-org/ai
+module github.com/tensorwire/ai
 
 go 1.25.0
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/open-ai-org/gguf v1.0.0
-	github.com/open-ai-org/helix v1.0.0
-	github.com/open-ai-org/mongoose v1.0.8
-	github.com/open-ai-org/tokenizer v1.0.1
+	github.com/tensorwire/gguf v1.0.0
+	github.com/tensorwire/helix v1.0.0
+	github.com/tensorwire/mongoose v1.0.8
+	github.com/tensorwire/tokenizer v1.0.1
 )
 
 require (
@@ -37,3 +37,11 @@ require (
 	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )
+
+replace github.com/tensorwire/mongoose => ../mongoose
+
+replace github.com/tensorwire/gguf => ../gguf
+
+replace github.com/tensorwire/tokenizer => ../tokenizer
+
+replace github.com/tensorwire/helix => ../helix

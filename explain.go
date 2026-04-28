@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/tokenizer"
 )
 
 // cmdExplain generates token-level attributions showing which input tokens

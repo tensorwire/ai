@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/open-ai-org/gguf"
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/gguf"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdTrain discovers all available compute backends, benchmarks them,

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/open-ai-org/tokenizer"
+	"github.com/tensorwire/tokenizer"
 )
 
 func TestApplyChatTemplate_ChatML(t *testing.T) {

@@ -66,7 +66,7 @@ jobs:
         if: matrix.goos == 'darwin'
         run: |
           # Clone mongoose for metallib files
-          git clone --depth 1 https://github.com/open-ai-org/mongoose.git /tmp/mongoose
+          git clone --depth 1 https://github.com/tensorwire/mongoose.git /tmp/mongoose
           if [ -f /tmp/mongoose/kernels/gemm_metal4.metallib ]; then
             cp /tmp/mongoose/kernels/gemm_metal4.metallib .
             cp /tmp/mongoose/kernels/fused_train.metallib .

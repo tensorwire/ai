@@ -10,7 +10,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/open-ai-org/mongoose"
+	"github.com/tensorwire/mongoose"
 )
 
 // cmdBenchmark: ai benchmark <model> [flags]
