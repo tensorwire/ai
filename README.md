@@ -4,7 +4,10 @@ GPU-accelerated ML CLI. Train, infer, quantize, and serve LLMs. Zero Python, one
 
 Powered by the [mongoose](https://github.com/tensorwire/mongoose) GPU compute engine.
 
+This is a solo passion project and budgets are tight for renting production hardware and acquiring commodity hardware, if you want to help out my sponsor link is below. 
+
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/swizzley)
+
 
 ## Install
 
