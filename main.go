@@ -18,6 +18,8 @@ import (
 	"strings"
 )
 
+var version = "dev"
+
 func main() {
 	ParseGlobalFlags()
 
@@ -115,7 +117,7 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 	case "-v", "--version", "version":
-		fmt.Println("ai v1.5.2 — powered by mongoose")
+		fmt.Printf("ai %s — powered by mongoose\n", version)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", cmd)
 		usage()

@@ -60,7 +60,8 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: ${{ matrix.cgo }}
         run: |
-          go build -ldflags="-s -w" -o ai-${{ matrix.suffix }}${{ matrix.ext }} .
+          VERSION=${GITHUB_REF_NAME:-dev}
+          go build -ldflags="-s -w -X main.version=${VERSION}" -o ai-${{ matrix.suffix }}${{ matrix.ext }} .
 
       - name: Package Metal kernels (macOS)
         if: matrix.goos == 'darwin'
