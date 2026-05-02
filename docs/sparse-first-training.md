@@ -159,12 +159,14 @@ Byte-level transformer, 4 layers, seq_len=64, vocab=256, 100 training steps.
 
 **NVIDIA RTX 5090 (single GPU, pure Helix optimizer, 1000 steps):**
 
-| dim | params | steps/s |
-|-----|--------|---------|
-| 128 | 624K | 773 |
-| 512 | 9.6M | 455 |
-| 1024 | 38M | 191 |
-| 2048 | 152M | 74 |
+| dim | params | steps/s (v1.5.1) | steps/s (v1.5.2) | notes |
+|-----|--------|-----------------|-----------------|-------|
+| 128 | 624K | 773 | 569 | dispatch overhead dominates at small dim |
+| 512 | 4.9M | 455 | 433 | within 5% |
+| 1024 | 16M | 191 | 294 | +54% — FP16 tensor core path improved |
+| 2048 | 57M | 74 | 83 | +12% |
+
+*v1.5.2 regression at dim≤512: additional kernel dispatch paths (Q4 dp4a, TQ3, FP16 raw upload) add ~2μs per CGo call. At dim=128 where each training step is <1.3ms, this overhead is measurable. At dim≥1024 where GEMMs dominate (>5ms/step), the improved FP16 tensor core utilization more than compensates. The param count difference reflects v1.5.2 using the actual default ffn_dim=256 rather than the scaled ffn_dim=4×dim used in v1.5.1 benchmarks.*
 
 **Dual H100 SXM NVLink (Helix Dispatch, 2000 steps):**
 
