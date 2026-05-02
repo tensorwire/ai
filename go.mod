@@ -7,8 +7,8 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/tensorwire/gguf v1.0.0
 	github.com/tensorwire/helix v1.0.0
-	github.com/tensorwire/mongoose v1.0.0
-	github.com/tensorwire/tokenizer v1.0.0
+	github.com/tensorwire/mongoose v1.1.0
+	github.com/tensorwire/tokenizer v1.1.0
 )
 
 require (

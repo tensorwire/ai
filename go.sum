@@ -48,10 +48,10 @@ github.com/tensorwire/gguf v1.0.0 h1:6vakaNBr+4a9GirvqyJTgc1l6oX8nWyvgnQvurzLx84
 github.com/tensorwire/gguf v1.0.0/go.mod h1:wy23KpwtLxlgYYjSlf1LyR7g3LpBTQ3lFKEXyiaq4EI=
 github.com/tensorwire/helix v1.0.0 h1:YCVACqpnAAziJ0AJS27heJ7iaMADkku83FogakVp7n8=
 github.com/tensorwire/helix v1.0.0/go.mod h1:cSCmXr0BMAoTFXEoCw3rnwXT6Odk8jtWMK7DZq9RGlk=
-github.com/tensorwire/mongoose v1.0.0 h1:xoGhvw2I9MTB50rBRVKNKcJjCSu62QJ5+7YrAoWdcR0=
-github.com/tensorwire/mongoose v1.0.0/go.mod h1:liUCmzJvJlZZDhipEJzQnNRjWqgRGvQNIEvL0DoroBQ=
-github.com/tensorwire/tokenizer v1.0.0 h1:Ty/v33Xkkmyi1OqlU1REUzS8E0SW0hna4X+3PYz4v84=
-github.com/tensorwire/tokenizer v1.0.0/go.mod h1:ecN7TYoE8KQ3WNbGMRPKDkvNIIVPTFGAlCIxg5JeJg4=
+github.com/tensorwire/mongoose v1.1.0 h1:m/dl4Tu/TYQ9BVzX8AlzMZQL7/U4NMR7iYLVuXokJ5o=
+github.com/tensorwire/mongoose v1.1.0/go.mod h1:liUCmzJvJlZZDhipEJzQnNRjWqgRGvQNIEvL0DoroBQ=
+github.com/tensorwire/tokenizer v1.1.0 h1:KeNrMhR2VcqR4eM2xaGiGi+2OUCv8G3Ing9f+mGoJ54=
+github.com/tensorwire/tokenizer v1.1.0/go.mod h1:ecN7TYoE8KQ3WNbGMRPKDkvNIIVPTFGAlCIxg5JeJg4=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e h1:JVG44RsyaB9T2KIHavMF/ppJZNG9ZpyihvCd0w101no=
 github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e/go.mod h1:RbqR21r5mrJuqunuUZ/Dhy/avygyECGrLceyNeo4LiM=
 golang.org/x/exp v0.0.0-20231006140011-7918f672742d h1:jtJma62tbqLibJ5sFQz8bKtEM8rJBtfilJ2qTU199MI=
