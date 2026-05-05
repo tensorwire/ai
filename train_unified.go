@@ -40,13 +40,6 @@ func cmdTrainUnified(args map[string]string) {
 		os.Exit(1)
 	}
 
-	// arch=mlp with --stream: streaming NDJSON data loader for large tabular datasets
-	if args["arch"] == "mlp" && args["stream"] == "true" {
-		args["data"] = dataPath
-		cmdTrainMLP(args)
-		return
-	}
-
 	if modelPath != "" {
 		modelPath = resolveModelPath(modelPath)
 		runFinetune(modelPath, dataPath, args)
