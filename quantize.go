@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/tensorwire/gguf"
@@ -122,6 +123,80 @@ func cmdQuantize() {
 	}
 }
 
+// sq4EncodeTensor quantizes a single FP32 weight tensor to SQ4 with per-tensor band calibration.
+// Returns packed nibbles, 8 band means, outlier indices, and outlier values.
+func sq4EncodeTensor(data []float32, rows, cols int) (packed []byte, bands [8]float32, outlierIdx []uint32, outlierVal []float32) {
+	n := rows * cols
+	packed = make([]byte, n/2)
+
+	absVals := make([]float32, n)
+	for i, v := range data {
+		if v < 0 {
+			absVals[i] = -v
+		} else {
+			absVals[i] = v
+		}
+	}
+	sorted := make([]float32, n)
+	copy(sorted, absVals)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	var boundaries [8]float32
+	for b := 0; b < 8; b++ {
+		lo := n * b / 8
+		hi := n * (b + 1) / 8
+		if hi > n {
+			hi = n
+		}
+		boundaries[b] = sorted[hi-1]
+		var sum float64
+		for _, v := range sorted[lo:hi] {
+			sum += float64(v)
+		}
+		bands[b] = float32(sum / float64(hi-lo))
+	}
+
+	outlierPos := n * 999 / 1000
+	if outlierPos >= n-1 {
+		outlierPos = n - 2
+	}
+	if outlierPos < 0 {
+		outlierPos = 0
+	}
+	outlierThresh := sorted[outlierPos]
+
+	halfCols := cols / 2
+	for r := 0; r < rows; r++ {
+		for c := 0; c < cols; c++ {
+			idx := r*cols + c
+			v := data[idx]
+			absV := absVals[idx]
+
+			if absV >= outlierThresh && outlierThresh > 0 {
+				outlierIdx = append(outlierIdx, uint32(idx))
+				outlierVal = append(outlierVal, v)
+			}
+
+			band := 7
+			for b := 0; b < 7; b++ {
+				if absV <= boundaries[b] {
+					band = b
+					break
+				}
+			}
+
+			signBit := 0
+			if v < 0 {
+				signBit = 1
+			}
+			nibble := byte((signBit << 3) | (band & 0x07))
+			shift := uint((c & 1) * 4)
+			packed[r*halfCols+c/2] |= nibble << shift
+		}
+	}
+	return
+}
+
 func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBytes int64) {
 	outputDir := filepath.Base(modelDir) + "-sq4"
 	if len(os.Args) >= 5 {
@@ -129,7 +204,6 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 	}
 	os.MkdirAll(outputDir, 0755)
 
-	// Read config for layer count
 	configData, _ := os.ReadFile(filepath.Join(modelDir, "config.json"))
 	var cfg map[string]interface{}
 	json.Unmarshal(configData, &cfg)
@@ -144,14 +218,6 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 
 	fmt.Printf("  output: %s\n\n", outputDir)
 
-	// Weight tensors to quantize (per-layer projections)
-	weightSuffixes := []string{
-		"self_attn.q_proj.weight", "self_attn.k_proj.weight",
-		"self_attn.v_proj.weight", "self_attn.o_proj.weight",
-		"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
-	}
-
-	// Create output files
 	packedF, _ := os.Create(filepath.Join(outputDir, "sq4_packed.bin"))
 	bandsF, _ := os.Create(filepath.Join(outputDir, "sq4_bands.bin"))
 	outlierIdxF, _ := os.Create(filepath.Join(outputDir, "sq4_outlier_idx.bin"))
@@ -168,7 +234,6 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 		PackedOffset int    `json:"packed_offset"`
 		PackedBytes  int    `json:"packed_bytes"`
 		BandsOffset  int    `json:"bands_offset"`
-		BandsFloats  int    `json:"bands_floats"`
 		OutlierStart int    `json:"outlier_start"`
 		OutlierCount int    `json:"outlier_count"`
 	}
@@ -179,6 +244,63 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 	outlierOff := 0
 	var totalSQ4Bytes int64
 
+	writeTensor := func(name string, data []float32, rows, cols int) {
+		packed, bands, oIdx, oVal := sq4EncodeTensor(data, rows, cols)
+
+		meta := tensorMeta{
+			Name:         name,
+			Rows:         rows,
+			Cols:         cols,
+			PackedOffset: packedOff,
+			PackedBytes:  len(packed),
+			BandsOffset:  bandsOff,
+			OutlierStart: outlierOff,
+			OutlierCount: len(oIdx),
+		}
+		metas = append(metas, meta)
+
+		packedF.Write(packed)
+		packedOff += len(packed)
+
+		bandsBytes := make([]byte, 8*4)
+		for i := 0; i < 8; i++ {
+			binary.LittleEndian.PutUint32(bandsBytes[i*4:], math.Float32bits(bands[i]))
+		}
+		bandsF.Write(bandsBytes)
+		bandsOff += 8
+
+		idxBytes := make([]byte, len(oIdx)*4)
+		for i, v := range oIdx {
+			binary.LittleEndian.PutUint32(idxBytes[i*4:], v)
+		}
+		outlierIdxF.Write(idxBytes)
+
+		valBytes := make([]byte, len(oVal)*4)
+		for i, v := range oVal {
+			binary.LittleEndian.PutUint32(valBytes[i*4:], math.Float32bits(v))
+		}
+		outlierValF.Write(valBytes)
+		outlierOff += len(oIdx)
+
+		totalSQ4Bytes += int64(len(packed) + 8*4 + len(oIdx)*8)
+	}
+
+	// SQ4-encode embed + lm_head
+	for _, name := range []string{"model.embed_tokens.weight", "lm_head.weight"} {
+		data, info, err := st.ReadTensorFloat32(name)
+		if err != nil || data == nil {
+			continue
+		}
+		writeTensor(name, data, info.Shape[0], info.Shape[1])
+		fmt.Printf("  %s → SQ4 (%dx%d)\n", name, info.Shape[0], info.Shape[1])
+	}
+
+	// SQ4-encode all layer projections
+	weightSuffixes := []string{
+		"self_attn.q_proj.weight", "self_attn.k_proj.weight",
+		"self_attn.v_proj.weight", "self_attn.o_proj.weight",
+		"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+	}
 	for l := 0; l < nLayers; l++ {
 		prefix := fmt.Sprintf("model.layers.%d.", l)
 		for _, suffix := range weightSuffixes {
@@ -187,54 +309,13 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 			if err != nil || data == nil {
 				continue
 			}
-
-			rows := info.Shape[0]
-			cols := info.Shape[1]
-			sq4 := gguf.QuantizeToSQ4(data, rows, cols)
-
-			meta := tensorMeta{
-				Name:         name,
-				Rows:         rows,
-				Cols:         cols,
-				PackedOffset: packedOff,
-				PackedBytes:  len(sq4.Packed),
-				BandsOffset:  bandsOff,
-				BandsFloats:  len(sq4.Bands),
-				OutlierStart: outlierOff,
-				OutlierCount: len(sq4.OutlierIdx),
-			}
-			metas = append(metas, meta)
-
-			packedF.Write(sq4.Packed)
-			packedOff += len(sq4.Packed)
-
-			bandsBytes := make([]byte, len(sq4.Bands)*4)
-			for i, v := range sq4.Bands {
-				binary.LittleEndian.PutUint32(bandsBytes[i*4:], math.Float32bits(v))
-			}
-			bandsF.Write(bandsBytes)
-			bandsOff += len(sq4.Bands)
-
-			idxBytes := make([]byte, len(sq4.OutlierIdx)*4)
-			for i, v := range sq4.OutlierIdx {
-				binary.LittleEndian.PutUint32(idxBytes[i*4:], v)
-			}
-			outlierIdxF.Write(idxBytes)
-
-			valBytes := make([]byte, len(sq4.OutlierVal)*4)
-			for i, v := range sq4.OutlierVal {
-				binary.LittleEndian.PutUint32(valBytes[i*4:], math.Float32bits(v))
-			}
-			outlierValF.Write(valBytes)
-			outlierOff += len(sq4.OutlierIdx)
-
-			totalSQ4Bytes += int64(len(sq4.Packed) + len(sq4.Bands)*4 + len(sq4.OutlierIdx)*8)
+			writeTensor(name, data, info.Shape[0], info.Shape[1])
 		}
 		fmt.Printf("\r  Layer %d/%d quantized to SQ4", l+1, nLayers)
 	}
 	fmt.Println()
 
-	// Save metadata
+	// Metadata
 	metaJSON := struct {
 		Format  string       `json:"format"`
 		Model   string       `json:"model"`
@@ -260,9 +341,9 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 		}
 	}
 
-	// Save embeddings + norms as SafeTensors (these stay FP32)
+	// Norms + biases stay FP32
 	fpTensors := map[string]gguf.SaveTensor{}
-	for _, name := range []string{"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"} {
+	for _, name := range []string{"model.norm.weight"} {
 		data, info, err := st.ReadTensorFloat32(name)
 		if err == nil && data != nil {
 			fpTensors[name] = gguf.SaveTensor{Data: data, Shape: info.Shape}
@@ -270,7 +351,12 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 	}
 	for l := 0; l < nLayers; l++ {
 		prefix := fmt.Sprintf("model.layers.%d.", l)
-		for _, n := range []string{"input_layernorm.weight", "post_attention_layernorm.weight"} {
+		for _, n := range []string{
+			"input_layernorm.weight", "post_attention_layernorm.weight",
+			"self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias",
+			"self_attn.o_proj.bias",
+			"mlp.gate_proj.bias", "mlp.up_proj.bias", "mlp.down_proj.bias",
+		} {
 			data, info, err := st.ReadTensorFloat32(prefix + n)
 			if err == nil && data != nil {
 				fpTensors[prefix+n] = gguf.SaveTensor{Data: data, Shape: info.Shape}

@@ -151,6 +151,18 @@ func cmdInferGPU(model string, promptParts []string) {
 		}
 	}
 
+	// SQ4 model detection — check for sq4_meta.json
+	sq4MetaPath := filepath.Join(path, "sq4_meta.json")
+	if _, err := os.Stat(sq4MetaPath); err == nil {
+		metal, _ := eng.(*mongoose.Metal)
+		if metal != nil {
+			cmdInferSQ4Metal(path, prompt, metal, te, cfg, dim, nLayers, heads, kvHeads, ffnDim,
+				vocabSize, headDim, kvDim, attnDim, maxSeq, ropeTheta, normEps)
+			return
+		}
+		log.Println("[SQ4] SQ4 model detected but Metal not available — falling back to FP32")
+	}
+
 	ms, err := OpenModel(path)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
