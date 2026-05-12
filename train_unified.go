@@ -19,6 +19,12 @@ import (
 // All settings have opinionated defaults. Override with key=value:
 //   ai train data=file.txt steps=5000 lr=3e-4 dim=512 layers=8
 func cmdTrainUnified(args map[string]string) {
+	// Route to MLP training: ai train mode=mlp data=<file>
+	if args["mode"] == "mlp" {
+		cmdTrainMLP(args)
+		return
+	}
+
 	dataPath := args["data"]
 	modelPath := args["model"]
 

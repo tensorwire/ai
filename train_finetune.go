@@ -26,14 +26,23 @@ func cmdFinetune() {
 	stepsFlag := fs.Int("steps", 100, "Training steps")
 	lrFlag := fs.Float64("lr", 1e-5, "Learning rate")
 	logEvery := fs.Int("log-every", 10, "Log every N steps")
+	saveEvery := fs.Int("save-every", 50, "Save checkpoint every N steps (0 = only at end)")
+	outputDir := fs.String("output", "", "Output directory for checkpoints (default: ./finetune-out)")
 
 	fs.Parse(os.Args[2:])
 
 	if *modelPath == "" {
-		home, _ := os.UserHomeDir()
-		*modelPath = filepath.Join(home, ".ai", "models", "TinyLlama-1.1B-Chat-v1.0")
+		log.Fatal("model required: ai finetune --model <name> --data <file>")
 	}
-	if *dataPath == "" { log.Fatal("data required: ai finetune model=<name> data=<file>") }
+	if *dataPath == "" {
+		log.Fatal("data required: ai finetune --model <name> --data <file>")
+	}
+
+	resolved := resolveModel(*modelPath)
+	if resolved == "" {
+		log.Fatalf("model not found: %s\nTry: ai pull <org>/%s", *modelPath, *modelPath)
+	}
+	*modelPath = resolved
 
 	eng := selectEngine("auto")
 	te := mongoose.AsTensorEngine(eng)
@@ -48,32 +57,49 @@ func cmdFinetune() {
 	ms, err := OpenModel(*modelPath)
 	if err != nil { log.Fatalf("open model: %v", err) }
 
-	dim := 2048
-	heads := 32
-	kvHeads := 4
-	nLayers := 22
-	ffnDim := 5632
-	seqLen := 64
-	vocabSize := 32000
-
 	cfgPath := filepath.Join(*modelPath, "config.json")
-	if cfgData, err := os.ReadFile(cfgPath); err == nil {
-		var cfg map[string]interface{}
-		json.Unmarshal(cfgData, &cfg)
-		if v, ok := cfg["hidden_size"].(float64); ok { dim = int(v) }
-		if v, ok := cfg["num_attention_heads"].(float64); ok { heads = int(v) }
-		if v, ok := cfg["num_key_value_heads"].(float64); ok { kvHeads = int(v) }
-		if v, ok := cfg["num_hidden_layers"].(float64); ok { nLayers = int(v) }
-		if v, ok := cfg["intermediate_size"].(float64); ok { ffnDim = int(v) }
-		if v, ok := cfg["vocab_size"].(float64); ok { vocabSize = int(v) }
-		if v, ok := cfg["max_position_embeddings"].(float64); ok && int(v) < 2048 { seqLen = int(v) }
-		log.Printf("[finetune] config: dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d", dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
+	cfgData, err := os.ReadFile(cfgPath)
+	if err != nil {
+		log.Fatalf("model directory missing config.json — expected at %s", cfgPath)
 	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(cfgData, &cfg); err != nil {
+		log.Fatalf("config.json parse error: %v", err)
+	}
+
+	getInt := func(key string) int {
+		if v, ok := cfg[key].(float64); ok { return int(v) }
+		log.Fatalf("config.json missing required field: %s", key)
+		return 0
+	}
+	dim := getInt("hidden_size")
+	heads := getInt("num_attention_heads")
+	kvHeads := getInt("num_key_value_heads")
+	nLayers := getInt("num_hidden_layers")
+	ffnDim := getInt("intermediate_size")
+	vocabSize := getInt("vocab_size")
+	seqLen := 64
+	if v, ok := cfg["max_position_embeddings"].(float64); ok && int(v) < 2048 { seqLen = int(v) }
+	log.Printf("[finetune] config: dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d", dim, heads, kvHeads, nLayers, ffnDim, vocabSize)
 
 	headDim := dim / heads
 	kvDim := kvHeads * headDim
 	lr := float32(*lrFlag)
 	n := seqLen
+
+	// VRAM estimate: INT8 weights + FP32 cache + FP16 momentum/velocity + FP32 buffers
+	// Per-layer: 7 weights × (INT8 + FP32 cache + FP16 mom + FP16 vel) ≈ 9 bytes/param
+	layerParams := int64(dim*dim*2 + kvDim*dim*2 + ffnDim*dim*3)
+	perLayerBytes := layerParams * 9
+	embedBytes := int64(vocabSize) * int64(dim) * 4 * 2
+	bufferBytes := int64(n) * int64(dim) * 4 * 20 * int64(nLayers)
+	totalEstimate := perLayerBytes*int64(nLayers) + embedBytes + bufferBytes
+	vram := int64(eng.VRAM())
+	if vram > 0 && totalEstimate > vram {
+		log.Printf("[finetune] Model needs %.1f GB VRAM but only %.1f GB available",
+			float64(totalEstimate)/(1024*1024*1024), float64(vram)/(1024*1024*1024))
+		log.Fatalf("[finetune] Use LoRA instead: ai train model=%s data=%s (auto-routes to Q8+LoRA which fits)", filepath.Base(*modelPath), *dataPath)
+	}
 
 	log.Printf("[finetune] loading %s", *modelPath)
 
@@ -226,6 +252,52 @@ func cmdFinetune() {
 
 	zero := func(t *mongoose.Tensor) {
 		mongoose.KZero(t.DevicePtr(), t.Size*4)
+	}
+
+	// Checkpoint setup
+	ckptBase := *outputDir
+	if ckptBase == "" {
+		ckptBase = "finetune-out"
+	}
+	ckptDir := filepath.Join(ckptBase, "checkpoints")
+	os.MkdirAll(ckptDir, 0755)
+
+	saveCheckpoint := func(step int, loss float32) {
+		cuda.Sync()
+		tensors := map[string]gguf.SaveTensor{
+			"model.embed_tokens.weight": {Data: te.ToHost(embed), Shape: []int{vocabSize, dim}},
+			"lm_head.weight":            {Data: te.ToHost(lmHead), Shape: []int{vocabSize, dim}},
+			"model.norm.weight":         {Data: te.ToHost(finalNorm), Shape: []int{dim}},
+		}
+		for li := range lays {
+			pfx := fmt.Sprintf("model.layers.%d.", li)
+			tensors[pfx+"self_attn.q_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wq.cache), Shape: []int{dim, dim}}
+			tensors[pfx+"self_attn.k_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wk.cache), Shape: []int{kvDim, dim}}
+			tensors[pfx+"self_attn.v_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wv.cache), Shape: []int{kvDim, dim}}
+			tensors[pfx+"self_attn.o_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].wo.cache), Shape: []int{dim, dim}}
+			tensors[pfx+"mlp.gate_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].gate.cache), Shape: []int{ffnDim, dim}}
+			tensors[pfx+"mlp.up_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].up.cache), Shape: []int{ffnDim, dim}}
+			tensors[pfx+"mlp.down_proj.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].down.cache), Shape: []int{dim, ffnDim}}
+			tensors[pfx+"input_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm1), Shape: []int{dim}}
+			tensors[pfx+"post_attention_layernorm.weight"] = gguf.SaveTensor{Data: te.ToHost(lays[li].norm2), Shape: []int{dim}}
+		}
+		stepDir := filepath.Join(ckptDir, fmt.Sprintf("step-%05d", step))
+		os.MkdirAll(stepDir, 0755)
+		stPath := filepath.Join(stepDir, "model.safetensors")
+		if err := gguf.SaveSafeTensors(stPath, tensors); err != nil {
+			log.Printf("[checkpoint] save error: %v", err)
+			return
+		}
+		// Copy config + tokenizer from source model
+		for _, f := range []string{"config.json", "tokenizer.json", "tokenizer_config.json",
+			"tokenizer.model", "special_tokens_map.json", "generation_config.json"} {
+			src := filepath.Join(*modelPath, f)
+			if data, err := os.ReadFile(src); err == nil {
+				os.WriteFile(filepath.Join(stepDir, f), data, 0644)
+			}
+		}
+		fi, _ := os.Stat(stPath)
+		log.Printf("[checkpoint] step %d (loss=%.3f) → %s (%.1f MB)", step, loss, stepDir, float64(fi.Size())/(1024*1024))
 	}
 
 	fmt.Println("ai train — FP32 backward + Helix DNA optimizer")
@@ -416,16 +488,37 @@ func cmdFinetune() {
 			needleUpdate(&lays[li].down, b.dWDown)
 		}
 		adamW(lmHead, dLmHead, lmHeadAS.m, lmHeadAS.v)
-		adamW(embed, dLmHead, embedAS.m, embedAS.v)
+
+		// Embedding gradient: scatter-add dHidden into dEmbed by token ID
+		dEmbedData := make([]float32, vocabSize*dim)
+		dHiddenHost := te.ToHost(dHidden)
+		for pos := 0; pos < n; pos++ {
+			tid := data[start+pos]
+			if tid >= 0 && tid < vocabSize {
+				for j := 0; j < dim; j++ {
+					dEmbedData[tid*dim+j] += dHiddenHost[pos*dim+j]
+				}
+			}
+		}
+		dEmbed := te.FromHost(dEmbedData, []int{vocabSize, dim})
+		adamW(embed, dEmbed, embedAS.m, embedAS.v)
+		te.Release(dEmbed)
 
 		if step <= 3 || step%*logEvery == 0 {
 			elapsed := time.Since(t0)
 			fmt.Printf("step %5d/%d  loss=%.3f  lr=%.1e  %.0fs  (%.1f steps/s)\n",
 				step, *stepsFlag, stepLoss, lr, elapsed.Seconds(), float64(step)/elapsed.Seconds())
 		}
+
+		if *saveEvery > 0 && step%*saveEvery == 0 && step < *stepsFlag {
+			saveCheckpoint(step, stepLoss)
+		}
 	}
+
+	saveCheckpoint(*stepsFlag, 0)
 
 	cuda.Sync()
 	total := time.Since(t0)
 	fmt.Printf("\ndone. %d steps in %.3fs (%.1f steps/s)\n", *stepsFlag, total.Seconds(), float64(*stepsFlag)/total.Seconds())
+	fmt.Printf("Model saved to: %s\n", ckptDir)
 }

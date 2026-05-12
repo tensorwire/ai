@@ -129,3 +129,37 @@ go test -v ./...
 ### train_unified.go (routing)
 
 9. **CUDA fine-tune routes to broken cmdFinetune.** `runFinetune()` on CUDA calls `cmdFinetune()` which has bugs 1-6 above. For large models, should route to a Q8+LoRA path instead. Metal already routes via `--resume` to `cmdTrainMetal` which reads config.json correctly.
+
+### merge.go (cmdMerge — LoRA adapter merge)
+
+10. **OOM on large models (Qwen 2.5 14B on 64GB RAM).** `cmdMerge` reads every base model tensor via `ReadTensorFloat32` and stores all of them in the `mergedTensors` map simultaneously before writing anything. For 14B params that's ~56GB of float32 held in RAM at once, plus adapter tensors and Go runtime overhead. Fix: stream tensors — read one tensor, merge if adapted, write immediately, release before loading the next. Alternatively, process in shards (write one output shard at a time). Reproduced on Beast (64GB system RAM) with Qwen 2.5 14B.
+
+### Training Quality (from-scratch, MPS/Metal path)
+
+11. **68% vs 90% accuracy gap against PyTorch.** Training from scratch with `ai` + mongoose on Metal produces 68% accuracy; PyTorch on same data/architecture/hyperparams produces 90%. Investigation tracked in chain. Top suspects: (a) Helix optimizer uses beta2=0.95 vs PyTorch AdamW's 0.999, and weight_decay=0.1 vs 0.01 — 10× more aggressive regularization may cause underfitting. (b) Backward pass numerical precision — Metal MPS may accumulate gradients in FP16 instead of FP32, zeroing small gradients in early layers. (c) Warmup is only 1 step vs PyTorch's typical 100-2000 — early training instability. Quick diagnostic: replace Helix with standard AdamW using PyTorch-matched hyperparams (beta2=0.999, wd=0.01, warmup=100). If accuracy jumps to ~90%, it's hyperparameters not a kernel bug. Also test CUDA path — if CUDA also gets 68%, the bug is in shared Go code, not Metal-specific.
+
+### Format support (all commands)
+
+12. **GGUF models rejected everywhere.** serve.go, infer_gpu.go, chat.go, quantize.go, merge.go, prune.go, distill.go, eval.go, explain.go, benchmark.go all hardcode `gguf.OpenSafeTensors()` instead of using the unified `OpenModel()` from model_loader.go which already handles GGUF, SafeTensors, shards, and zips. Error messages are opaque ("safetensors: \<error\>") with no guidance to convert. Fix: replace each `gguf.OpenSafeTensors()` call with `OpenModel()`.
+
+13. **`ai convert` is one-way (SafeTensors→GGUF only).** No GGUF→SafeTensors, no GGUF→GGUF requantization. Users with GGUF models can't use any command without a conversion path that doesn't exist.
+
+14. **`ai pull` skips GGUF-only models.** Download filter only grabs `.safetensors` files. Models published as GGUF-only (TheBloke, etc.) fail with "No safetensors files found" and no suggestion.
+
+15. **`ai infer` doesn't apply chat templates.** Sends raw text to instruction-tuned models that expect `<|im_start|>user\n...<|im_end|>`. Produces garbage for any instruct/chat model. `ai chat` and `ai serve` apply templates correctly.
+
+16. **Chat template detection ignores `chat_template` field.** Only detects ChatML and Llama3 by probing tokenizer vocabulary. Mistral (`[INST]`), Gemma (`<start_of_turn>`), Phi, and any model with a custom Jinja2 `chat_template` in `tokenizer_config.json` falls back to broken generic markdown format.
+
+17. **No architecture validation on model load.** Tensor names are hardcoded to Llama-family layout. Phi, Gemma, GPT-NeoX, MPT use different naming and fail silently — nil tensor data, crash later during inference.
+
+### serve.go
+
+18. **No VRAM pre-check.** Non-streaming mode loads entire model into GPU without checking if it fits. Crashes with no helpful message.
+
+19. **No CPU fallback.** Unlike infer_gpu.go which has a CPU streaming tier, serve.go crashes if no GPU available.
+
+20. **Hardcoded concurrency limits.** Inference queue capped at 16, no request timeout, no context cancellation on client disconnect. Hung inference blocks queue forever.
+
+### mongoose Q4 kernel
+
+21. **Q4 matvec produces garbage output.** Tested with Mistral 7B — Q8 works perfectly, Q4 output is control tokens at 1000+ tok/s. Code review: Go-side packing and CUDA-side unpacking match (low nibble = even col, high nibble = odd col, offset-8 symmetric, scale = absMax/7). The 1000+ tok/s suggests results are near-zero/NaN causing immediate stop tokens. Root cause likely: 4-bit symmetric with only 15 levels (-7..+7) per-row is too coarse for 7B models — quantization error compounds across 32 layers. Fix: implement block-quantized Q4 (per-32-element scales like GGUF Q4_0) instead of per-row. Q8 is the reliable path until then.

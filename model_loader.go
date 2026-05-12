@@ -400,6 +400,48 @@ func (m *ModelSource) ReadTensorFloat32(name string) ([]float32, error) {
 	}
 }
 
+// ReadTensorFloat32Full returns data, shape info, and error — matches SafeTensors signature.
+func (m *ModelSource) ReadTensorFloat32Full(name string) ([]float32, *gguf.TensorInfo, error) {
+	switch m.format {
+	case "safetensors":
+		return m.st.ReadTensorFloat32(name)
+	case "gguf":
+		ggufName := name
+		if mapped, ok := m.nameMap[name]; ok {
+			ggufName = mapped
+		}
+		data, shape, err := m.gr.ReadTensorFloat32(ggufName)
+		if err != nil {
+			data, shape, err = m.gr.ReadTensorFloat32(name)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		return data, &gguf.TensorInfo{Shape: shape}, nil
+	default:
+		return nil, nil, fmt.Errorf("unsupported format: %s", m.format)
+	}
+}
+
+// DequantAWQ delegates to SafeTensors AWQ dequantization. Returns nil for GGUF.
+func (m *ModelSource) DequantAWQ(prefix string, groupSize int) ([]float32, int, int, error) {
+	if m.st != nil {
+		return m.st.DequantAWQ(prefix, groupSize)
+	}
+	return nil, 0, 0, fmt.Errorf("AWQ dequant not supported for %s format", m.format)
+}
+
+// TensorNames returns all tensor names in the model.
+func (m *ModelSource) TensorNames() []string {
+	if m.st != nil {
+		return m.st.TensorNames
+	}
+	if m.gr != nil {
+		return m.gr.TensorNames()
+	}
+	return nil
+}
+
 // HasTensor checks if a tensor exists by HF name.
 func (m *ModelSource) HasTensor(name string) bool {
 	switch m.format {
@@ -416,6 +458,7 @@ func (m *ModelSource) HasTensor(name string) bool {
 	}
 }
 
+func (m *ModelSource) ST() *gguf.SafeTensors              { return m.st }
 func (m *ModelSource) Config() map[string]interface{} { return m.config }
 func (m *ModelSource) Format() string                 { return m.format }
 func (m *ModelSource) Dir() string                    { return m.dir }

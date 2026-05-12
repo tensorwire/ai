@@ -13,7 +13,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/tensorwire/gguf"
 	"github.com/tensorwire/mongoose"
 	"github.com/tensorwire/tokenizer"
 )
@@ -38,6 +37,20 @@ type chatMessage struct {
 func applyChatTemplate(tok *tokenizer.Tokenizer, messages []chatMessage, cfg map[string]interface{}) []int {
 	hasIMStart := tok.HasToken("<|im_start|>")
 	hasBeginOfText := tok.HasToken("<|begin_of_text|>")
+	hasStartOfTurn := tok.HasToken("<start_of_turn>")
+
+	if hasStartOfTurn {
+		var sb strings.Builder
+		for _, m := range messages {
+			sb.WriteString("<start_of_turn>")
+			sb.WriteString(m.Role)
+			sb.WriteString("\n")
+			sb.WriteString(m.Content)
+			sb.WriteString("<end_of_turn>\n")
+		}
+		sb.WriteString("<start_of_turn>model\n")
+		return tok.Encode(sb.String())
+	}
 
 	if hasIMStart {
 		var sb strings.Builder
@@ -183,7 +196,7 @@ func discoverStopTokens(tok *tokenizer.Tokenizer, cfg map[string]interface{}, mo
 	endPatterns := []string{
 		"<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>",
 		"<|end|>", "</s>", "<|end_of_turn|>", "<|stop|>",
-		"<|end_header_id|>",
+		"<|end_header_id|>", "<end_of_turn>",
 	}
 	for _, pat := range endPatterns {
 		if tok.HasToken(pat) {
@@ -269,9 +282,13 @@ func buildChatEngine(modelArg string) *chatEngine {
 		log.Fatalf("tokenizer: %v", err)
 	}
 
-	st, err := gguf.OpenSafeTensors(path)
+	ms, err := OpenModel(path)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("model format not supported for chat — convert with: ai convert safetensors %s", path)
 	}
 
 	embedData, _, _ := st.ReadTensorFloat32("model.embed_tokens.weight")

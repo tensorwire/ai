@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/tensorwire/gguf"
 	"github.com/tensorwire/mongoose"
 )
 
@@ -36,9 +35,13 @@ func cmdEval(args map[string]string) {
 	}
 	mongoose.LoadKernels()
 
-	st, err := gguf.OpenSafeTensors(modelPath)
+	ms, err := OpenModel(modelPath)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("eval currently requires SafeTensors format — convert with: ai convert safetensors %s", modelPath)
 	}
 
 	dim := 2048

@@ -113,9 +113,13 @@ func cmdDistill(args map[string]string) {
 
 	// Load teacher for inference (read-only)
 	fmt.Print("Loading teacher weights... ")
-	tST, err := gguf.OpenSafeTensors(teacherDir)
+	tMS, err := OpenModel(teacherDir)
 	if err != nil {
 		log.Fatalf("open teacher: %v", err)
+	}
+	tST := tMS.ST()
+	if tST == nil {
+		log.Fatalf("distill currently requires SafeTensors format — convert with: ai convert safetensors %s", teacherDir)
 	}
 	tEmbedData, _, _ := tST.ReadTensorFloat32("model.embed_tokens.weight")
 	fmt.Println("done")

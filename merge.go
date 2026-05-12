@@ -4,28 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/tensorwire/gguf"
 )
 
-// cmdMerge: mongoose merge <base-model> <adapters> [output-dir]
+// cmdMerge: ai merge <base-model> <adapters> [output-dir]
 //
 // Merges LoRA adapters back into the base model weights.
-// output = base_weight + A @ B (for each adapted layer)
-//
-// This produces a full-size model that can be:
-//   - Quantized: mongoose quantize merged-model q8
-//   - Served:    mongoose serve merged-model
-//   - Inferred:  mongoose infer merged-model "prompt"
-//
-// Example:
-//   mongoose merge qwen2.5-14b ./finetuned/adapters.safetensors ./merged-model
+// Uses streaming writes — only one tensor in memory at a time.
 func cmdMerge() {
 	if len(os.Args) < 4 {
-		fmt.Fprintln(os.Stderr, "Usage: mongoose merge <base-model> <adapters> [output-dir]")
+		fmt.Fprintln(os.Stderr, "Usage: ai merge <base-model> <adapters> [output-dir]")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "  Merges LoRA adapters into base model weights.")
 		fmt.Fprintln(os.Stderr, "  Result is a full model ready for quantize/serve/infer.")
@@ -48,7 +40,6 @@ func cmdMerge() {
 		outputDir = filepath.Base(baseDir) + "-merged"
 	}
 
-	// Load LoRA config
 	loraConfigPath := filepath.Join(filepath.Dir(adapterPath), "lora_config.json")
 	var loraRank int
 	var targetModules []string
@@ -69,27 +60,15 @@ func cmdMerge() {
 		log.Printf("No lora_config.json found, assuming rank=%d", loraRank)
 	}
 
-	fmt.Println("mongoose merge")
-	fmt.Printf("  base:     %s\n", baseDir)
-	fmt.Printf("  adapters: %s\n", adapterPath)
-	fmt.Printf("  rank:     %d\n", loraRank)
-	fmt.Printf("  targets:  %v\n", targetModules)
-	fmt.Printf("  output:   %s\n", outputDir)
-	fmt.Println()
-
-	// Open base model
 	baseST, err := gguf.OpenSafeTensors(baseDir)
 	if err != nil {
 		log.Fatalf("Open base model: %v", err)
 	}
-
-	// Open adapters
 	adapterST, err := gguf.OpenSafeTensors(adapterPath)
 	if err != nil {
 		log.Fatalf("Open adapters: %v", err)
 	}
 
-	// Load model config for layer count
 	configData, _ := os.ReadFile(filepath.Join(baseDir, "config.json"))
 	var mcfg map[string]interface{}
 	json.Unmarshal(configData, &mcfg)
@@ -98,23 +77,54 @@ func cmdMerge() {
 		nLayers = int(v)
 	}
 
-	// Merge: for each adapted weight, compute W_merged = W_base + A @ B
-	mergedTensors := make(map[string]gguf.SaveTensor)
-	mergedCount := 0
+	fmt.Println("ai merge")
+	fmt.Printf("  base:     %s\n", baseDir)
+	fmt.Printf("  adapters: %s\n", adapterPath)
+	fmt.Printf("  rank:     %d\n", loraRank)
+	fmt.Printf("  targets:  %v\n", targetModules)
+	fmt.Printf("  output:   %s\n", outputDir)
+	fmt.Println()
 
-	for _, name := range baseST.TensorNames {
-		baseData, _, err := baseST.ReadTensorFloat32(name)
+	// Pass 1: collect tensor names and shapes for the streaming header
+	names := make([]string, len(baseST.TensorNames))
+	copy(names, baseST.TensorNames)
+	sort.Strings(names)
+
+	metas := make([]gguf.TensorMeta, 0, len(names))
+	for _, name := range names {
+		ti, err := baseST.GetInfo(name)
 		if err != nil {
-			log.Printf("WARN: skip %s: %v", name, err)
+			continue
+		}
+		elems := 1
+		for _, d := range ti.Shape {
+			elems *= d
+		}
+		metas = append(metas, gguf.TensorMeta{Name: name, Shape: ti.Shape, Elems: elems})
+	}
+
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		log.Fatalf("mkdir: %v", err)
+	}
+
+	outputST := filepath.Join(outputDir, "model.safetensors")
+	w, err := gguf.NewStreamingSafeTensorsWriter(outputST, metas)
+	if err != nil {
+		log.Fatalf("create output: %v", err)
+	}
+
+	// Pass 2: read each tensor, merge if adapted, write immediately
+	mergedCount := 0
+	for i, m := range metas {
+		baseData, _, err := baseST.ReadTensorFloat32(m.Name)
+		if err != nil {
+			log.Printf("WARN: skip %s: %v", m.Name, err)
+			w.WriteTensor(make([]float32, m.Elems))
 			continue
 		}
 
-		// Check if this tensor has LoRA adapters
-		loraAName := name
-		// Convert weight name to adapter name:
-		// "model.layers.0.self_attn.q_proj.weight" → "model.layers.0.self_attn.q_proj.lora_A"
-		if isAdaptedWeight(name, targetModules) {
-			baseName := name[:len(name)-len(".weight")]
+		if isAdaptedWeight(m.Name, targetModules) {
+			baseName := m.Name[:len(m.Name)-len(".weight")]
 			aName := baseName + ".lora_A"
 			bName := baseName + ".lora_B"
 
@@ -123,13 +133,10 @@ func cmdMerge() {
 				bData, bInfo, _ := adapterST.ReadTensorFloat32(bName)
 
 				if aData != nil && bData != nil {
-					// A is [rank, inDim], B is [outDim, rank]
-					// LoRA output = B @ A (added to weight W[outDim, inDim])
 					rank := aInfo.Shape[0]
 					inDim := aInfo.Shape[1]
 					outDim := bInfo.Shape[0]
 
-					// W_merged = W_base + B @ A
 					for i := 0; i < outDim; i++ {
 						for j := 0; j < inDim; j++ {
 							var sum float64
@@ -140,30 +147,22 @@ func cmdMerge() {
 						}
 					}
 					mergedCount++
-					_ = loraAName
 				}
 			}
 		}
 
-		ti, _ := baseST.GetInfo(name)
-		mergedTensors[name] = gguf.SaveTensor{
-			Data:  baseData,
-			Shape: ti.Shape,
+		if err := w.WriteTensor(baseData); err != nil {
+			log.Fatalf("write tensor %s: %v", m.Name, err)
+		}
+
+		if (i+1)%50 == 0 || i == len(metas)-1 {
+			fmt.Printf("\r  %d/%d tensors written", i+1, len(metas))
 		}
 	}
+	fmt.Println()
+	w.Close()
 
 	fmt.Printf("Merged %d/%d adapted layers\n", mergedCount, nLayers*len(targetModules))
-
-	// Save merged model
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		log.Fatalf("mkdir: %v", err)
-	}
-
-	fmt.Print("Saving merged model... ")
-	outputST := filepath.Join(outputDir, "model.safetensors")
-	if err := gguf.SaveSafeTensors(outputST, mergedTensors); err != nil {
-		log.Fatalf("save: %v", err)
-	}
 
 	// Copy config files
 	for _, f := range []string{"config.json", "tokenizer.json", "tokenizer_config.json",
@@ -178,13 +177,10 @@ func cmdMerge() {
 	if info != nil {
 		fmt.Printf("done. %.1f GB → %s\n", float64(info.Size())/(1024*1024*1024), outputDir)
 	}
-	_ = math.Sqrt // ensure math import used
 }
 
-// isAdaptedWeight checks if a tensor name corresponds to a LoRA-adapted weight.
 func isAdaptedWeight(name string, targets []string) bool {
 	if len(targets) == 0 {
-		// Default targets if no config
 		targets = []string{"q_proj", "k_proj", "v_proj", "o_proj",
 			"gate_proj", "up_proj", "down_proj"}
 	}

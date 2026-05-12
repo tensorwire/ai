@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -30,19 +32,24 @@ func init() {
 // === convert ===
 
 func cmdConvert(format string, args []string) {
-	if format != "gguf" {
-		log.Fatalf("Unknown format: %s (supported: gguf)", format)
+	if format != "gguf" && format != "safetensors" {
+		log.Fatalf("Unknown format: %s (supported: gguf, safetensors)", format)
 	}
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "Usage: ai convert gguf <model-dir> [output.gguf] [--quant f32|q8_0|q4_0]")
+		fmt.Fprintln(os.Stderr, "       ai convert safetensors <model.gguf> [output-dir]")
 		os.Exit(1)
+	}
+
+	if format == "safetensors" {
+		cmdConvertToSafeTensors(args)
+		return
 	}
 
 	modelDir := resolveModel(args[0])
 	outputPath := filepath.Join(modelDir, "model.gguf")
 	quantType := "f32"
 
-	// Parse remaining args
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--quant" && i+1 < len(args) {
 			quantType = args[i+1]
@@ -62,6 +69,88 @@ func cmdConvert(format string, args []string) {
 	fmt.Println("Load in Ollama: ollama create mymodel -f Modelfile")
 }
 
+func cmdConvertToSafeTensors(args []string) {
+	inputPath := args[0]
+	outputDir := ""
+	if len(args) >= 2 {
+		outputDir = args[1]
+	}
+
+	ms, err := OpenModel(inputPath)
+	if err != nil {
+		log.Fatalf("open model: %v", err)
+	}
+
+	if outputDir == "" {
+		base := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+		outputDir = base + "-safetensors"
+	}
+	os.MkdirAll(outputDir, 0755)
+
+	names := ms.TensorNames()
+	if len(names) == 0 {
+		log.Fatal("no tensors found in model")
+	}
+
+	fmt.Printf("Converting %s → %s (%d tensors)\n", inputPath, outputDir, len(names))
+
+	// Collect metadata for streaming writer
+	type tensorEntry struct {
+		name  string
+		elems int
+		shape []int
+	}
+	var entries []tensorEntry
+	var metas []gguf.TensorMeta
+
+	for _, name := range names {
+		data, info, err := ms.ReadTensorFloat32Full(name)
+		if err != nil || data == nil {
+			log.Printf("WARN: skip %s: %v", name, err)
+			continue
+		}
+		shape := info.Shape
+		if len(shape) == 0 {
+			shape = []int{len(data)}
+		}
+		entries = append(entries, tensorEntry{name: name, elems: len(data), shape: shape})
+		metas = append(metas, gguf.TensorMeta{Name: name, Shape: shape, Elems: len(data)})
+	}
+
+	outPath := filepath.Join(outputDir, "model.safetensors")
+	w, err := gguf.NewStreamingSafeTensorsWriter(outPath, metas)
+	if err != nil {
+		log.Fatalf("create output: %v", err)
+	}
+
+	for i, e := range entries {
+		data, _ := ms.ReadTensorFloat32(e.name)
+		if err := w.WriteTensor(data); err != nil {
+			log.Fatalf("write %s: %v", e.name, err)
+		}
+		if (i+1)%50 == 0 || i == len(entries)-1 {
+			fmt.Printf("\r  %d/%d tensors written", i+1, len(entries))
+		}
+	}
+	fmt.Println()
+	w.Close()
+
+	// Copy config.json if available alongside the source
+	srcDir := ms.Dir()
+	for _, f := range []string{"config.json", "tokenizer.json", "tokenizer_config.json",
+		"tokenizer.model", "special_tokens_map.json"} {
+		src := filepath.Join(srcDir, f)
+		if data, err := os.ReadFile(src); err == nil {
+			os.WriteFile(filepath.Join(outputDir, f), data, 0644)
+		}
+	}
+
+	fi, _ := os.Stat(outPath)
+	if fi != nil {
+		fmt.Printf("Done. %.1f GB → %s\n", float64(fi.Size())/(1024*1024*1024), outputDir)
+	}
+}
+
 // === pull ===
 
 func cmdPull(model string) {
@@ -79,12 +168,50 @@ func cmdPull(model string) {
 
 	// First, get the file list from HuggingFace API
 	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s", model)
-	resp, err := http.Get(apiURL)
+	resp, err := hfGet(apiURL)
 	if err != nil {
 		log.Fatalf("Failed to query HuggingFace: %v", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		resp.Body.Close()
+		if hfToken() != "" {
+			fmt.Printf("Access denied for %s — your HuggingFace token doesn't have access to this gated model.\n", model)
+			fmt.Println("Accept the license at: https://huggingface.co/" + model)
+			fmt.Print("Enter a new token (or press Enter to abort): ")
+		} else {
+			fmt.Printf("Access denied for %s — this is a gated model requiring a HuggingFace token.\n", model)
+			fmt.Println("1. Create a token at: https://huggingface.co/settings/tokens")
+			fmt.Println("2. Accept the model license at: https://huggingface.co/" + model)
+			fmt.Print("Paste your HuggingFace token (hf_...): ")
+		}
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() || strings.TrimSpace(scanner.Text()) == "" {
+			log.Fatal("Aborted.")
+		}
+		token := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(token, "hf_") {
+			log.Fatal("Invalid token — must start with hf_")
+		}
+		home, _ := os.UserHomeDir()
+		tokenDir := filepath.Join(home, ".cache", "huggingface")
+		os.MkdirAll(tokenDir, 0700)
+		os.WriteFile(filepath.Join(tokenDir, "token"), []byte(token+"\n"), 0600)
+		fmt.Println("Token saved. Retrying...")
+
+		resp, err = hfGet(apiURL)
+		if err != nil {
+			log.Fatalf("Failed to query HuggingFace: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			log.Fatalf("Still denied — make sure you've accepted the license at: https://huggingface.co/%s", model)
+		}
+		if resp.StatusCode != 200 {
+			log.Fatalf("Model not found: %s (HTTP %d)", model, resp.StatusCode)
+		}
+	}
 	if resp.StatusCode != 200 {
 		log.Fatalf("Model not found: %s (HTTP %d)", model, resp.StatusCode)
 	}
@@ -111,12 +238,31 @@ func cmdPull(model string) {
 		}
 	}
 
+	hasSafeTensors := false
+	for _, name := range wanted {
+		if strings.HasSuffix(name, ".safetensors") {
+			hasSafeTensors = true
+			break
+		}
+	}
+	if !hasSafeTensors {
+		for _, f := range modelInfo.Siblings {
+			name := f.Filename
+			if strings.HasSuffix(name, ".gguf") {
+				wanted = append(wanted, name)
+			}
+		}
+	}
 	if len(wanted) == 0 {
-		log.Fatalf("No safetensors files found in %s", model)
+		log.Fatalf("No model files found in %s (no .safetensors or .gguf)", model)
+	}
+	if !hasSafeTensors {
+		fmt.Println("  (no SafeTensors files — downloading GGUF)")
 	}
 
 	fmt.Printf("Files to download: %d\n", len(wanted))
-	for _, name := range wanted {
+	authRetried := false
+	for i, name := range wanted {
 		destPath := filepath.Join(destDir, name)
 		if _, err := os.Stat(destPath); err == nil {
 			fmt.Printf("  %s (exists, skipping)\n", name)
@@ -127,7 +273,59 @@ func cmdPull(model string) {
 		fmt.Printf("  %s ... ", name)
 
 		err := downloadFile(url, destPath)
-		if err != nil {
+		if err != nil && (strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "401")) && !authRetried {
+			fmt.Println()
+			authRetried = true
+			licenseURL := "https://huggingface.co/" + model
+			tokenURL := "https://huggingface.co/settings/tokens"
+			if hfToken() != "" {
+				fmt.Printf("\nAccess denied — your token doesn't have access to this gated model.\n")
+				fmt.Println("Accept the license at: " + licenseURL)
+				if openBrowser(licenseURL) {
+					fmt.Println("(opened in browser)")
+				}
+				fmt.Print("\nEnter a new token (or press Enter to abort): ")
+			} else {
+				fmt.Printf("\nThis is a gated model requiring a HuggingFace token.\n")
+				fmt.Println("1. Create a token at: " + tokenURL)
+				fmt.Println("2. Accept the model license at: " + licenseURL)
+				if openBrowser(tokenURL) {
+					fmt.Println("(opened in browser)")
+				}
+				fmt.Print("\nPaste your HuggingFace token (hf_...): ")
+			}
+			scanner := bufio.NewScanner(os.Stdin)
+			if !scanner.Scan() || strings.TrimSpace(scanner.Text()) == "" {
+				log.Fatal("Aborted.")
+			}
+			token := strings.TrimSpace(scanner.Text())
+			if !strings.HasPrefix(token, "hf_") {
+				log.Fatal("Invalid token — must start with hf_")
+			}
+			home, _ := os.UserHomeDir()
+			tokenDir := filepath.Join(home, ".cache", "huggingface")
+			os.MkdirAll(tokenDir, 0700)
+			os.WriteFile(filepath.Join(tokenDir, "token"), []byte(token+"\n"), 0600)
+			fmt.Println("Token saved. Retrying downloads...")
+
+			// Retry all files from the beginning
+			for j := 0; j <= i; j++ {
+				rName := wanted[j]
+				rDest := filepath.Join(destDir, rName)
+				if _, err := os.Stat(rDest); err == nil {
+					continue
+				}
+				rURL := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", model, rName)
+				fmt.Printf("  %s ... ", rName)
+				if err := downloadFile(rURL, rDest); err != nil {
+					fmt.Printf("FAILED: %v\n", err)
+				} else {
+					fi, _ := os.Stat(rDest)
+					fmt.Printf("%.1f MB\n", float64(fi.Size())/1024/1024)
+				}
+			}
+			continue
+		} else if err != nil {
 			fmt.Printf("FAILED: %v\n", err)
 		} else {
 			fi, _ := os.Stat(destPath)
@@ -138,9 +336,48 @@ func cmdPull(model string) {
 	fmt.Printf("\nDone. Use: ai info %s\n", filepath.Base(model))
 }
 
+func openBrowser(url string) bool {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		return false
+	}
+	return cmd.Start() == nil
+}
+
+func hfToken() string {
+	home, _ := os.UserHomeDir()
+	for _, p := range []string{
+		filepath.Join(home, ".cache", "huggingface", "token"),
+		filepath.Join(home, ".huggingface", "token"),
+	} {
+		if data, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+	return ""
+}
+
+func hfGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if tok := hfToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return http.DefaultClient.Do(req)
+}
+
 func downloadFile(url, dest string) error {
 	os.MkdirAll(filepath.Dir(dest), 0755)
-	resp, err := http.Get(url)
+	resp, err := hfGet(url)
 	if err != nil {
 		return err
 	}
@@ -176,12 +413,11 @@ func cmdModels() {
 			continue
 		}
 		path := filepath.Join(modelsDir, e.Name())
-		st, err := gguf.OpenSafeTensors(path)
+		ms, err := OpenModel(path)
 		if err != nil {
 			fmt.Printf("  %s (error: %v)\n", e.Name(), err)
 			continue
 		}
-
 		// Try to read config.json for architecture info
 		arch := "unknown"
 		configPath := filepath.Join(path, "config.json")
@@ -195,7 +431,7 @@ func cmdModels() {
 			}
 		}
 
-		fmt.Printf("  %-30s %d tensors  %s\n", e.Name(), len(st.TensorNames), arch)
+		fmt.Printf("  %-30s %d tensors  %s\n", e.Name(), len(ms.TensorNames()), arch)
 	}
 }
 
@@ -204,10 +440,11 @@ func cmdModels() {
 func cmdInfo(model string) {
 	path := resolveModel(model)
 
-	st, err := gguf.OpenSafeTensors(path)
+	ms, err := OpenModel(path)
 	if err != nil {
 		log.Fatalf("Can't open model: %v", err)
 	}
+	st := ms.ST()
 
 	// Read config.json
 	configPath := filepath.Join(path, "config.json")
@@ -217,7 +454,8 @@ func cmdInfo(model string) {
 
 	fmt.Printf("Model: %s\n", model)
 	fmt.Printf("Path:  %s\n", path)
-	fmt.Printf("Tensors: %d\n", len(st.TensorNames))
+	fmt.Printf("Format: %s\n", ms.Format())
+	fmt.Printf("Tensors: %d\n", len(ms.TensorNames()))
 
 	if cfg != nil {
 		if v, ok := cfg["hidden_size"]; ok {
@@ -240,12 +478,13 @@ func cmdInfo(model string) {
 		}
 	}
 
-	// Show first layer's tensors
-	fmt.Println("\nLayer 0 weights:")
-	for _, name := range st.ListTensors("model.layers.0.") {
-		ti, _ := st.GetInfo(name)
-		short := strings.TrimPrefix(name, "model.layers.0.")
-		fmt.Printf("  %-40s %s %v\n", short, ti.Dtype, ti.Shape)
+	if st != nil {
+		fmt.Println("\nLayer 0 weights:")
+		for _, name := range st.ListTensors("model.layers.0.") {
+			ti, _ := st.GetInfo(name)
+			short := strings.TrimPrefix(name, "model.layers.0.")
+			fmt.Printf("  %-40s %s %v\n", short, ti.Dtype, ti.Shape)
+		}
 	}
 }
 
@@ -500,6 +739,28 @@ func softmax(x []float32, n int) {
 
 func silu(x float32) float32 {
 	return x * float32(1.0/(1.0+math.Exp(-float64(x))))
+}
+
+func geluNew(x float32) float32 {
+	xf := float64(x)
+	return float32(0.5 * xf * (1.0 + math.Tanh(math.Sqrt(2.0/math.Pi)*(xf+0.044715*xf*xf*xf))))
+}
+
+func applyRoPEPartial(x []float32, pos, headDim, rotaryDim, numHeads int, theta float32) {
+	half := rotaryDim / 2
+	for h := 0; h < numHeads; h++ {
+		base := h * headDim
+		for i := 0; i < half; i++ {
+			freq := float32(1.0 / math.Pow(float64(theta), float64(2*i)/float64(rotaryDim)))
+			val := float32(pos) * freq
+			cos := float32(math.Cos(float64(val)))
+			sin := float32(math.Sin(float64(val)))
+			x0 := x[base+i]
+			x1 := x[base+half+i]
+			x[base+i] = x0*cos - x1*sin
+			x[base+half+i] = x0*sin + x1*cos
+		}
+	}
 }
 
 func applyRoPE(q, k []float32, pos, headDim int, theta float32, numHeads, numKVHeads int) {

@@ -11,7 +11,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tensorwire/gguf"
 	"github.com/tensorwire/mongoose"
 	"github.com/tensorwire/tokenizer"
 )
@@ -21,6 +20,17 @@ import (
 //   2. GPU-accelerated (Engine.MatMul) — weights streamed, matmul on GPU (Metal/CUDA/WebGPU)
 //   3. CPU fallback — pure Go
 func cmdInferGPU(model string, promptParts []string) {
+	ctxOverride := 0
+	var filtered []string
+	for i := 0; i < len(promptParts); i++ {
+		if promptParts[i] == "--ctx" && i+1 < len(promptParts) {
+			fmt.Sscanf(promptParts[i+1], "%d", &ctxOverride)
+			i++
+		} else {
+			filtered = append(filtered, promptParts[i])
+		}
+	}
+	promptParts = filtered
 	prompt := strings.Join(promptParts, " ")
 	path := resolveModel(model)
 
@@ -44,9 +54,24 @@ func cmdInferGPU(model string, promptParts []string) {
 	kvHeads := getInt("num_key_value_heads", heads)
 	ffnDim := getInt("intermediate_size", 0)
 	vocabSize := getInt("vocab_size", 0)
-	headDim := dim / heads
+	headDim := getInt("head_dim", dim/heads)
 	kvDim := kvHeads * headDim
+	attnDim := heads * headDim
 	maxSeq := getInt("max_position_embeddings", 2048)
+	if ctxOverride > 0 {
+		maxSeq = ctxOverride
+	} else if maxSeq > 8192 {
+		maxSeq = 8192
+	}
+	finalLogitCap := float32(0)
+	if v, ok := cfg["final_logit_softcapping"].(float64); ok {
+		finalLogitCap = float32(v)
+	}
+	attnLogitCap := float32(0)
+	if v, ok := cfg["attn_logit_softcapping"].(float64); ok {
+		attnLogitCap = float32(v)
+	}
+	_ = attnLogitCap
 	ropeTheta := float32(10000.0)
 	if v, ok := cfg["rope_theta"].(float64); ok {
 		ropeTheta = float32(v)
@@ -58,6 +83,49 @@ func cmdInferGPU(model string, promptParts []string) {
 	act := "silu"
 	if v, ok := cfg["hidden_act"].(string); ok {
 		act = v
+	}
+
+	if v, ok := cfg["layer_norm_eps"].(float64); ok && normEps == 1e-6 {
+		normEps = float32(v)
+	}
+	partialRotary := float32(1.0)
+	if v, ok := cfg["partial_rotary_factor"].(float64); ok {
+		partialRotary = float32(v)
+	}
+
+	family := ""
+	if arch, ok := cfg["architectures"].([]interface{}); ok && len(arch) > 0 {
+		family = detectFamily(arch[0].(string))
+	}
+	if mt, ok := cfg["model_type"].(string); ok && family == "" {
+		family = mt
+	}
+
+	gatedMLP := act == "silu" || act == "swiglu"
+	geluGated := false
+	oProjName := "self_attn.o_proj.weight"
+	var mlpWeightNames [3]string
+
+	splitRows := func(data []float32, totalRows, cols, splitAt int) ([]float32, []float32) {
+		a := make([]float32, splitAt*cols)
+		b := make([]float32, (totalRows-splitAt)*cols)
+		copy(a, data[:splitAt*cols])
+		copy(b, data[splitAt*cols:])
+		return a, b
+	}
+	splitRows3 := func(data []float32, totalRows, cols, n1, n2 int) ([]float32, []float32, []float32) {
+		a := make([]float32, n1*cols)
+		b := make([]float32, n2*cols)
+		c := make([]float32, (totalRows-n1-n2)*cols)
+		copy(a, data[:n1*cols])
+		copy(b, data[n1*cols:(n1+n2)*cols])
+		copy(c, data[(n1+n2)*cols:])
+		return a, b, c
+	}
+
+	rotaryDim := headDim
+	if partialRotary < 1.0 {
+		rotaryDim = int(float32(headDim) * partialRotary)
 	}
 
 	if dim == 0 || nLayers == 0 {
@@ -83,9 +151,29 @@ func cmdInferGPU(model string, promptParts []string) {
 		}
 	}
 
-	st, err := gguf.OpenSafeTensors(path)
+	ms, err := OpenModel(path)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("model format not supported for inference — convert with: ai convert safetensors %s", path)
+	}
+
+	fusedQKV := st.HasTensor("model.layers.0.self_attn.qkv_proj.weight")
+	fusedGateUp := st.HasTensor("model.layers.0.mlp.gate_up_proj.weight")
+
+	if !gatedMLP && strings.Contains(act, "gelu") && st.HasTensor("model.layers.0.mlp.gate_proj.weight") {
+		gatedMLP = true
+		geluGated = true
+	}
+	if gatedMLP {
+		mlpWeightNames = [3]string{"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}
+	} else {
+		mlpWeightNames = [3]string{"mlp.fc1.weight", "mlp.fc2.weight", ""}
+		if st.HasTensor("model.layers.0.self_attn.dense.weight") {
+			oProjName = "self_attn.dense.weight"
+		}
 	}
 
 	readWeight := func(name string, expectedRows, expectedCols int) ([]float32, int, int, error) {
@@ -108,11 +196,40 @@ func cmdInferGPU(model string, promptParts []string) {
 		log.Fatalf("tokenizer: %v", err)
 	}
 
-	tokens := tok.Encode(prompt)
+	modelName := strings.ToLower(filepath.Base(path))
+	instructSuffixes := []string{"-instruct", "-chat", "-it", ".instruct", ".chat"}
+	isInstruct := false
+	for _, suffix := range instructSuffixes {
+		if strings.Contains(modelName, suffix) {
+			isInstruct = true
+			break
+		}
+	}
+	rawMode := false
+	if len(promptParts) > 0 && promptParts[0] == "--raw" {
+		rawMode = true
+		promptParts = promptParts[1:]
+		prompt = strings.Join(promptParts, " ")
+	}
+
+	var tokens []int
+	if isInstruct && !rawMode {
+		messages := []chatMessage{{Role: "user", Content: prompt}}
+		tokens = applyChatTemplate(tok, messages, cfg)
+	} else {
+		tokens = tok.Encode(prompt)
+	}
+
+	stopTokens := discoverStopTokens(tok, cfg, path)
+
 	fmt.Printf("Model: %s (dim=%d layers=%d heads=%d kv=%d ffn=%d vocab=%d act=%s)\n",
 		filepath.Base(path), dim, nLayers, heads, kvHeads, ffnDim, vocabSize, act)
 	fmt.Printf("Engine: %s\n", eng.Name())
-	fmt.Printf("Prompt: %q → %d tokens\n", prompt, len(tokens))
+	if isInstruct && !rawMode {
+		fmt.Printf("Prompt: %q → %d tokens (chat template applied)\n", prompt, len(tokens))
+	} else {
+		fmt.Printf("Prompt: %q → %d tokens\n", prompt, len(tokens))
+	}
 
 	// Load embeddings + lm_head
 	fmt.Print("Loading embeddings... ")
@@ -129,17 +246,39 @@ func cmdInferGPU(model string, promptParts []string) {
 	useGPUKernels := false
 
 	type gpuLayer struct {
-		wq, wk, wv, wo    *mongoose.Tensor
-		gate, up, down     *mongoose.Tensor
-		bq, bk, bv         *mongoose.Tensor
-		norm1, norm2       []float32
-		gnorm1, gnorm2     *mongoose.Tensor
+		wq, wk, wv, wo        *mongoose.Tensor
+		gate, up, down         *mongoose.Tensor
+		bq, bk, bv, bo        *mongoose.Tensor
+		bgate, bdown           *mongoose.Tensor
+		norm1, norm2           []float32
+		gnorm1, gnorm2         *mongoose.Tensor
+		norm1bias, norm2bias   *mongoose.Tensor
 	}
 	var gpuLayers []gpuLayer
 	var gpuEmbed, gpuLMHead, gpuFinalNormT *mongoose.Tensor
 	var gpuFinalNorm []float32
 
+	// Estimate total GPU memory for FP32-resident path (weights + KV cache + embed/lmhead + scratch)
+	fp32WeightBytes := int64(vocabSize)*int64(dim)*4*2 + // embed + lmHead on GPU
+		int64(nLayers)*(int64(attnDim)*int64(dim)*4 + int64(kvDim)*int64(dim)*4*2 + int64(dim)*int64(attnDim)*4 + // q,k,v,o
+			int64(ffnDim)*int64(dim)*4*3 + // gate, up, down
+			int64(dim)*4*4) + // norms (up to 4 per layer for gemma)
+		int64(2)*int64(nLayers)*int64(maxSeq)*int64(kvDim)*4 + // KV cache
+		int64(maxSeq)*int64(headDim/2)*4*2 // RoPE tables
+	fp32NeedsGB := float64(fp32WeightBytes) / (1024 * 1024 * 1024)
+
+	skipFP32Resident := false
 	if te != nil {
+		vram := eng.VRAM()
+		vramGB := float64(vram) / (1024 * 1024 * 1024)
+		safeGB := vramGB * 0.85
+		if fp32NeedsGB > safeGB {
+			fmt.Printf("  Model FP32 weights: %.1f GB, GPU VRAM: %.1f GB — skipping FP32 GPU-resident, using Q8/Q4\n", fp32NeedsGB, vramGB)
+			skipFP32Resident = true
+		}
+	}
+
+	if te != nil && !skipFP32Resident {
 		gpuResident = true
 		fmt.Print("Loading weights to GPU... ")
 		gpuLayers = make([]gpuLayer, nLayers)
@@ -156,17 +295,41 @@ func cmdInferGPU(model string, promptParts []string) {
 				data, _, _ := st.ReadTensorFloat32(prefix + name)
 				return data
 			}
-			gpuLayers[l] = gpuLayer{
-				wq:    loadGPU("self_attn.q_proj.weight", dim, dim),
-				wk:    loadGPU("self_attn.k_proj.weight", kvDim, dim),
-				wv:    loadGPU("self_attn.v_proj.weight", kvDim, dim),
-				wo:    loadGPU("self_attn.o_proj.weight", dim, dim),
-				gate:  loadGPU("mlp.gate_proj.weight", ffnDim, dim),
-				up:    loadGPU("mlp.up_proj.weight", ffnDim, dim),
-				down:  loadGPU("mlp.down_proj.weight", dim, ffnDim),
+			gl := gpuLayer{
+				wo:    loadGPU(oProjName, dim, attnDim),
 				norm1: loadCPU("input_layernorm.weight"),
 				norm2: loadCPU("post_attention_layernorm.weight"),
 			}
+			if fusedQKV {
+				qkvData, _, _, _ := readWeight(prefix+"self_attn.qkv_proj.weight", dim+kvDim+kvDim, dim)
+				if qkvData != nil {
+					qD, kD, vD := splitRows3(qkvData, dim+kvDim+kvDim, dim, dim, kvDim)
+					gl.wq = te.FromHost(qD, []int{dim, dim})
+					gl.wk = te.FromHost(kD, []int{kvDim, dim})
+					gl.wv = te.FromHost(vD, []int{kvDim, dim})
+				}
+			} else {
+				gl.wq = loadGPU("self_attn.q_proj.weight", attnDim, dim)
+				gl.wk = loadGPU("self_attn.k_proj.weight", kvDim, dim)
+				gl.wv = loadGPU("self_attn.v_proj.weight", kvDim, dim)
+			}
+			if fusedGateUp {
+				guData, _, _, _ := readWeight(prefix+"mlp.gate_up_proj.weight", ffnDim*2, dim)
+				if guData != nil {
+					gD, uD := splitRows(guData, ffnDim*2, dim, ffnDim)
+					gl.gate = te.FromHost(gD, []int{ffnDim, dim})
+					gl.up = te.FromHost(uD, []int{ffnDim, dim})
+				}
+				gl.down = loadGPU("mlp.down_proj.weight", dim, ffnDim)
+			} else if gatedMLP {
+				gl.gate = loadGPU(mlpWeightNames[0], ffnDim, dim)
+				gl.up = loadGPU(mlpWeightNames[1], ffnDim, dim)
+				gl.down = loadGPU(mlpWeightNames[2], dim, ffnDim)
+			} else {
+				gl.gate = loadGPU(mlpWeightNames[0], ffnDim, dim)
+				gl.down = loadGPU(mlpWeightNames[1], dim, ffnDim)
+			}
+			gpuLayers[l] = gl
 			gpuLayers[l].gnorm1 = te.FromHost(gpuLayers[l].norm1, []int{1, dim})
 			gpuLayers[l].gnorm2 = te.FromHost(gpuLayers[l].norm2, []int{1, dim})
 			if bq, _, e := st.ReadTensorFloat32(prefix + "self_attn.q_proj.bias"); e == nil {
@@ -178,38 +341,63 @@ func cmdInferGPU(model string, promptParts []string) {
 			if bv, _, e := st.ReadTensorFloat32(prefix + "self_attn.v_proj.bias"); e == nil {
 				gpuLayers[l].bv = te.FromHost(bv, []int{1, kvDim})
 			}
+			oBiasName := strings.TrimSuffix(oProjName, ".weight") + ".bias"
+			if bo, _, e := st.ReadTensorFloat32(prefix + oBiasName); e == nil {
+				gpuLayers[l].bo = te.FromHost(bo, []int{1, dim})
+			}
+			if bg, _, e := st.ReadTensorFloat32(prefix + strings.TrimSuffix(mlpWeightNames[0], ".weight") + ".bias"); e == nil {
+				gpuLayers[l].bgate = te.FromHost(bg, []int{1, ffnDim})
+			}
+			fc2BiasName := mlpWeightNames[1]
+			if !gatedMLP { fc2BiasName = mlpWeightNames[1] }
+			if gatedMLP { fc2BiasName = mlpWeightNames[2] }
+			if bd, _, e := st.ReadTensorFloat32(prefix + strings.TrimSuffix(fc2BiasName, ".weight") + ".bias"); e == nil {
+				gpuLayers[l].bdown = te.FromHost(bd, []int{1, dim})
+			}
+			if nb, _, e := st.ReadTensorFloat32(prefix + "input_layernorm.bias"); e == nil {
+				gpuLayers[l].norm1bias = te.FromHost(nb, []int{1, dim})
+			}
+			if nb, _, e := st.ReadTensorFloat32(prefix + "post_attention_layernorm.bias"); e == nil {
+				gpuLayers[l].norm2bias = te.FromHost(nb, []int{1, dim})
+			}
 			fmt.Printf("\r  Layer %d/%d loaded", l+1, nLayers)
 		}
 		gpuEmbed = te.FromHost(embedData, []int{vocabSize, dim})
 		gpuLMHead = te.FromHost(lmHeadData, []int{vocabSize, dim})
 		gpuFinalNorm, _, _ = st.ReadTensorFloat32("model.norm.weight")
-		gpuFinalNormT = te.FromHost(gpuFinalNorm, []int{1, dim})
+		if gpuFinalNorm == nil {
+			gpuFinalNorm, _, _ = st.ReadTensorFloat32("model.final_layernorm.weight")
+		}
+		if gpuFinalNorm != nil {
+			gpuFinalNormT = te.FromHost(gpuFinalNorm, []int{1, dim})
+		}
 		fmt.Println(" — all weights on GPU")
 
 		useGPUKernels = mongoose.TrainKernelsLoaded() && mongoose.KernelsLoaded()
 	}
 
 	// RoPE tables
-	halfHead := headDim / 2
+	halfHead := rotaryDim / 2
 	cosTab := make([]float32, maxSeq*halfHead)
 	sinTab := make([]float32, maxSeq*halfHead)
 	for pos := 0; pos < maxSeq; pos++ {
 		for j := 0; j < halfHead; j++ {
-			freq := 1.0 / math.Pow(float64(ropeTheta), float64(2*j)/float64(headDim))
+			freq := 1.0 / math.Pow(float64(ropeTheta), float64(2*j)/float64(rotaryDim))
 			angle := float64(pos) * freq
 			cosTab[pos*halfHead+j] = float32(math.Cos(angle))
 			sinTab[pos*halfHead+j] = float32(math.Sin(angle))
 		}
 	}
 
-	// GPU RoPE tables + KV cache (only for fully GPU-resident path)
+	// GPU RoPE tables + KV cache (needed for GPU-resident and Q8/Q4 paths)
 	var gpuRopeCos, gpuRopeSin *mongoose.Tensor
 	type gpuKVCache struct {
 		k, v *mongoose.Tensor
 	}
 	var gpuKV []gpuKVCache
 
-	if useGPUKernels && gpuResident {
+	needsGPUKV := (useGPUKernels && gpuResident) || (te != nil && mongoose.HasQ8Matvec() && mongoose.KernelsLoaded())
+	if needsGPUKV {
 		gpuRopeCos = te.FromHost(cosTab, []int{maxSeq, halfHead})
 		gpuRopeSin = te.FromHost(sinTab, []int{maxSeq, halfHead})
 		gpuKV = make([]gpuKVCache, nLayers)
@@ -219,14 +407,25 @@ func cmdInferGPU(model string, promptParts []string) {
 				v: te.Zeros([]int{maxSeq, kvDim}),
 			}
 		}
+	}
+
+	if useGPUKernels && gpuResident {
 		fmt.Println("  infer: GPU-resident (KV cache + RoPE in VRAM)")
 	} else if gpuResident {
 		fmt.Println("  infer: GPU-accelerated (weights in VRAM, attention on CPU)")
-	} else {
+	} else if !needsGPUKV {
 		fmt.Println("  infer: CPU (streaming weights)")
 	}
 
 	// CPU state buffers (used by tier 2 and 3)
+	softcapLogits := func(logits []float32) {
+		if finalLogitCap > 0 {
+			for i := range logits {
+				logits[i] = finalLogitCap * float32(math.Tanh(float64(logits[i]/finalLogitCap)))
+			}
+		}
+	}
+
 	x := make([]float32, dim)
 	buf := make([]float32, dim)
 	q := make([]float32, dim)
@@ -289,11 +488,14 @@ func cmdInferGPU(model string, promptParts []string) {
 
 			normed := te.Zeros([]int{1, dim})
 			mongoose.KRMSNormOut(xGPU.DevicePtr(), normed.DevicePtr(), gl.gnorm1.DevicePtr(), 1, dim)
+			if gl.norm1bias != nil { te.AddInPlace(normed, gl.norm1bias) }
 
-			tQ := te.MatMulTransposeBT(normed, gl.wq, 1, dim, dim)
+			tQ := te.MatMulTransposeBT(normed, gl.wq, 1, dim, attnDim)
 			tK := te.MatMulTransposeBT(normed, gl.wk, 1, dim, kvDim)
 			tV := te.MatMulTransposeBT(normed, gl.wv, 1, dim, kvDim)
-			te.Release(normed)
+			if gl.gnorm2 != nil {
+				te.Release(normed)
+			}
 
 			if gl.bq != nil {
 				te.AddInPlace(tQ, gl.bq)
@@ -305,10 +507,21 @@ func cmdInferGPU(model string, promptParts []string) {
 				te.AddInPlace(tV, gl.bv)
 			}
 
-			cosOff := unsafe.Add(gpuRopeCos.DevicePtr(), uintptr(pos*halfHead*4))
-			sinOff := unsafe.Add(gpuRopeSin.DevicePtr(), uintptr(pos*halfHead*4))
-			mongoose.KRoPE(tQ.DevicePtr(), cosOff, sinOff, 1, dim, headDim, heads)
-			mongoose.KRoPE(tK.DevicePtr(), cosOff, sinOff, 1, kvDim, headDim, kvHeads)
+			if rotaryDim == headDim {
+				cosOff := unsafe.Add(gpuRopeCos.DevicePtr(), uintptr(pos*halfHead*4))
+				sinOff := unsafe.Add(gpuRopeSin.DevicePtr(), uintptr(pos*halfHead*4))
+				mongoose.KRoPE(tQ.DevicePtr(), cosOff, sinOff, 1, dim, headDim, heads)
+				mongoose.KRoPE(tK.DevicePtr(), cosOff, sinOff, 1, kvDim, headDim, kvHeads)
+			} else {
+				qHost := te.ToHost(tQ)
+				kHost := te.ToHost(tK)
+				applyRoPEPartial(qHost, pos, headDim, rotaryDim, heads, ropeTheta)
+				applyRoPEPartial(kHost, pos, headDim, rotaryDim, kvHeads, ropeTheta)
+				te.Release(tQ)
+				te.Release(tK)
+				tQ = te.FromHost(qHost, []int{1, dim})
+				tK = te.FromHost(kHost, []int{1, kvDim})
+			}
 
 			kv := &gpuKV[l]
 			mongoose.KCopy(
@@ -320,32 +533,65 @@ func cmdInferGPU(model string, promptParts []string) {
 			te.Release(tK)
 			te.Release(tV)
 
-			tAttnOut := te.Zeros([]int{1, dim})
+			tAttnOut := te.Zeros([]int{1, attnDim})
 			mongoose.KDecodeAttention(tQ.DevicePtr(), kv.k.DevicePtr(), kv.v.DevicePtr(),
-				tAttnOut.DevicePtr(), pos+1, dim, kvDim, heads, kvHeads)
+				tAttnOut.DevicePtr(), pos+1, attnDim, kvDim, heads, kvHeads)
 			te.Release(tQ)
 
-			tProj := te.MatMulTransposeBT(tAttnOut, gl.wo, 1, dim, dim)
+			tProj := te.MatMulTransposeBT(tAttnOut, gl.wo, 1, attnDim, dim)
 			te.Release(tAttnOut)
+			if gl.bo != nil { te.AddInPlace(tProj, gl.bo) }
 			te.AddInPlace(xGPU, tProj)
 			te.Release(tProj)
 
-			normed2 := te.Zeros([]int{1, dim})
-			mongoose.KRMSNormOut(xGPU.DevicePtr(), normed2.DevicePtr(), gl.gnorm2.DevicePtr(), 1, dim)
+			var normed2 *mongoose.Tensor
+			if gl.gnorm2 != nil {
+				normed2 = te.Zeros([]int{1, dim})
+				mongoose.KRMSNormOut(xGPU.DevicePtr(), normed2.DevicePtr(), gl.gnorm2.DevicePtr(), 1, dim)
+				if gl.norm2bias != nil { te.AddInPlace(normed2, gl.norm2bias) }
+			} else {
+				normed2 = normed
+			}
 
-			tGate := te.MatMulTransposeBT(normed2, gl.gate, 1, dim, ffnDim)
-			tUp := te.MatMulTransposeBT(normed2, gl.up, 1, dim, ffnDim)
-			te.Release(normed2)
+			if gatedMLP {
+				tGate := te.MatMulTransposeBT(normed2, gl.gate, 1, dim, ffnDim)
+				tUp := te.MatMulTransposeBT(normed2, gl.up, 1, dim, ffnDim)
+				if gl.gnorm2 != nil { te.Release(normed2) } else { te.Release(normed) }
 
-			ffnMid := te.Zeros([]int{1, ffnDim})
-			mongoose.KSiLUGateMul(tGate.DevicePtr(), tUp.DevicePtr(), ffnMid.DevicePtr(), ffnDim)
-			te.Release(tGate)
-			te.Release(tUp)
+				var ffnMid *mongoose.Tensor
+				if geluGated {
+					gH := te.ToHost(tGate)
+					uH := te.ToHost(tUp)
+					te.Release(tGate)
+					te.Release(tUp)
+					for i := range gH { gH[i] = geluNew(gH[i]) * uH[i] }
+					ffnMid = te.FromHost(gH, []int{1, ffnDim})
+				} else {
+					ffnMid = te.Zeros([]int{1, ffnDim})
+					mongoose.KSiLUGateMul(tGate.DevicePtr(), tUp.DevicePtr(), ffnMid.DevicePtr(), ffnDim)
+					te.Release(tGate)
+					te.Release(tUp)
+				}
 
-			tDown := te.MatMulTransposeBT(ffnMid, gl.down, 1, ffnDim, dim)
-			te.Release(ffnMid)
-			te.AddInPlace(xGPU, tDown)
-			te.Release(tDown)
+				tDown := te.MatMulTransposeBT(ffnMid, gl.down, 1, ffnDim, dim)
+				te.Release(ffnMid)
+				if gl.bdown != nil { te.AddInPlace(tDown, gl.bdown) }
+				te.AddInPlace(xGPU, tDown)
+				te.Release(tDown)
+			} else {
+				tFC1 := te.MatMulTransposeBT(normed2, gl.gate, 1, dim, ffnDim)
+				if gl.gnorm2 != nil { te.Release(normed2) } else { te.Release(normed) }
+				if gl.bgate != nil { te.AddInPlace(tFC1, gl.bgate) }
+				fc1Host := te.ToHost(tFC1)
+				for i := range fc1Host { fc1Host[i] = geluNew(fc1Host[i]) }
+				te.Release(tFC1)
+				tAct := te.FromHost(fc1Host, []int{1, ffnDim})
+				tFC2 := te.MatMulTransposeBT(tAct, gl.down, 1, ffnDim, dim)
+				te.Release(tAct)
+				if gl.bdown != nil { te.AddInPlace(tFC2, gl.bdown) }
+				te.AddInPlace(xGPU, tFC2)
+				te.Release(tFC2)
+			}
 		}
 
 		mongoose.KRMSNorm(xGPU.DevicePtr(), gpuFinalNormT.DevicePtr(), 1, dim)
@@ -355,6 +601,7 @@ func cmdInferGPU(model string, promptParts []string) {
 
 		logits := te.ToHost(tLogits)
 		te.Release(tLogits)
+		softcapLogits(logits)
 		return logits
 	}
 
@@ -367,10 +614,31 @@ func cmdInferGPU(model string, promptParts []string) {
 		_ = cuda
 
 		nParams := int64(vocabSize)*int64(dim)*2 // embed + lmHead
+		nRows := int64(vocabSize)*2
 		for l := 0; l < nLayers; l++ {
 			nParams += int64(dim)*int64(dim)*2 + int64(kvDim)*int64(dim)*2 + int64(ffnDim)*int64(dim)*3
+			nRows += int64(dim)*2 + int64(kvDim)*2 + int64(ffnDim)*3
 		}
-		cudaUseQ4 = mongoose.HasQ4Matvec() && nParams > 4_000_000_000
+		// Q8: 1 byte/param + 4 bytes/row (scale), Q4: 0.5 bytes/param + 4 bytes/row
+		q8Bytes := nParams + nRows*4
+		q4Bytes := nParams/2 + nRows*4
+		kvBytes := int64(2) * int64(nLayers) * int64(maxSeq) * int64(kvDim) * 4
+		scratchBytes := int64(dim+ffnDim) * 4 * 20 // activation buffers
+
+		vram := int64(eng.VRAM())
+
+		q8Total := q8Bytes + kvBytes + scratchBytes
+		q4Total := q4Bytes + kvBytes + scratchBytes
+
+		// Always prefer Q8 for quality. Only use Q4 if Q8 clearly won't fit.
+		// Use a generous margin because actual allocations include padding and alignment.
+		if mongoose.HasQ4Matvec() && q8Total > vram && q4Total <= vram {
+			cudaUseQ4 = true
+		} else if mongoose.HasQ4Matvec() && q8Total > vram && q4Total > vram {
+			cudaUseQ4 = true
+			fmt.Printf("  WARNING: model may not fit in VRAM even at Q4 (need %.1f GB, have %.1f GB)\n",
+				float64(q4Total)/(1024*1024*1024), float64(vram)/(1024*1024*1024))
+		}
 
 		type q8Weight struct {
 			data   unsafe.Pointer // int8 or packed uint8 on GPU
@@ -459,10 +727,12 @@ func cmdInferGPU(model string, promptParts []string) {
 		}
 
 		type q8Layer struct {
-			wq, wk, wv, wo    q8Weight
-			gate, up, down     q8Weight
-			bq, bk, bv         *mongoose.Tensor
-			gnorm1, gnorm2     *mongoose.Tensor
+			wq, wk, wv, wo        q8Weight
+			gate, up, down         q8Weight
+			bq, bk, bv, bo        *mongoose.Tensor
+			bgate, bdown           *mongoose.Tensor
+			gnorm1, gnorm2         *mongoose.Tensor
+			norm1bias, norm2bias   *mongoose.Tensor
 		}
 
 		qLabel := "Q8"
@@ -472,28 +742,102 @@ func cmdInferGPU(model string, promptParts []string) {
 		fmt.Printf("Quantizing weights to %s (%.1fB params)... ", qLabel, float64(nParams)/1e9)
 		q8Layers := make([]q8Layer, nLayers)
 		for l := 0; l < nLayers; l++ {
-			gl := &gpuLayers[l]
 			q8l := &q8Layers[l]
-			q8l.gnorm1 = gl.gnorm1
-			q8l.gnorm2 = gl.gnorm2
-			q8l.bq = gl.bq
-			q8l.bk = gl.bk
-			q8l.bv = gl.bv
-
 			prefix := fmt.Sprintf("model.layers.%d.", l)
+
+			if l < len(gpuLayers) {
+				gl := &gpuLayers[l]
+				q8l.gnorm1 = gl.gnorm1
+				q8l.gnorm2 = gl.gnorm2
+				q8l.bq = gl.bq
+				q8l.bk = gl.bk
+				q8l.bv = gl.bv
+				q8l.bo = gl.bo
+				q8l.bgate = gl.bgate
+				q8l.bdown = gl.bdown
+				q8l.norm1bias = gl.norm1bias
+				q8l.norm2bias = gl.norm2bias
+			} else {
+				n1, _, _ := st.ReadTensorFloat32(prefix + "input_layernorm.weight")
+				n2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
+				if n1 != nil { q8l.gnorm1 = te.FromHost(n1, []int{1, dim}) }
+				if n2 != nil { q8l.gnorm2 = te.FromHost(n2, []int{1, dim}) }
+				if bq, _, e := st.ReadTensorFloat32(prefix + "self_attn.q_proj.bias"); e == nil {
+					q8l.bq = te.FromHost(bq, []int{1, dim})
+				}
+				if bk, _, e := st.ReadTensorFloat32(prefix + "self_attn.k_proj.bias"); e == nil {
+					q8l.bk = te.FromHost(bk, []int{1, kvDim})
+				}
+				if bv, _, e := st.ReadTensorFloat32(prefix + "self_attn.v_proj.bias"); e == nil {
+					q8l.bv = te.FromHost(bv, []int{1, kvDim})
+				}
+				oBiasName := strings.TrimSuffix(oProjName, ".weight") + ".bias"
+				if bo, _, e := st.ReadTensorFloat32(prefix + oBiasName); e == nil {
+					q8l.bo = te.FromHost(bo, []int{1, dim})
+				}
+				if bg, _, e := st.ReadTensorFloat32(prefix + strings.TrimSuffix(mlpWeightNames[0], ".weight") + ".bias"); e == nil {
+					q8l.bgate = te.FromHost(bg, []int{1, ffnDim})
+				}
+				fc2BiasName := mlpWeightNames[1]
+				if gatedMLP { fc2BiasName = mlpWeightNames[2] }
+				if bd, _, e := st.ReadTensorFloat32(prefix + strings.TrimSuffix(fc2BiasName, ".weight") + ".bias"); e == nil {
+					q8l.bdown = te.FromHost(bd, []int{1, dim})
+				}
+				if nb, _, e := st.ReadTensorFloat32(prefix + "input_layernorm.bias"); e == nil {
+					q8l.norm1bias = te.FromHost(nb, []int{1, dim})
+				}
+				if nb, _, e := st.ReadTensorFloat32(prefix + "post_attention_layernorm.bias"); e == nil {
+					q8l.norm2bias = te.FromHost(nb, []int{1, dim})
+				}
+			}
+
 			loadQ8 := func(name string, rows, cols int) q8Weight {
 				data, _, _, _ := readWeight(prefix+name, rows, cols)
 				return quantizeToGPU(data, rows, cols)
 			}
-			q8l.wq = loadQ8("self_attn.q_proj.weight", dim, dim)
-			q8l.wk = loadQ8("self_attn.k_proj.weight", kvDim, dim)
-			q8l.wv = loadQ8("self_attn.v_proj.weight", kvDim, dim)
-			q8l.wo = loadQ8("self_attn.o_proj.weight", dim, dim)
-			q8l.gate = loadQ8("mlp.gate_proj.weight", ffnDim, dim)
-			q8l.up = loadQ8("mlp.up_proj.weight", ffnDim, dim)
-			q8l.down = loadQ8("mlp.down_proj.weight", dim, ffnDim)
+			if fusedQKV {
+				qkvData, _, _, _ := readWeight(prefix+"self_attn.qkv_proj.weight", dim+kvDim+kvDim, dim)
+				if qkvData != nil {
+					qD, kD, vD := splitRows3(qkvData, dim+kvDim+kvDim, dim, dim, kvDim)
+					q8l.wq = quantizeToGPU(qD, attnDim, dim)
+					q8l.wk = quantizeToGPU(kD, kvDim, dim)
+					q8l.wv = quantizeToGPU(vD, kvDim, dim)
+				}
+			} else {
+				q8l.wq = loadQ8("self_attn.q_proj.weight", attnDim, dim)
+				q8l.wk = loadQ8("self_attn.k_proj.weight", kvDim, dim)
+				q8l.wv = loadQ8("self_attn.v_proj.weight", kvDim, dim)
+			}
+			q8l.wo = loadQ8(oProjName, dim, attnDim)
+			if fusedGateUp {
+				guData, _, _, _ := readWeight(prefix+"mlp.gate_up_proj.weight", ffnDim*2, dim)
+				if guData != nil {
+					gD, uD := splitRows(guData, ffnDim*2, dim, ffnDim)
+					q8l.gate = quantizeToGPU(gD, ffnDim, dim)
+					q8l.up = quantizeToGPU(uD, ffnDim, dim)
+				}
+				q8l.down = loadQ8("mlp.down_proj.weight", dim, ffnDim)
+			} else if gatedMLP {
+				q8l.gate = loadQ8(mlpWeightNames[0], ffnDim, dim)
+				q8l.up = loadQ8(mlpWeightNames[1], ffnDim, dim)
+				q8l.down = loadQ8(mlpWeightNames[2], dim, ffnDim)
+			} else {
+				q8l.gate = loadQ8(mlpWeightNames[0], ffnDim, dim)
+				q8l.down = loadQ8(mlpWeightNames[1], dim, ffnDim)
+			}
+			fmt.Printf("\r  Layer %d/%d quantized to %s", l+1, nLayers, qLabel)
 		}
+		fmt.Println()
 		q8LMHead := quantizeToGPU(lmHeadData, vocabSize, dim)
+		if gpuFinalNormT == nil {
+			fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+			if fnorm == nil {
+				fnorm, _, _ = st.ReadTensorFloat32("model.final_layernorm.weight")
+			}
+			if fnorm != nil {
+				gpuFinalNormT = te.FromHost(fnorm, []int{1, dim})
+			}
+		}
 		fmt.Println("done")
 
 		useCUDAQ8 = true
@@ -506,26 +850,39 @@ func cmdInferGPU(model string, promptParts []string) {
 			}
 		}
 
+		embedScale := float32(0)
+		if family == "gemma" || family == "gemma2" {
+			embedScale = float32(math.Sqrt(float64(dim)))
+		}
+
 		gpuForwardQ8 = func(tokenID, pos int) []float32 {
 			tokOff := tokenID * dim
 			if tokOff+dim > len(embedData) {
 				return nil
 			}
-			xGPU := te.FromHost(embedData[tokOff:tokOff+dim], []int{1, dim})
+			emb := make([]float32, dim)
+			copy(emb, embedData[tokOff:tokOff+dim])
+			if embedScale > 0 {
+				for i := range emb { emb[i] *= embedScale }
+			}
+			xGPU := te.FromHost(emb, []int{1, dim})
 
 			for l := 0; l < nLayers; l++ {
 				ql := &q8Layers[l]
 
 				normed := te.Zeros([]int{1, dim})
 				mongoose.KRMSNormOut(xGPU.DevicePtr(), normed.DevicePtr(), ql.gnorm1.DevicePtr(), 1, dim)
+				if ql.norm1bias != nil { te.AddInPlace(normed, ql.norm1bias) }
 
-				tQ := te.Zeros([]int{1, dim})
+				tQ := te.Zeros([]int{1, attnDim})
 				tK := te.Zeros([]int{1, kvDim})
 				tV := te.Zeros([]int{1, kvDim})
 				q8MV(normed.DevicePtr(), ql.wq, tQ.DevicePtr())
 				q8MV(normed.DevicePtr(), ql.wk, tK.DevicePtr())
 				q8MV(normed.DevicePtr(), ql.wv, tV.DevicePtr())
-				te.Release(normed)
+				if ql.gnorm2 != nil {
+					te.Release(normed)
+				}
 
 				if ql.bq != nil {
 					te.AddInPlace(tQ, ql.bq)
@@ -537,10 +894,21 @@ func cmdInferGPU(model string, promptParts []string) {
 					te.AddInPlace(tV, ql.bv)
 				}
 
-				cosOff := unsafe.Add(gpuRopeCos.DevicePtr(), uintptr(pos*halfHead*4))
-				sinOff := unsafe.Add(gpuRopeSin.DevicePtr(), uintptr(pos*halfHead*4))
-				mongoose.KRoPE(tQ.DevicePtr(), cosOff, sinOff, 1, dim, headDim, heads)
-				mongoose.KRoPE(tK.DevicePtr(), cosOff, sinOff, 1, kvDim, headDim, kvHeads)
+				if rotaryDim == headDim {
+					cosOff := unsafe.Add(gpuRopeCos.DevicePtr(), uintptr(pos*halfHead*4))
+					sinOff := unsafe.Add(gpuRopeSin.DevicePtr(), uintptr(pos*halfHead*4))
+					mongoose.KRoPE(tQ.DevicePtr(), cosOff, sinOff, 1, dim, headDim, heads)
+					mongoose.KRoPE(tK.DevicePtr(), cosOff, sinOff, 1, kvDim, headDim, kvHeads)
+				} else {
+					qHost := te.ToHost(tQ)
+					kHost := te.ToHost(tK)
+					applyRoPEPartial(qHost, pos, headDim, rotaryDim, heads, ropeTheta)
+					applyRoPEPartial(kHost, pos, headDim, rotaryDim, kvHeads, ropeTheta)
+					te.Release(tQ)
+					te.Release(tK)
+					tQ = te.FromHost(qHost, []int{1, dim})
+					tK = te.FromHost(kHost, []int{1, kvDim})
+				}
 
 				kv := &gpuKV[l]
 				mongoose.KCopy(
@@ -552,36 +920,70 @@ func cmdInferGPU(model string, promptParts []string) {
 				te.Release(tK)
 				te.Release(tV)
 
-				tAttnOut := te.Zeros([]int{1, dim})
+				tAttnOut := te.Zeros([]int{1, attnDim})
 				mongoose.KDecodeAttention(tQ.DevicePtr(), kv.k.DevicePtr(), kv.v.DevicePtr(),
-					tAttnOut.DevicePtr(), pos+1, dim, kvDim, heads, kvHeads)
+					tAttnOut.DevicePtr(), pos+1, attnDim, kvDim, heads, kvHeads)
 				te.Release(tQ)
 
 				tProj := te.Zeros([]int{1, dim})
 				q8MV(tAttnOut.DevicePtr(), ql.wo, tProj.DevicePtr())
 				te.Release(tAttnOut)
+				if ql.bo != nil { te.AddInPlace(tProj, ql.bo) }
 				te.AddInPlace(xGPU, tProj)
 				te.Release(tProj)
 
-				normed2 := te.Zeros([]int{1, dim})
-				mongoose.KRMSNormOut(xGPU.DevicePtr(), normed2.DevicePtr(), ql.gnorm2.DevicePtr(), 1, dim)
+				var normed2 *mongoose.Tensor
+				if ql.gnorm2 != nil {
+					normed2 = te.Zeros([]int{1, dim})
+					mongoose.KRMSNormOut(xGPU.DevicePtr(), normed2.DevicePtr(), ql.gnorm2.DevicePtr(), 1, dim)
+					if ql.norm2bias != nil { te.AddInPlace(normed2, ql.norm2bias) }
+				} else {
+					normed2 = normed
+				}
 
-				tGate := te.Zeros([]int{1, ffnDim})
-				tUp := te.Zeros([]int{1, ffnDim})
-				q8MV(normed2.DevicePtr(), ql.gate, tGate.DevicePtr())
-				q8MV(normed2.DevicePtr(), ql.up, tUp.DevicePtr())
-				te.Release(normed2)
+				if gatedMLP {
+					tGate := te.Zeros([]int{1, ffnDim})
+					tUp := te.Zeros([]int{1, ffnDim})
+					q8MV(normed2.DevicePtr(), ql.gate, tGate.DevicePtr())
+					q8MV(normed2.DevicePtr(), ql.up, tUp.DevicePtr())
+					if ql.gnorm2 != nil { te.Release(normed2) } else { te.Release(normed) }
 
-				ffnMid := te.Zeros([]int{1, ffnDim})
-				mongoose.KSiLUGateMul(tGate.DevicePtr(), tUp.DevicePtr(), ffnMid.DevicePtr(), ffnDim)
-				te.Release(tGate)
-				te.Release(tUp)
+					var ffnMid *mongoose.Tensor
+					if geluGated {
+						gH := te.ToHost(tGate)
+						uH := te.ToHost(tUp)
+						te.Release(tGate)
+						te.Release(tUp)
+						for i := range gH { gH[i] = geluNew(gH[i]) * uH[i] }
+						ffnMid = te.FromHost(gH, []int{1, ffnDim})
+					} else {
+						ffnMid = te.Zeros([]int{1, ffnDim})
+						mongoose.KSiLUGateMul(tGate.DevicePtr(), tUp.DevicePtr(), ffnMid.DevicePtr(), ffnDim)
+						te.Release(tGate)
+						te.Release(tUp)
+					}
 
-				tDown := te.Zeros([]int{1, dim})
-				q8MV(ffnMid.DevicePtr(), ql.down, tDown.DevicePtr())
-				te.Release(ffnMid)
-				te.AddInPlace(xGPU, tDown)
-				te.Release(tDown)
+					tDown := te.Zeros([]int{1, dim})
+					q8MV(ffnMid.DevicePtr(), ql.down, tDown.DevicePtr())
+					te.Release(ffnMid)
+					te.AddInPlace(xGPU, tDown)
+					te.Release(tDown)
+				} else {
+					tFC1 := te.Zeros([]int{1, ffnDim})
+					q8MV(normed2.DevicePtr(), ql.gate, tFC1.DevicePtr())
+					if ql.gnorm2 != nil { te.Release(normed2) } else { te.Release(normed) }
+					if ql.bgate != nil { te.AddInPlace(tFC1, ql.bgate) }
+					fc1Host := te.ToHost(tFC1)
+					for i := range fc1Host { fc1Host[i] = geluNew(fc1Host[i]) }
+					te.Release(tFC1)
+					tAct := te.FromHost(fc1Host, []int{1, ffnDim})
+					tFC2 := te.Zeros([]int{1, dim})
+					q8MV(tAct.DevicePtr(), ql.down, tFC2.DevicePtr())
+					te.Release(tAct)
+					if ql.bdown != nil { te.AddInPlace(tFC2, ql.bdown) }
+					te.AddInPlace(xGPU, tFC2)
+					te.Release(tFC2)
+				}
 			}
 
 			mongoose.KRMSNorm(xGPU.DevicePtr(), gpuFinalNormT.DevicePtr(), 1, dim)
@@ -658,13 +1060,18 @@ func cmdInferGPU(model string, promptParts []string) {
 					}
 				}
 
-				applyRoPE(q, k[:kvDim], pos, headDim, ropeTheta, heads, kvHeads)
+				if rotaryDim == headDim {
+					applyRoPE(q, k[:kvDim], pos, headDim, ropeTheta, heads, kvHeads)
+				} else {
+					applyRoPEPartial(q, pos, headDim, rotaryDim, heads, ropeTheta)
+					applyRoPEPartial(k[:kvDim], pos, headDim, rotaryDim, kvHeads, ropeTheta)
+				}
 
 				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], k[:kvDim])
 				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], v[:kvDim])
 
 				kvMul := heads / kvHeads
-				for i := range attnOut[:dim] {
+				for i := range attnOut[:attnDim] {
 					attnOut[i] = 0
 				}
 				for h := 0; h < heads; h++ {
@@ -722,12 +1129,28 @@ func cmdInferGPU(model string, promptParts []string) {
 				normW, _, _ := st.ReadTensorFloat32(prefix + "input_layernorm.weight")
 				copy(buf, x)
 				rmsNorm(buf, normW, normEps)
+				normedBuf := make([]float32, dim)
+				copy(normedBuf, buf)
 
-				wq, qRows, qCols, _ := readWeight(prefix+"self_attn.q_proj.weight", dim, dim)
-				wk, kRows, kCols, _ := readWeight(prefix+"self_attn.k_proj.weight", kvDim, dim)
-				wv, vRows, vCols, _ := readWeight(prefix+"self_attn.v_proj.weight", kvDim, dim)
+				var wq, wk, wv []float32
+				var qRows, qCols, kRows, kCols, vRows, vCols int
+				if fusedQKV {
+					qkvData, _, _, _ := readWeight(prefix+"self_attn.qkv_proj.weight", attnDim+kvDim+kvDim, dim)
+					if qkvData != nil {
+						wq = qkvData[:attnDim*dim]
+						wk = qkvData[attnDim*dim : (attnDim+kvDim)*dim]
+						wv = qkvData[(attnDim+kvDim)*dim:]
+						qRows, qCols = attnDim, dim
+						kRows, kCols = kvDim, dim
+						vRows, vCols = kvDim, dim
+					}
+				} else {
+					wq, qRows, qCols, _ = readWeight(prefix+"self_attn.q_proj.weight", attnDim, dim)
+					wk, kRows, kCols, _ = readWeight(prefix+"self_attn.k_proj.weight", kvDim, dim)
+					wv, vRows, vCols, _ = readWeight(prefix+"self_attn.v_proj.weight", kvDim, dim)
+				}
 
-				streamMatVec(q, wq, buf, qRows, qCols)
+				streamMatVec(q[:attnDim], wq, buf, qRows, qCols)
 				streamMatVec(k[:kvDim], wk, buf, kRows, kCols)
 				streamMatVec(v[:kvDim], wv, buf, vRows, vCols)
 
@@ -747,13 +1170,18 @@ func cmdInferGPU(model string, promptParts []string) {
 					}
 				}
 
-				applyRoPE(q, k[:kvDim], pos, headDim, ropeTheta, heads, kvHeads)
+				if rotaryDim == headDim {
+					applyRoPE(q, k[:kvDim], pos, headDim, ropeTheta, heads, kvHeads)
+				} else {
+					applyRoPEPartial(q, pos, headDim, rotaryDim, heads, ropeTheta)
+					applyRoPEPartial(k[:kvDim], pos, headDim, rotaryDim, kvHeads, ropeTheta)
+				}
 
 				copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], k[:kvDim])
 				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], v[:kvDim])
 
 				kvMul := heads / kvHeads
-				for i := range attnOut[:dim] {
+				for i := range attnOut[:attnDim] {
 					attnOut[i] = 0
 				}
 				for h := 0; h < heads; h++ {
@@ -777,38 +1205,53 @@ func cmdInferGPU(model string, promptParts []string) {
 					}
 				}
 
-				wo, woRows, woCols, _ := readWeight(prefix+"self_attn.o_proj.weight", dim, dim)
+				wo, woRows, woCols, _ := readWeight(prefix+oProjName, dim, attnDim)
 				proj := make([]float32, dim)
-				streamMatVec(proj, wo, attnOut, woRows, woCols)
+				streamMatVec(proj, wo, attnOut[:attnDim], woRows, woCols)
 				for i := 0; i < dim; i++ {
 					x[i] += proj[i]
 				}
 
 				normW2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
-				copy(buf, x)
-				rmsNorm(buf, normW2, normEps)
+				if normW2 != nil {
+					copy(buf, x)
+					rmsNorm(buf, normW2, normEps)
+				} else {
+					copy(buf, normedBuf)
+				}
 
-				gate, gRows, gCols, _ := readWeight(prefix+"mlp.gate_proj.weight", ffnDim, dim)
-				up, uRows, uCols, _ := readWeight(prefix+"mlp.up_proj.weight", ffnDim, dim)
-				down, dRows, dCols, _ := readWeight(prefix+"mlp.down_proj.weight", dim, ffnDim)
-				streamMatVec(ffnBuf, gate, buf, gRows, gCols)
-				streamMatVec(ffnBuf2, up, buf, uRows, uCols)
-				if act == "relu" {
-					for i := 0; i < ffnDim; i++ {
-						if ffnBuf[i] < 0 {
-							ffnBuf[i] = 0
+				if gatedMLP {
+					gate, gRows, gCols, _ := readWeight(prefix+mlpWeightNames[0], ffnDim, dim)
+					up, uRows, uCols, _ := readWeight(prefix+mlpWeightNames[1], ffnDim, dim)
+					down, dRows, dCols, _ := readWeight(prefix+mlpWeightNames[2], dim, ffnDim)
+					streamMatVec(ffnBuf, gate, buf, gRows, gCols)
+					streamMatVec(ffnBuf2, up, buf, uRows, uCols)
+					if geluGated {
+						for i := 0; i < ffnDim; i++ {
+							ffnBuf[i] = geluNew(ffnBuf[i]) * ffnBuf2[i]
 						}
-						ffnBuf[i] *= ffnBuf2[i]
+					} else {
+						for i := 0; i < ffnDim; i++ {
+							ffnBuf[i] = silu(ffnBuf[i]) * ffnBuf2[i]
+						}
+					}
+					downOut := make([]float32, dim)
+					streamMatVec(downOut, down, ffnBuf, dRows, dCols)
+					for i := 0; i < dim; i++ {
+						x[i] += downOut[i]
 					}
 				} else {
+					fc1, f1Rows, f1Cols, _ := readWeight(prefix+mlpWeightNames[0], ffnDim, dim)
+					fc2, f2Rows, f2Cols, _ := readWeight(prefix+mlpWeightNames[1], dim, ffnDim)
+					streamMatVec(ffnBuf, fc1, buf, f1Rows, f1Cols)
 					for i := 0; i < ffnDim; i++ {
-						ffnBuf[i] = silu(ffnBuf[i]) * ffnBuf2[i]
+						ffnBuf[i] = geluNew(ffnBuf[i])
 					}
-				}
-				downOut := make([]float32, dim)
-				streamMatVec(downOut, down, ffnBuf, dRows, dCols)
-				for i := 0; i < dim; i++ {
-					x[i] += downOut[i]
+					downOut := make([]float32, dim)
+					streamMatVec(downOut, fc2, ffnBuf, f2Rows, f2Cols)
+					for i := 0; i < dim; i++ {
+						x[i] += downOut[i]
+					}
 				}
 			}
 		}
@@ -821,9 +1264,13 @@ func cmdInferGPU(model string, promptParts []string) {
 		}
 
 		finalNorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+		if finalNorm == nil {
+			finalNorm, _, _ = st.ReadTensorFloat32("model.final_layernorm.weight")
+		}
 		rmsNorm(x, finalNorm, normEps)
 		logits := make([]float32, vocabSize)
 		streamMatVec(logits, lmHeadData, x, vocabSize, dim)
+		softcapLogits(logits)
 		return logits
 	}
 
@@ -831,7 +1278,7 @@ func cmdInferGPU(model string, promptParts []string) {
 	fusedForward := func(tokenID, pos int) []float32 { return nil }
 	useFused := false
 
-	if metal, ok := eng.(*mongoose.Metal); ok {
+	if metal, ok := eng.(*mongoose.Metal); ok && gatedMLP && !geluGated && !fusedQKV && attnDim == dim {
 		ret := metal.BuildFused(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, maxSeq, float64(ropeTheta), 1e-6)
 		if ret == 0 {
 			nw := metal.FusedNumWeights()
@@ -906,7 +1353,7 @@ func cmdInferGPU(model string, promptParts []string) {
 	useMetalGraph := false
 
 	if !useFused {
-		if metal, ok := eng.(*mongoose.Metal); ok {
+		if metal, ok := eng.(*mongoose.Metal); ok && gatedMLP && !geluGated && !fusedQKV && attnDim == dim {
 		ret := metal.BuildInferGraph(dim, kvDim, headDim, heads, kvHeads, ffnDim, vocabSize, nLayers, float64(ropeTheta))
 		if ret == 0 {
 			nw := metal.InferNumWeights()
@@ -1050,15 +1497,30 @@ func cmdInferGPU(model string, promptParts []string) {
 	maxTokens := 200
 
 	fmt.Printf("\nGenerating (max %d tokens):\n", maxTokens)
-	fmt.Print(prompt)
+	if !isInstruct || rawMode {
+		fmt.Print(prompt)
+	}
 
 	allTokens := make([]int, len(tokens))
 	copy(allTokens, tokens)
-	allTokens = append(allTokens, nextToken)
-	fmt.Print(tok.Decode([]int{nextToken}))
 	t0 := time.Now()
 
-	for step := 1; step < maxTokens; step++ {
+	for step := 0; step < maxTokens; step++ {
+		if stopTokens[nextToken] {
+			break
+		}
+
+		allTokens = append(allTokens, nextToken)
+		decoded := tok.Decode([]int{nextToken})
+		if idx := findSpecialToken(decoded); idx >= 0 {
+			decoded = decoded[:idx]
+			if len(decoded) > 0 {
+				fmt.Print(decoded)
+			}
+			break
+		}
+		fmt.Print(decoded)
+
 		pos := len(allTokens) - 1
 		if pos >= maxSeq-1 {
 			break
@@ -1068,15 +1530,7 @@ func cmdInferGPU(model string, promptParts []string) {
 		if logits == nil {
 			break
 		}
-
 		nextToken = sampleTopK(logits, temperature, topK)
-		allTokens = append(allTokens, nextToken)
-
-		fmt.Print(tok.Decode([]int{nextToken}))
-
-		if nextToken == tok.EOS || nextToken == 0 {
-			break
-		}
 	}
 
 	elapsed := time.Since(t0)

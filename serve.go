@@ -374,8 +374,11 @@ func cmdServe(args map[string]string) {
 			state.modelName, state.dim, state.layers, state.heads, state.vocabSize)
 	}
 
-	// Start inference worker goroutine
-	state.inferQueue = make(chan *inferRequest, 16)
+	queueSize := 16
+	if v, ok := args["queue"]; ok {
+		fmt.Sscanf(v, "%d", &queueSize)
+	}
+	state.inferQueue = make(chan *inferRequest, queueSize)
 	go state.inferWorker()
 
 	mux := http.NewServeMux()
@@ -487,8 +490,15 @@ func (s *serveState) submitInfer(tokens []int, maxTokens int, temp float32, topK
 		stopToks:  stop,
 		resultCh:  make(chan inferToken, 64),
 	}
-	s.inferQueue <- req
-	return req.resultCh
+	select {
+	case s.inferQueue <- req:
+		return req.resultCh
+	case <-time.After(30 * time.Second):
+		ch := make(chan inferToken, 1)
+		ch <- inferToken{err: fmt.Errorf("inference queue full — try again later")}
+		close(ch)
+		return ch
+	}
 }
 
 // -----------------------------------------------------------------------
@@ -544,6 +554,9 @@ func (s *serveState) loadModel(name string) error {
 	s.ffnDim = getInt("intermediate_size", 0)
 	s.vocabSize = getInt("vocab_size", 0)
 	s.maxSeq = getInt("max_position_embeddings", 2048)
+	if s.maxSeq > 8192 {
+		s.maxSeq = 8192
+	}
 
 	tok, err := tokenizer.LoadTokenizer(path)
 	if err != nil {
@@ -551,13 +564,30 @@ func (s *serveState) loadModel(name string) error {
 	}
 	s.tokenizer = tok
 
-	st, err := gguf.OpenSafeTensors(path)
+	ms, err := OpenModel(path)
 	if err != nil {
-		return fmt.Errorf("safetensors: %w", err)
+		return fmt.Errorf("open model: %w", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		return fmt.Errorf("serve currently requires SafeTensors format — convert with: ai convert safetensors %s", path)
 	}
 	s.safetens = st
 
 	s.eng = selectEngine("auto")
+	if s.eng.VRAM() > 0 {
+		headDim := s.dim / s.heads
+		kvDim := s.kvHeads * headDim
+		fp32Bytes := int64(s.vocabSize)*int64(s.dim)*4*2 +
+			int64(s.layers)*(int64(s.dim)*int64(s.dim)*4*4 + int64(kvDim)*int64(s.dim)*4*2 +
+				int64(s.ffnDim)*int64(s.dim)*4*3 + int64(s.dim)*4*2) +
+			int64(2)*int64(s.layers)*int64(s.maxSeq)*int64(kvDim)*4
+		vram := int64(s.eng.VRAM())
+		if fp32Bytes > vram {
+			log.Printf("[serve] WARNING: model FP32 estimate %.1f GB exceeds VRAM %.1f GB — will use Q8 quantized inference",
+				float64(fp32Bytes)/(1024*1024*1024), float64(vram)/(1024*1024*1024))
+		}
+	}
 	mongoose.LoadKernels()
 	log.Printf("[serve] engine: %s", s.eng.Name())
 

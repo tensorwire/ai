@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tensorwire/gguf"
 	"github.com/tensorwire/tokenizer"
 )
 
@@ -58,9 +57,13 @@ func cmdInferImpl(model, prompt string) {
 	fmt.Printf("Model: %s (%d layers, dim=%d, heads=%d, kv=%d, ffn=%d, vocab=%d, act=%s)\n",
 		model, layers, dim, heads, numKVHeads, ffnDim, vocabSize, act)
 
-	st, err := gguf.OpenSafeTensors(path)
+	ms, err := OpenModel(path)
 	if err != nil {
-		log.Fatalf("Can't open model: %v", err)
+		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("CPU inference currently requires SafeTensors format — convert with: ai convert safetensors %s", path)
 	}
 
 	isAWQ := false

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/tensorwire/gguf"
 	"github.com/tensorwire/tokenizer"
 )
 
@@ -51,9 +50,13 @@ func cmdExplain() {
 		log.Fatalf("tokenizer: %v", err)
 	}
 
-	st, err := gguf.OpenSafeTensors(modelDir)
+	ms, err := OpenModel(modelDir)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("explain currently requires SafeTensors format — convert with: ai convert safetensors %s", modelDir)
 	}
 
 	embedData, _, _ := st.ReadTensorFloat32("model.embed_tokens.weight")

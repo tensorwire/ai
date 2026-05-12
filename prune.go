@@ -56,9 +56,13 @@ func cmdPrune() {
 	}
 
 	modelDir := resolveModel(modelName)
-	st, err := gguf.OpenSafeTensors(modelDir)
+	ms, err := OpenModel(modelDir)
 	if err != nil {
 		log.Fatalf("open model: %v", err)
+	}
+	st := ms.ST()
+	if st == nil {
+		log.Fatalf("prune currently requires SafeTensors format — convert with: ai convert safetensors %s", modelDir)
 	}
 
 	if outputDir == "" {
