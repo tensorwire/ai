@@ -75,32 +75,44 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 	}
 	fmt.Printf("  engine:  Metal SQ4 fused (%s)\n", metal.Name())
 
-	// Upload SQ4 weight at a given slot index
-	uploadSQ4 := func(wi int, name string) {
+	// Allocate slabs and bulk-upload all SQ4 data
+	totalOutliers := 0
+	totalBandsFloats := 0
+	for _, t := range meta.Tensors {
+		totalOutliers += t.OutlierCount
+		totalBandsFloats += 8
+	}
+	sq4Infer.AllocSlabs(len(packedAll), totalBandsFloats, totalOutliers)
+
+	// Bulk upload packed data (already contiguous in file)
+	sq4Infer.UploadPacked(0, packedAll)
+
+	// Upload bands (convert from raw bytes to float32)
+	allBands := make([]float32, totalBandsFloats)
+	for i := range allBands {
+		allBands[i] = math.Float32frombits(binary.LittleEndian.Uint32(bandsAll[i*4:]))
+	}
+	sq4Infer.UploadBands(0, allBands)
+
+	// Upload outliers (convert from raw bytes)
+	if totalOutliers > 0 {
+		allOIdx := make([]uint32, totalOutliers)
+		allOVal := make([]float32, totalOutliers)
+		for i := 0; i < totalOutliers; i++ {
+			allOIdx[i] = binary.LittleEndian.Uint32(outlierIdxAll[i*4:])
+			allOVal[i] = math.Float32frombits(binary.LittleEndian.Uint32(outlierValAll[i*4:]))
+		}
+		sq4Infer.UploadOutliers(0, allOIdx, allOVal)
+	}
+
+	// Set weight descriptors (offsets into slabs)
+	setDesc := func(wi int, name string) {
 		idx, ok := tensorByName[name]
 		if !ok {
-			log.Printf("[SQ4] warning: %s not found in metadata, skipping", name)
 			return
 		}
 		t := meta.Tensors[idx]
-		packed := packedAll[t.PackedOffset : t.PackedOffset+t.PackedBytes]
-		bandsStart := t.BandsOffset * 4
-		var bands [8]float32
-		for b := 0; b < 8; b++ {
-			bands[b] = math.Float32frombits(binary.LittleEndian.Uint32(bandsAll[bandsStart+b*4:]))
-		}
-		var oIdx []uint32
-		var oVal []float32
-		if t.OutlierCount > 0 {
-			oIdx = make([]uint32, t.OutlierCount)
-			oVal = make([]float32, t.OutlierCount)
-			for i := 0; i < t.OutlierCount; i++ {
-				off := (t.OutlierStart + i) * 4
-				oIdx[i] = binary.LittleEndian.Uint32(outlierIdxAll[off:])
-				oVal[i] = math.Float32frombits(binary.LittleEndian.Uint32(outlierValAll[off:]))
-			}
-		}
-		sq4Infer.SetSQ4(wi, packed, bands, oIdx, oVal, t.Rows, t.Cols)
+		sq4Infer.SetSQ4Desc(wi, t.PackedOffset, t.PackedBytes, t.BandsOffset, t.OutlierStart, t.OutlierCount, t.Rows, t.Cols)
 	}
 
 	loadFP32 := func(name string) []float32 {
@@ -124,9 +136,9 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		wi++
 
 		// slots 1-3: Q/K/V weights (SQ4)
-		uploadSQ4(wi, pfx+"self_attn.q_proj.weight"); wi++
-		uploadSQ4(wi, pfx+"self_attn.k_proj.weight"); wi++
-		uploadSQ4(wi, pfx+"self_attn.v_proj.weight"); wi++
+		setDesc(wi, pfx+"self_attn.q_proj.weight"); wi++
+		setDesc(wi, pfx+"self_attn.k_proj.weight"); wi++
+		setDesc(wi, pfx+"self_attn.v_proj.weight"); wi++
 
 		// slots 4-6: Q/K/V biases (FP32)
 		for _, bn := range []string{"self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"} {
@@ -143,7 +155,7 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		}
 
 		// slot 7: O weight (SQ4)
-		uploadSQ4(wi, pfx+"self_attn.o_proj.weight"); wi++
+		setDesc(wi, pfx+"self_attn.o_proj.weight"); wi++
 
 		// slot 8: norm2 (FP32)
 		norm2 := loadFP32(pfx + "post_attention_layernorm.weight")
@@ -153,9 +165,9 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		wi++
 
 		// slots 9-11: gate/up/down weights (SQ4)
-		uploadSQ4(wi, pfx+"mlp.gate_proj.weight"); wi++
-		uploadSQ4(wi, pfx+"mlp.up_proj.weight"); wi++
-		uploadSQ4(wi, pfx+"mlp.down_proj.weight"); wi++
+		setDesc(wi, pfx+"mlp.gate_proj.weight"); wi++
+		setDesc(wi, pfx+"mlp.up_proj.weight"); wi++
+		setDesc(wi, pfx+"mlp.down_proj.weight"); wi++
 
 		if (l+1)%10 == 0 || l == nLayers-1 {
 			log.Printf("[SQ4] loaded layer %d/%d", l+1, nLayers)
@@ -171,9 +183,9 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 
 	// lm_head — SQ4. For tied weights, reuse embed's SQ4 data.
 	if _, ok := tensorByName["lm_head.weight"]; ok {
-		uploadSQ4(wi, "lm_head.weight")
+		setDesc(wi, "lm_head.weight")
 	} else {
-		uploadSQ4(wi, "model.embed_tokens.weight")
+		setDesc(wi, "model.embed_tokens.weight")
 	}
 	wi++
 
