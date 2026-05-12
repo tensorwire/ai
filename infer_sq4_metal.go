@@ -42,8 +42,10 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 			Name         string `json:"name"`
 			Rows         int    `json:"rows"`
 			Cols         int    `json:"cols"`
-			PackedOffset int    `json:"packed_offset"`
-			PackedBytes  int    `json:"packed_bytes"`
+			MagOffset    int    `json:"mag_offset"`
+			MagBytes     int    `json:"mag_bytes"`
+			SignOffset   int    `json:"sign_offset"`
+			SignBytes    int    `json:"sign_bytes"`
 			BandsOffset  int    `json:"bands_offset"`
 			OutlierStart int    `json:"outlier_start"`
 			OutlierCount int    `json:"outlier_count"`
@@ -51,7 +53,8 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 	}
 	json.Unmarshal(metaBytes, &meta)
 
-	packedAll, _ := os.ReadFile(filepath.Join(path, "sq4_packed.bin"))
+	magAll, _ := os.ReadFile(filepath.Join(path, "sq4_magnitude.bin"))
+	signAll, _ := os.ReadFile(filepath.Join(path, "sq4_sign.bin"))
 	bandsAll, _ := os.ReadFile(filepath.Join(path, "sq4_bands.bin"))
 	outlierIdxAll, _ := os.ReadFile(filepath.Join(path, "sq4_outlier_idx.bin"))
 	outlierValAll, _ := os.ReadFile(filepath.Join(path, "sq4_outlier_val.bin"))
@@ -75,17 +78,26 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 	}
 	fmt.Printf("  engine:  Metal SQ4 fused (%s)\n", metal.Name())
 
-	// Allocate slabs and bulk-upload all SQ4 data
+	// Compute total packed size (nibbles: n_weights / 2 bytes) and allocate
 	totalOutliers := 0
 	totalBandsFloats := 0
+	totalPackedBytes := 0
 	for _, t := range meta.Tensors {
 		totalOutliers += t.OutlierCount
 		totalBandsFloats += 8
+		totalPackedBytes += t.Rows * t.Cols / 2
 	}
-	sq4Infer.AllocSlabs(len(packedAll), totalBandsFloats, totalOutliers)
+	sq4Infer.AllocSlabs(totalPackedBytes, totalBandsFloats, totalOutliers)
 
-	// Bulk upload packed data (already contiguous in file)
-	sq4Infer.UploadPacked(0, packedAll)
+	// Upload each tensor: pack mag+sign into nibbles on CPU, upload to packed slab
+	packedOff := 0
+	for _, t := range meta.Tensors {
+		nWeights := t.Rows * t.Cols
+		magSlice := magAll[t.MagOffset : t.MagOffset+t.MagBytes]
+		signSlice := signAll[t.SignOffset : t.SignOffset+t.SignBytes]
+		sq4Infer.UploadPacked(packedOff, magSlice, signSlice, nWeights)
+		packedOff += nWeights / 2
+	}
 
 	// Upload bands (convert from raw bytes to float32)
 	allBands := make([]float32, totalBandsFloats)
@@ -105,14 +117,24 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		sq4Infer.UploadOutliers(0, allOIdx, allOVal)
 	}
 
-	// Set weight descriptors (offsets into slabs)
+	// Promote weight slabs to GPU-private memory
+	sq4Infer.FinalizeSlabs()
+
+	// Build packed offset map: tensor name → byte offset in nibble slab
+	packedOffsetMap := map[string]int{}
+	pOff := 0
+	for _, t := range meta.Tensors {
+		packedOffsetMap[t.Name] = pOff
+		pOff += t.Rows * t.Cols / 2
+	}
+
 	setDesc := func(wi int, name string) {
 		idx, ok := tensorByName[name]
 		if !ok {
 			return
 		}
 		t := meta.Tensors[idx]
-		sq4Infer.SetSQ4Desc(wi, t.PackedOffset, t.PackedBytes, t.BandsOffset, t.OutlierStart, t.OutlierCount, t.Rows, t.Cols)
+		sq4Infer.SetSQ4Desc(wi, packedOffsetMap[name], t.BandsOffset, t.OutlierStart, t.OutlierCount, t.Rows, t.Cols)
 	}
 
 	loadFP32 := func(name string) []float32 {
@@ -189,7 +211,7 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 	}
 	wi++
 
-	// Dequant embed to FP32 for token lookup (CPU-side)
+	// Dequant embed to FP32 and upload to GPU
 	embedIdx := tensorByName["model.embed_tokens.weight"]
 	embedT := meta.Tensors[embedIdx]
 	embedBandsStart := embedT.BandsOffset * 4
@@ -198,19 +220,22 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		embedBands[b] = math.Float32frombits(binary.LittleEndian.Uint32(bandsAll[embedBandsStart+b*4:]))
 	}
 	embedData := make([]float32, vocabSize*dim)
-	halfCols := dim / 2
-	for r := 0; r < vocabSize; r++ {
-		for c := 0; c < dim; c++ {
-			byteIdx := embedT.PackedOffset + r*halfCols + c/2
-			shift := uint((c & 1) * 4)
-			nibble := (packedAll[byteIdx] >> shift) & 0x0F
-			band := nibble & 0x07
-			val := embedBands[band]
-			if nibble&0x08 != 0 {
-				val = -val
-			}
-			embedData[r*dim+c] = val
+	n := vocabSize * dim
+	for i := 0; i < n; i++ {
+		bitPos := (embedT.MagOffset*8) + i*3
+		byteIdx := bitPos / 8
+		bitOff := uint(bitPos % 8)
+		raw := magAll[byteIdx] >> bitOff
+		if bitOff > 5 {
+			raw |= magAll[byteIdx+1] << (8 - bitOff)
 		}
+		band := raw & 0x07
+		val := embedBands[band]
+		signByteIdx := embedT.SignOffset + i/8
+		if signAll[signByteIdx]&(1<<uint(i%8)) != 0 {
+			val = -val
+		}
+		embedData[i] = val
 	}
 	for i := 0; i < embedT.OutlierCount; i++ {
 		off := (embedT.OutlierStart + i) * 4
@@ -220,19 +245,7 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 			embedData[flat] = oVal
 		}
 	}
-
-	// RoPE tables
-	halfHead := headDim / 2
-	cosTab := make([]float32, maxSeq*halfHead)
-	sinTab := make([]float32, maxSeq*halfHead)
-	for pos := 0; pos < maxSeq; pos++ {
-		for j := 0; j < halfHead; j++ {
-			freq := 1.0 / math.Pow(float64(ropeTheta), float64(2*j)/float64(headDim))
-			angle := float64(pos) * freq
-			cosTab[pos*halfHead+j] = float32(math.Cos(angle))
-			sinTab[pos*halfHead+j] = float32(math.Sin(angle))
-		}
-	}
+	sq4Infer.UploadEmbed(embedData)
 
 	fmt.Printf("  model:   %s\n", path)
 	fmt.Printf("  arch:    dim=%d heads=%d kv=%d layers=%d ffn=%d vocab=%d\n",
@@ -245,26 +258,25 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 		tokens = []int{1}
 	}
 
-	fHidden := make([]float32, dim)
 	fLogits := make([]float32, vocabSize)
 
 	forward := func(tokenID, pos int) []float32 {
-		tokOff := tokenID * dim
-		if tokOff+dim > len(embedData) {
-			return nil
-		}
-		copy(fHidden, embedData[tokOff:tokOff+dim])
-		cosSlice := cosTab[pos*halfHead : pos*halfHead+halfHead]
-		sinSlice := sinTab[pos*halfHead : pos*halfHead+halfHead]
-		sq4Infer.Step(fHidden, cosSlice, sinSlice, pos, fLogits)
+		sq4Infer.Step(tokenID, pos, fLogits)
 		return fLogits
 	}
 
+	// Prefill: batched GEMM for all prompt tokens
 	fmt.Print("Prefilling... ")
 	t0 := time.Now()
 	var logits []float32
-	for i, tid := range tokens {
-		logits = forward(tid, i)
+	useBatchedPrefill := true
+	if useBatchedPrefill && len(tokens) >= 1 {
+		sq4Infer.Prefill(tokens, fLogits)
+		logits = fLogits
+	} else {
+		for i, tid := range tokens {
+			logits = forward(tid, i)
+		}
 	}
 	prefillTime := time.Since(t0)
 	fmt.Printf("done (%d tokens, %.1fs)\n", len(tokens), prefillTime.Seconds())
@@ -276,6 +288,7 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 	fmt.Printf("\nGenerating (max %d tokens):\n", maxTokens)
 	fmt.Print(prompt)
 
+	// Generation: GPU-side forward + argmax, no D2H logits copy
 	genStart := time.Now()
 	generated := 0
 	for i := 0; i < maxTokens; i++ {
@@ -289,10 +302,9 @@ func cmdInferSQ4Metal(path, prompt string, metal *mongoose.Metal, te mongoose.Te
 			break
 		}
 
-		logits = forward(nextToken, pos)
+		nextToken = sq4Infer.StepSample(nextToken, pos)
 		pos++
 		generated++
-		nextToken = sampleTopK(logits, 0.7, 40)
 	}
 
 	genTime := time.Since(genStart)

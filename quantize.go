@@ -123,28 +123,38 @@ func cmdQuantize() {
 	}
 }
 
-// sq4EncodeTensor quantizes a single FP32 weight tensor to SQ4 with per-tensor band calibration.
-// Returns packed nibbles, 8 band means, outlier indices, and outlier values.
-func sq4EncodeTensor(data []float32, rows, cols int) (packed []byte, bands [8]float32, outlierIdx []uint32, outlierVal []float32) {
+// sq4EncodeTensor quantizes a single FP32 weight tensor to SQ4.
+// Copied from chain's CompressWeightsSQ (protocol/weight_sq.go) with
+// output adapted to the opensource file format (separate mag/sign streams).
+//
+// Logic is IDENTICAL to chain:
+// - 8 equal-count percentile bands on sorted |weights|
+// - boundaries[b] = max |weight| in band b
+// - means[b] = mean |weight| in band b (reconstruction value)
+// - Outliers: |weight| > p99.9 threshold (strict greater)
+// - Band assignment: first b where |weight| <= boundaries[b]
+func sq4EncodeTensor(data []float32, rows, cols int) (mag []byte, sign []byte, bands [8]float32, outlierIdx []uint32, outlierVal []float32) {
 	n := rows * cols
-	packed = make([]byte, n/2)
+	numBands := 8
 
-	absVals := make([]float32, n)
+	// Sort absolute values to find percentile boundaries
+	abs := make([]float32, n)
 	for i, v := range data {
 		if v < 0 {
-			absVals[i] = -v
+			abs[i] = -v
 		} else {
-			absVals[i] = v
+			abs[i] = v
 		}
 	}
 	sorted := make([]float32, n)
-	copy(sorted, absVals)
+	copy(sorted, abs)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 
-	var boundaries [8]float32
-	for b := 0; b < 8; b++ {
-		lo := n * b / 8
-		hi := n * (b + 1) / 8
+	// Compute band boundaries and means
+	boundaries := make([]float32, numBands)
+	for b := 0; b < numBands; b++ {
+		lo := n * b / numBands
+		hi := n * (b + 1) / numBands
 		if hi > n {
 			hi = n
 		}
@@ -156,42 +166,48 @@ func sq4EncodeTensor(data []float32, rows, cols int) (packed []byte, bands [8]fl
 		bands[b] = float32(sum / float64(hi-lo))
 	}
 
+	// Outlier threshold: p99.9
 	outlierPos := n * 999 / 1000
-	if outlierPos >= n-1 {
-		outlierPos = n - 2
-	}
-	if outlierPos < 0 {
-		outlierPos = 0
+	if outlierPos >= n {
+		outlierPos = n - 1
 	}
 	outlierThresh := sorted[outlierPos]
 
-	halfCols := cols / 2
-	for r := 0; r < rows; r++ {
-		for c := 0; c < cols; c++ {
-			idx := r*cols + c
-			v := data[idx]
-			absV := absVals[idx]
+	// Encode weights — matching chain's CompressWeightsSQ exactly
+	magBits := n * 3
+	mag = make([]byte, (magBits+7)/8)
+	sign = make([]byte, (n+7)/8)
 
-			if absV >= outlierThresh && outlierThresh > 0 {
-				outlierIdx = append(outlierIdx, uint32(idx))
-				outlierVal = append(outlierVal, v)
-			}
+	for i, v := range data {
+		absV := abs[i]
 
-			band := 7
-			for b := 0; b < 7; b++ {
-				if absV <= boundaries[b] {
-					band = b
-					break
-				}
-			}
+		// Outlier check (strict greater, matching chain)
+		if absV > outlierThresh {
+			outlierIdx = append(outlierIdx, uint32(i))
+			outlierVal = append(outlierVal, v)
+		}
 
-			signBit := 0
-			if v < 0 {
-				signBit = 1
+		// Find magnitude band
+		band := numBands - 1
+		for b := 0; b < numBands-1; b++ {
+			if absV <= boundaries[b] {
+				band = b
+				break
 			}
-			nibble := byte((signBit << 3) | (band & 0x07))
-			shift := uint((c & 1) * 4)
-			packed[r*halfCols+c/2] |= nibble << shift
+		}
+
+		// 3-bit magnitude: pack into bitstream
+		bitPos := i * 3
+		byteIdx := bitPos / 8
+		bitOff := uint(bitPos % 8)
+		mag[byteIdx] |= byte(band&0x07) << bitOff
+		if bitOff > 5 {
+			mag[byteIdx+1] |= byte(band&0x07) >> (8 - bitOff)
+		}
+
+		// 1-bit sign: 0=positive, 1=negative
+		if v < 0 {
+			sign[i/8] |= 1 << uint(i%8)
 		}
 	}
 	return
@@ -218,11 +234,13 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 
 	fmt.Printf("  output: %s\n\n", outputDir)
 
-	packedF, _ := os.Create(filepath.Join(outputDir, "sq4_packed.bin"))
+	magF, _ := os.Create(filepath.Join(outputDir, "sq4_magnitude.bin"))
+	signF, _ := os.Create(filepath.Join(outputDir, "sq4_sign.bin"))
 	bandsF, _ := os.Create(filepath.Join(outputDir, "sq4_bands.bin"))
 	outlierIdxF, _ := os.Create(filepath.Join(outputDir, "sq4_outlier_idx.bin"))
 	outlierValF, _ := os.Create(filepath.Join(outputDir, "sq4_outlier_val.bin"))
-	defer packedF.Close()
+	defer magF.Close()
+	defer signF.Close()
 	defer bandsF.Close()
 	defer outlierIdxF.Close()
 	defer outlierValF.Close()
@@ -231,36 +249,44 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 		Name         string `json:"name"`
 		Rows         int    `json:"rows"`
 		Cols         int    `json:"cols"`
-		PackedOffset int    `json:"packed_offset"`
-		PackedBytes  int    `json:"packed_bytes"`
+		MagOffset    int    `json:"mag_offset"`
+		MagBytes     int    `json:"mag_bytes"`
+		SignOffset   int    `json:"sign_offset"`
+		SignBytes    int    `json:"sign_bytes"`
 		BandsOffset  int    `json:"bands_offset"`
 		OutlierStart int    `json:"outlier_start"`
 		OutlierCount int    `json:"outlier_count"`
 	}
 	var metas []tensorMeta
 
-	packedOff := 0
+	magOff := 0
+	signOff := 0
 	bandsOff := 0
 	outlierOff := 0
 	var totalSQ4Bytes int64
 
 	writeTensor := func(name string, data []float32, rows, cols int) {
-		packed, bands, oIdx, oVal := sq4EncodeTensor(data, rows, cols)
+		mag, sign, bands, oIdx, oVal := sq4EncodeTensor(data, rows, cols)
 
 		meta := tensorMeta{
 			Name:         name,
 			Rows:         rows,
 			Cols:         cols,
-			PackedOffset: packedOff,
-			PackedBytes:  len(packed),
+			MagOffset:    magOff,
+			MagBytes:     len(mag),
+			SignOffset:   signOff,
+			SignBytes:    len(sign),
 			BandsOffset:  bandsOff,
 			OutlierStart: outlierOff,
 			OutlierCount: len(oIdx),
 		}
 		metas = append(metas, meta)
 
-		packedF.Write(packed)
-		packedOff += len(packed)
+		magF.Write(mag)
+		magOff += len(mag)
+
+		signF.Write(sign)
+		signOff += len(sign)
 
 		bandsBytes := make([]byte, 8*4)
 		for i := 0; i < 8; i++ {
@@ -282,7 +308,7 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 		outlierValF.Write(valBytes)
 		outlierOff += len(oIdx)
 
-		totalSQ4Bytes += int64(len(packed) + 8*4 + len(oIdx)*8)
+		totalSQ4Bytes += int64(len(mag) + len(sign) + 8*4 + len(oIdx)*8)
 	}
 
 	// SQ4-encode embed + lm_head

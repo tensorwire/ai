@@ -160,7 +160,13 @@ func cmdInferGPU(model string, promptParts []string) {
 				vocabSize, headDim, kvDim, attnDim, maxSeq, ropeTheta, normEps)
 			return
 		}
-		log.Println("[SQ4] SQ4 model detected but Metal not available — falling back to FP32")
+		cuda, _ := eng.(*mongoose.CUDA)
+		if cuda != nil && mongoose.HasSQ4Matvec() {
+			cmdInferSQ4CUDA(path, prompt, cuda, te, cfg, dim, nLayers, heads, kvHeads, ffnDim,
+				vocabSize, headDim, kvDim, attnDim, maxSeq, ropeTheta, normEps)
+			return
+		}
+		log.Println("[SQ4] SQ4 model detected but no SQ4-capable backend — falling back to FP32")
 	}
 
 	ms, err := OpenModel(path)
