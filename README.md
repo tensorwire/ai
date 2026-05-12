@@ -100,7 +100,7 @@ ai train data="/data/*.txt" --dim 512 --layers 8 --steps 5000 --lr 3e-4
 
 | Command | Description |
 |---------|-------------|
-| `ai quantize <model> [q8\|q4\|f16]` | Reduce precision |
+| `ai quantize <model> [q8\|q4\|sq4\|f16]` | Reduce precision |
 | `ai prune <model>` | Remove low-magnitude weights (50% default) |
 | `ai prune <model> --sparsity 0.7 --structured` | Structured head pruning |
 | `ai convert gguf <model>` | Export to GGUF (for Ollama) |
@@ -163,24 +163,22 @@ Every command works on every backend. Optimized paths are used when available, w
 | explain | yes | yes | yes | yes |
 | sweep | yes (graph) | yes (exec) | yes (exec) | yes (exec) |
 
-## Performance
+### SQ4 — FP16 Quality at Q4 Memory Cost
 
-### Training convergence — dim=512, RTX 5090
+[SQ4](docs/sq4-whitepaper.md) (Synaptic Quantization 4-bit) — percentile band calibration + outlier sideband. Same 4-bit budget as Q4_0 but output is indistinguishable from FP16. A 32B model fits in under 7 GB. Format [spec](docs/sq4-spec.md).
 
+On CUDA, SQ4 dequant is a single register-file lookup — effectively free. The kernel is memory-bound at all sizes, so reading half the bytes vs FP16 is pure gain. On Metal, SQ4 matches FP16 throughput below ~3B and is faster above ~3B where inference becomes bandwidth-bound.
+
+| Model | Params | FP16 | SQ4 | SQ4 VRAM |
+|-------|--------|------|-----|----------|
+| Qwen2.5-3B | 3B | 2.9 GB | 1.5 GB | 4x less, same quality |
+| Mistral-7B | 7B | 6.8 GB | 3.4 GB | 4x less, same quality |
+| Qwen2.5-32B | 32B | ~64 GB | ~7 GB | Fits on 8 GB GPU |
+
+```bash
+ai quantize Qwen2.5-0.5B sq4    # one command, no calibration data
+ai infer Qwen2.5-0.5B-sq4 "The capital of France is"
 ```
-step 1     loss 6.17
-step 100   loss 2.59   floor 2.37
-step 300   loss 2.05   floor 1.76
-step 500   loss 1.95   floor 1.29   365 steps/s
-```
-
-### Inference — Qwen2.5-0.5B, Q8, `ai serve`
-
-| Metric | M4 Max | M1 Pro |
-|--------|--------|--------|
-| `ai benchmark` (avg) | 221.7 tok/s | 97.2 tok/s |
-| `ai serve` throughput | 239–241 tok/s | 133–145 tok/s |
-| TTFT (streaming) | 4ms | 29ms |
 
 ### Streaming inference — `ai serve`
 
@@ -198,17 +196,9 @@ ai serve Qwen2.5-0.5B              # streaming (default) — instant cold start
 ai serve Qwen2.5-0.5B --no-stream  # wait for full model load, max speed from first token
 ```
 
-### CUDA serve — RTX 5090
-
-| Path | Tok/s |
-|------|-------|
-| Generic (pre-v1.3.1) | 1.9 |
-| Q8 fused (v1.3.1+) | 189 |
-
-Zero-alloc hot path: all scratch buffers pre-allocated at model load.
-
 ### Architecture
 
+- SQ4 synaptic quantization: percentile band calibration + outlier sideband, MLX-derived INT4 matvec (Metal), register LUT dequant (CUDA, Metal fallback)
 - Automatic quantization: Q8 for models <4B params, Q4 for 7B+
 - Metal 4 `matmul2d` TensorOp on macOS 26+
 - Fused dequant-matvec kernels — zero intermediate buffers
