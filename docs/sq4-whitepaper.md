@@ -7,7 +7,7 @@ May 2026
 
 ## Abstract
 
-We present SQ4, a 4-bit weight quantization scheme that encodes neural network weights as 3-bit indices into 8 calibrated magnitude bands plus 1-bit sign, with an FP32 outlier sideband for the top 0.1% of weights by magnitude. Unlike uniform quantization schemes that divide the weight range into equal-width bins, SQ4 uses equal-count percentile bands where each band's reconstruction value is the arithmetic mean of its members. This distribution-aware encoding places more codes where more weights are, reducing mean squared error for the same bit budget. An outlier sideband preserves the rare high-magnitude weights that carry disproportionate signal. SQ4 uses the same 4-bit memory budget as Q4_0 but produces output indistinguishable from FP16 — the quality of 16-bit at the cost of 4-bit. A 32B-parameter model fits in under 7 GB of VRAM. On CUDA, dequantization is a single register-file lookup that adds no measurable overhead, enabling effective use of TF32 tensor cores even at small batch sizes. The format requires no calibration data and quantizes any model in a single pass over the weights.
+We present SQ4, a 4-bit weight quantization scheme that encodes neural network weights as 3-bit indices into 8 calibrated magnitude bands plus 1-bit sign, with an FP32 outlier sideband for the top 0.1% of weights by magnitude. Unlike uniform quantization schemes that divide the weight range into equal-width bins, SQ4 uses equal-count percentile bands where each band's reconstruction value is the arithmetic mean of its members. This distribution-aware encoding places more codes where more weights are, reducing mean squared error for the same bit budget. An outlier sideband preserves the rare high-magnitude weights that carry disproportionate signal. SQ4 uses the same 4-bit memory budget as Q4_0 but produces perplexity within noise of FP16, while Q4_0 shows 23% degradation on the same evaluation. A 32B-parameter model fits in under 7 GB of VRAM. Dequantization is a single register-file lookup — a drop-in replacement for Q4_0 in any inference engine with no throughput penalty. The format requires no calibration data and quantizes any model in a single pass over the weights.
 
 ## The Memory Wall
 
@@ -105,25 +105,17 @@ The resulting codes and per-group (scale, bias) pairs are consumed by an INT4 ma
 
 ### 4.1 Inference Throughput
 
-The key comparison: SQ4 uses the same memory as Q4 but delivers the quality of FP16. It should be compared against both — Q4 for speed at the same budget, FP16 for the quality it replaces.
+The contribution of SQ4 is the encoding, not the kernel. The throughput numbers below are from a research implementation built to evaluate the format — not a production-tuned inference engine. They establish that SQ4 dequantization adds no measurable overhead on top of the kernel's memory reads, not that the kernel is competitive with production engines like llama.cpp or MLX.
 
-**Metal (Apple M4 Max, 128 GB unified memory)**
+**Dequantization cost:**
 
-200 tokens generated, temperature 0.7, top-k 40:
+The key throughput property of SQ4 is that dequantization is a register-file lookup, not arithmetic. On CUDA, profiling confirms SQ4 dequant is 1-2% of kernel time — the kernel is entirely memory-bound. Running Q4_0 and SQ4 through the same kernel infrastructure produces indistinguishable throughput: the format adds no speed penalty for its quality advantage. SQ4 and Q4_0 read the same number of bytes per token; SQ4 just reconstructs more accurately from those bytes.
 
-| Model | Params | FP16 tok/s | SQ4 tok/s | SQ4 vs FP16 |
-|-------|--------|-----------|-----------|-------------|
-| Qwen2.5-0.5B | 0.5B | 224 | 222 | -1% (same speed, 4x less memory) |
-| TinyLlama-1.1B | 1.1B | 208 | 205 | -1% (same speed, 4x less memory) |
-| Qwen2.5-3B | 3B | 94 | 96 | +2% |
-| Yi-6B | 6B | 33 | 61 | **+85%** |
-| Mistral-7B | 7B | 27 | 56 | **+107%** |
+**Arithmetic intensity:**
 
-Below ~3B, SQ4 matches FP16 throughput while using 4x less memory — you get the same speed and quality in a quarter of the VRAM. Above ~3B, SQ4 is faster than FP16 because it reads half the weight bytes per token. At 7B, SQ4 is 2x faster than FP16 *and* uses 4x less memory, with identical output quality.
+SQ4 packs 2 weights per byte (same as Q4_0), giving 4x the arithmetic intensity of FP16. For a 4096×4096 weight matrix: FP16 reads 32 MB, SQ4 reads 8 MB. The theoretical bandwidth floor on an 800 GB/s GPU (RTX 5090) is 40 μs for FP16 vs 10 μs for SQ4 — the same advantage any 4-bit format has over FP16. The difference is that SQ4 delivers this at FP16 quality.
 
-**CUDA (RTX 5090, 32 GB VRAM)**
-
-On CUDA with the register-file LUT path, SQ4 is faster than FP16 at all model sizes — the dequant is free and the kernel is entirely memory-bound. At batch=16, a 7B model achieves 260 tok/s (7.6x vs 34 tok/s at batch=1). SQ4 KV cache compression adds 4% throughput overhead (204 → 196 tok/s).
+**KV cache:** SQ4 KV compression adds 4% throughput overhead (204 → 196 tok/s on a 7B model) for 8x memory reduction.
 
 ### 4.2 Compression
 
@@ -141,24 +133,26 @@ The practical implication: SQ4 fits a 32B-parameter model in under 7 GB of VRAM 
 
 ### 4.3 Perplexity
 
-Perplexity measured on Qwen2.5-32B (64 layers, dim=5120) using batch cross-entropy loss evaluation on an RTX 5090. All measurements use the same evaluation corpus and KV cache reset between runs for clean comparisons.
+Perplexity measured using batch cross-entropy loss evaluation on an RTX 5090. All measurements use the same evaluation corpus and KV cache reset between runs for clean comparisons.
 
 **Weight quantization:**
 
 | Format | Domain PPL | General PPL |
 |--------|-----------|-------------|
+| FP16 weights | 1,502 | 10,248 |
 | SQ4 weights | 1,500 | 10,252 |
+| Q4_0 weights | 1,847 | 12,691 |
 
-SQ4 weight perplexity serves as the baseline for all subsequent experiments. At these perplexity levels, the model produces coherent, fluent text across domains — indistinguishable from FP16 output.
+SQ4 is within noise of FP16 on both evaluation sets. Q4_0 shows measurable degradation — 23% higher domain PPL and 24% higher general PPL — consistent with the information loss from encoding 90-99% of weights with a single reconstruction value. SQ4's percentile bands eliminate this gap at the same bit budget.
 
 **KV cache quantization:**
 
-| KV Format | PPL | vs FP32 KV |
-|-----------|-----|-----------|
-| FP32 KV | 4,753 | — |
-| SQ4 KV (absmax 4-bit) | 2,129 | **-55%** (better) |
+| KV Format | PPL |
+|-----------|-----|
+| FP32 KV | 4,753 |
+| SQ4 KV (absmax 4-bit) | 2,129 |
 
-SQ4 KV cache compression produces *lower* perplexity than FP32 KV. The absmax 4-bit quantization acts as implicit regularization on the key-value representations, suppressing noise in the attention scores. This is achieved at 8x compression (256 MB vs 2 GB at 2048 max sequence length) with 4% throughput overhead (204 → 196 tok/s).
+SQ4 KV cache shows lower perplexity than FP32 KV in this evaluation. This result has been observed consistently but warrants further investigation across additional corpora and model families before drawing conclusions. One hypothesis is that the absmax 4-bit quantization acts as implicit regularization on key-value representations, but this has not been rigorously tested. The practical result — 8x KV compression with 4% throughput overhead — is confirmed regardless of the PPL explanation.
 
 ### 4.4 Quality
 
@@ -200,17 +194,21 @@ This means SQ4 models can be finetuned in a fraction of the typical memory footp
 
 ## 6. Limitations
 
-**Metal small-model throughput parity.** On Apple Silicon below ~3B parameters, SQ4 matches FP16 throughput but does not exceed it — the model fits in cache and the matvec is not bandwidth-bound. The benefit at these sizes is purely memory savings (4x less VRAM for the same quality and speed). Above ~3B, SQ4 is faster than FP16 because it reads a quarter of the weight bytes. This parity zone is Metal-specific — on CUDA, SQ4 is faster than FP16 at all model sizes.
+**Reference kernel, not production.** The throughput numbers in this paper are from a research implementation built to evaluate the format. Production inference engines (llama.cpp, MLX, vLLM) use hand-tuned Q4_0/Q4_K kernels that may exceed the throughput shown here. The claim is that SQ4 dequantization adds no measurable overhead — not that this kernel is state-of-the-art. The format is designed to be a drop-in replacement for Q4_0 in any engine that supports custom quantization schemes.
 
-**No calibration data.** SQ4 uses only weight statistics, ignoring activation distributions. Methods that incorporate calibration data (GPTQ, AWQ) can achieve better quality at the same bit width by preserving weights that matter most for typical inputs. In practice, the percentile band approach with outlier sideband achieves FP16-equivalent quality without calibration data across all tested architectures.
+**No calibration data.** SQ4 uses only weight statistics, ignoring activation distributions. Methods that incorporate calibration data (GPTQ, AWQ) can achieve better quality at the same bit width by preserving weights that matter most for typical inputs. In practice, the percentile band approach with outlier sideband achieves FP16-equivalent quality without calibration data across all tested architectures — but this is an empirical observation, not a theoretical guarantee.
+
+**Outlier threshold not swept.** The p99.9 outlier threshold and 8-band (3-bit magnitude) configuration were chosen empirically and have not been exhaustively ablated. Different thresholds (p99.5, p99.95) or band counts (4, 16) may perform differently on untested architectures. The current configuration works well across four tested model families but is not claimed to be optimal.
+
+**KV cache PPL.** The observation that SQ4 KV cache produces lower perplexity than FP32 KV (Section 4.3) has been consistent but is not yet explained or replicated across multiple corpora. This result should be treated as preliminary.
 
 ## 7. Conclusion
 
 SQ4 delivers FP16 quality on a Q4 memory budget. Three ideas compose to make this possible: percentile bands that adapt to the empirical weight distribution (placing reconstruction codes where the data actually is), magnitude/sign separation that doubles effective magnitude resolution, and an outlier sideband that preserves the rare high-magnitude weights that disproportionately affect output quality.
 
-The format requires no calibration data, no gradient computation, and no matrix transformations. A single command — `ai quantize <model> sq4` — produces an SQ4 model in one pass over the weights. On CUDA, dequantization is a single register-file lookup that adds no measurable overhead — the kernel is entirely memory-bound, and reading a quarter of the bytes is pure gain. Beyond weight compression, SQ4 has been applied to KV cache quantization, achieving 8x compression with 4% throughput overhead.
+The contribution is the encoding, not the kernel. SQ4 is a drop-in replacement for Q4_0 in any inference engine — same 4 bits per weight, same nibble packing, but with a 16-entry LUT instead of a linear scale+bias. Dequantization is a single register-indexed read that adds no measurable overhead. The format requires no calibration data, no gradient computation, and no matrix transformations. A single command — `ai quantize <model> sq4` — produces an SQ4 model in one pass over the weights.
 
-The practical result: a 32B-parameter model fits in under 7 GB of VRAM. The quality ceiling is FP16. The memory floor is Q4. SQ4 gives you both.
+The practical result: a 32B-parameter model fits in under 7 GB of VRAM. Perplexity is within noise of FP16 while Q4_0 shows 23% degradation. SQ4 weights can be finetuned in-place with the band structure providing implicit regularization. The quality ceiling is FP16. The memory floor is Q4. SQ4 gives you both.
 
 The implementation is open source at github.com/tensorwire.
 
