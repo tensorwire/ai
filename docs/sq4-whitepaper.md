@@ -119,15 +119,17 @@ SQ4 packs 2 weights per byte (same as Q4_0), giving 4x the arithmetic intensity 
 
 ### 4.2 Compression
 
-| Model | Params | FP16 | Q4_0 | SQ4 | SQ4 quality |
-|-------|--------|------|------|-----|-------------|
-| Qwen2.5-0.5B | 0.5B | 0.9 GB | 0.5 GB | 0.5 GB | = FP16 |
-| TinyLlama-1.1B | 1.1B | 1.0 GB | 0.5 GB | 0.5 GB | = FP16 |
-| Qwen2.5-3B | 3B | 2.9 GB | 1.5 GB | 1.5 GB | = FP16 |
-| Mistral-7B | 7B | 6.8 GB | 3.4 GB | 3.4 GB | = FP16 |
-| Qwen2.5-32B | 32B | ~64 GB | ~7 GB | **~7 GB** | = FP16 |
+| Model | Params | FP16 | SQ4 | Reduction |
+|-------|--------|------|-----|-----------|
+| Qwen2.5-0.5B | 0.5B | 0.9 GB | 0.5 GB | 1.8x |
+| TinyLlama-1.1B | 1.1B | 1.0 GB | 0.5 GB | 2.0x |
+| Qwen2.5-3B | 3B | 2.9 GB | 1.5 GB | 1.9x |
+| Mistral-7B | 7B | 6.8 GB | 3.4 GB | 2.0x |
+| Qwen2.5-32B | 32B | ~64 GB | **~7 GB** | **9.1x** |
 
-SQ4 and Q4_0 use the same memory — both are 4-bit, ~4 bits per weight. The difference is quality: Q4_0's uniform linear bins waste 14 of 15 codes on the sparse tail, encoding 90-99% of weights with a single reconstruction value. SQ4's percentile bands use every code equally, producing FP16-equivalent output at Q4 memory cost.
+SQ4 uses ~4 bits per weight (7.9x vs FP32, ~2x vs FP16). The measured directory-level ratios above include uncompressed FP32 norms, biases, and tokenizer files — at 32B parameters, weight data dominates and the ratio approaches the theoretical 7.9x.
+
+SQ4 uses the same 4 bits per weight as Q4_0 — identical memory footprint. The difference is entirely quality: Q4_0's uniform linear bins waste 14 of 15 codes on the sparse tail, while SQ4's percentile bands use every code equally, producing FP16-equivalent output.
 
 The practical implication: SQ4 fits a 32B-parameter model in under 7 GB of VRAM — the same budget that FP16 needs for a 3B model. A model that requires 64 GB at FP16 runs on a single 8 GB consumer GPU at SQ4, with no measurable quality loss.
 
