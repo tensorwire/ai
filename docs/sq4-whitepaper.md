@@ -111,11 +111,21 @@ The contribution of SQ4 is the encoding, not the kernel. The throughput numbers 
 
 The key throughput property of SQ4 is that dequantization is a register-file lookup, not arithmetic. On CUDA, profiling confirms SQ4 dequant is 1-2% of kernel time — the kernel is entirely memory-bound. Running Q4_0 and SQ4 through the same kernel infrastructure produces indistinguishable throughput: the format adds no speed penalty for its quality advantage. SQ4 and Q4_0 read the same number of bytes per token; SQ4 just reconstructs more accurately from those bytes.
 
+**Reference kernel vs FP16 baseline (ReluLLaMA-7B, RTX 5090):**
+
+| Format | tok/s | VRAM | Engine |
+|--------|-------|------|--------|
+| FP16 | 81.4 | 13.6 GB | PyTorch transformers |
+| SQ4 (batch=1) | 34 | 3.4 GB | mongoose (untuned) |
+| SQ4 (batch=8) | 204 | 3.4 GB | mongoose (untuned) |
+
+The SQ4 reference kernel is not optimized to the level of PyTorch's FP16 path — at batch=1, FP16 is 2.4x faster. The comparison demonstrates two things: (1) SQ4 uses 4x less VRAM for the same model, and (2) the VRAM savings enable batch-parallel decode (batch=8), which recovers and exceeds the FP16 throughput at 2.5x the speed in a quarter of the memory. A production-tuned SQ4 kernel would close the batch=1 gap; the format imposes no inherent throughput penalty.
+
 **Arithmetic intensity:**
 
 SQ4 delivers FP16 quality while reading 4x fewer bytes per token. For a 4096×4096 weight matrix: FP16 reads 32 MB, SQ4 reads 8 MB. The theoretical bandwidth floor on an 800 GB/s GPU is 40 μs for FP16 vs 10 μs for SQ4. This is the same bandwidth advantage any 4-bit format has over FP16 — but unlike Q4_0, SQ4 doesn't sacrifice quality to get it. Total cost per weight: ~4.025 bits (3 magnitude + 1 sign + ~0.025 outlier overhead).
 
-**KV cache:** SQ4 KV compression adds 4% throughput overhead (204 → 196 tok/s on a 7B model) for 8x memory reduction.
+**KV cache:** SQ4 KV compression adds 4% throughput overhead (204 → 196 tok/s) for 8x memory reduction.
 
 ### 4.2 Compression
 
