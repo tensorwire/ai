@@ -292,7 +292,7 @@ Measured compression ratios (including FP32 norms/biases overhead):
 |-------|--------|------|------|-----|-------------|
 | Qwen2.5-0.5B | 0.5B | 0.9 GB | 0.5 GB | 0.5 GB | = FP16 |
 | TinyLlama-1.1B | 1.1B | 1.0 GB | 0.5 GB | 0.5 GB | = FP16 |
-| Mistral-7B | 7B | 6.8 GB | 3.4 GB | 3.4 GB | = FP16 |
+| Qwen2.5-3B | 3B | 2.9 GB | 1.5 GB | 1.5 GB | = FP16 |
 | Qwen2.5-32B | 32B | ~64 GB | ~7 GB | **~7 GB** | = FP16 |
 
 SQ4 and Q4_0 use the same 4-bit budget — identical memory. The difference is quality: Q4_0's uniform linear bins waste codes on the sparse tails, while SQ4's percentile bands use every code equally. Weight tensors achieve 7.9x compression vs FP32 (32 bits / ~4.06 bits per weight). The measured directory-level ratios include uncompressed FP32 norms, biases, and tokenizer files.

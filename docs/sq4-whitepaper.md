@@ -124,7 +124,6 @@ SQ4 packs 2 weights per byte (same as Q4_0), giving 4x the arithmetic intensity 
 | Qwen2.5-0.5B | 0.5B | 0.9 GB | 0.5 GB | 1.8x |
 | TinyLlama-1.1B | 1.1B | 1.0 GB | 0.5 GB | 2.0x |
 | Qwen2.5-3B | 3B | 2.9 GB | 1.5 GB | 1.9x |
-| Mistral-7B | 7B | 6.8 GB | 3.4 GB | 2.0x |
 | Qwen2.5-32B | 32B | ~64 GB | **~7 GB** | **9.1x** |
 
 SQ4 uses ~4 bits per weight (7.9x vs FP32, ~2x vs FP16). The measured directory-level ratios above include uncompressed FP32 norms, biases, and tokenizer files — at 32B parameters, weight data dominates and the ratio approaches the theoretical 7.9x.
