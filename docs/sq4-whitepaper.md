@@ -141,10 +141,10 @@ Formal perplexity measurements comparing SQ4, FP16, and Q4_0 on the same evaluat
 
 SQ4 extends naturally to key-value cache compression. The KV cache uses per-position absmax 4-bit quantization: for each position in the cache, a single scale factor (`max(|v|)`) maps 8 magnitude levels across the value range. This is simpler than the weight encoding (no percentile calibration, no outlier sideband) because KV values are written once and read many times during attention — the quantization cost is amortized across all subsequent tokens.
 
-Measured on a 7B model (RTX 5090, 2048 max sequence length):
+Measured on a 7B SQ4 model (RTX 5090, 2048 max sequence length). Both configurations use SQ4 weights — the only variable is KV cache format:
 
-| Metric | FP32 KV | SQ4 KV |
-|--------|---------|--------|
+| Metric | SQ4 weights + FP32 KV | SQ4 weights + SQ4 KV |
+|--------|-----------------------|----------------------|
 | KV VRAM | 2,048 MB | 256 MB |
 | Throughput | 204 tok/s | 196 tok/s |
 | Overhead | — | 4% |
