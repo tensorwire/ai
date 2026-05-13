@@ -81,13 +81,13 @@ Outlier corrections are applied exactly at runtime on both platforms. For each o
 
 ### 3.3 TF32 Tensor Cores
 
-SQ4's 4-bit packing quadruples arithmetic intensity compared to FP16 (2 weights per byte vs 0.5). The reference kernel includes a TF32 tensor core path using inline PTX `mma.sync.aligned.m16n8k8` with tile-swizzled weight layout for coalesced reads, dispatched via `sq4_matvec_tf32_kernel`. At batch=8, this path achieves 204 tok/s on a 7B model (6x the batch=1 baseline of 34 tok/s; the gap from ideal 8x linear scaling reflects per-token launch overhead and attention/KV bandwidth costs). At batch=16, throughput reaches 260 tok/s (7.6x).
+SQ4's 4-bit packing quadruples arithmetic intensity compared to FP16 (2 weights per byte vs 0.5). At K>1, a single read of the weight matrix is shared across K output vectors, further amortizing the memory cost. The reference kernel includes a TF32 tensor core path using inline PTX `mma.sync.aligned.m16n8k8` with tile-swizzled weight layout for coalesced reads, dispatched via `sq4_matvec_tf32_kernel`. At K=8, this path achieves 204 tok/s on a 7B model; at K=16, 260 tok/s (see Section 4.1 for the full scaling curve).
 
-The tensor core path is not yet integrated into a persistent CUDA graph — each token launch is independent. A graph-captured version would reduce launch overhead and close the gap to linear scaling.
+The tensor core path is not yet integrated into a persistent CUDA graph — each token launch is independent. A graph-captured version would reduce launch overhead and improve scaling efficiency.
 
 ### 3.4 KV Cache Compression
 
-SQ4 is also applied to key-value cache compression during inference. The KV cache uses absmax 4-bit quantization, achieving 8x compression with minimal throughput impact — 204 tok/s uncompressed vs 196 tok/s with SQ4 KV on a 7B model (4% overhead). This makes long-context inference practical on consumer GPUs.
+SQ4 is also applied to key-value cache compression during inference. The KV cache uses absmax 4-bit quantization, achieving 8x compression with minimal throughput impact at the K=8 operating point (204 → 196 tok/s, 4% overhead). This makes long-context inference practical on consumer GPUs.
 
 ### 3.5 Linear Re-encoding (Optional Metal Fast Path)
 
@@ -113,13 +113,14 @@ The key throughput property of SQ4 is that dequantization is a register-file loo
 
 **Reference kernel vs FP16 baseline (ReluLLaMA-7B, RTX 5090):**
 
-| Format | tok/s | VRAM | Engine |
-|--------|-------|------|--------|
-| FP16 | 81.4 | 13.6 GB | PyTorch transformers |
-| SQ4 (batch=1) | 34 | 3.4 GB | mongoose (untuned) |
-| SQ4 (batch=8) | 204 | 3.4 GB | mongoose (untuned) |
+| Format | K | tok/s | VRAM | Engine |
+|--------|---|-------|------|--------|
+| FP16 | 1 | 81.4 | 13.6 GB | PyTorch transformers |
+| SQ4 | 1 | 34 | 3.4 GB | mongoose (untuned) |
+| SQ4 | 8 | 204 | 3.4 GB | mongoose (untuned) |
+| SQ4 | 16 | 260 | 3.4 GB | mongoose (untuned) |
 
-Both engines are research/eager-mode implementations, not production-tuned inference servers (llama.cpp, vLLM, TensorRT-LLM). At batch=1, PyTorch's FP16 path is 2.4x faster than the SQ4 reference kernel. The comparison demonstrates two things: (1) SQ4 uses 4x less VRAM for the same model, and (2) the VRAM savings enable batch-parallel decode (batch=8), which recovers and exceeds the FP16 throughput at 2.5x the speed in a quarter of the memory. A production-tuned SQ4 kernel would close the batch=1 gap; the format imposes no inherent throughput penalty.
+K is the number of output vectors sharing a single weight read per matvec step. Both engines are research/eager-mode implementations, not production-tuned inference servers (llama.cpp, vLLM, TensorRT-LLM). At K=1, PyTorch's FP16 path is 2.4x faster than the SQ4 reference kernel. The comparison demonstrates two things: (1) SQ4 uses 4x less VRAM for the same model, and (2) the VRAM savings enable parallel decode — at K=8, SQ4 exceeds the FP16 throughput at 2.5x the speed in a quarter of the memory. Scaling is sub-linear (6x at K=8, 7.6x at K=16 vs ideal 8x/16x), reflecting per-token launch overhead and attention/KV bandwidth costs that a graph-captured version would reduce. A production-tuned SQ4 kernel would also close the K=1 gap; the format imposes no inherent throughput penalty.
 
 **Arithmetic intensity:**
 
@@ -152,7 +153,7 @@ Formal perplexity measurements comparing SQ4, FP16, and Q4_0 on the same evaluat
 
 SQ4 extends naturally to key-value cache compression. The KV cache uses per-position absmax 4-bit quantization: for each position in the cache, a single scale factor (`max(|v|)`) maps 8 magnitude levels across the value range. This is simpler than the weight encoding (no percentile calibration, no outlier sideband) because KV values are written once and read many times during attention — the quantization cost is amortized across all subsequent tokens.
 
-Measured at the batch=8 configuration from Section 3.3 on a 7B SQ4 model (RTX 5090, 2048 max sequence length). Both configurations use SQ4 weights — the only variable is KV cache format:
+Measured at the K=8 operating point from Section 4.1 on a 7B SQ4 model (RTX 5090, 2048 max sequence length). Both configurations use SQ4 weights — the only variable is KV cache format:
 
 | Metric | SQ4 weights + FP32 KV | SQ4 weights + SQ4 KV |
 |--------|-----------------------|----------------------|
