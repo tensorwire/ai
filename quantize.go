@@ -321,15 +321,27 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 		fmt.Printf("  %s → SQ4 (%dx%d)\n", name, info.Shape[0], info.Shape[1])
 	}
 
+	// Detect MoE
+	numExperts := 0
+	if v, ok := cfg["num_local_experts"].(float64); ok { numExperts = int(v) }
+	if numExperts == 0 {
+		if v, ok := cfg["num_experts"].(float64); ok { numExperts = int(v) }
+	}
+	if numExperts > 0 {
+		fmt.Printf("  MoE: %d experts/layer\n", numExperts)
+	}
+
 	// SQ4-encode all layer projections
-	weightSuffixes := []string{
+	attnSuffixes := []string{
 		"self_attn.q_proj.weight", "self_attn.k_proj.weight",
 		"self_attn.v_proj.weight", "self_attn.o_proj.weight",
+	}
+	denseFfnSuffixes := []string{
 		"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
 	}
 	for l := 0; l < nLayers; l++ {
 		prefix := fmt.Sprintf("model.layers.%d.", l)
-		for _, suffix := range weightSuffixes {
+		for _, suffix := range attnSuffixes {
 			name := prefix + suffix
 			data, info, err := st.ReadTensorFloat32(name)
 			if err != nil || data == nil {
@@ -337,23 +349,52 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 			}
 			writeTensor(name, data, info.Shape[0], info.Shape[1])
 		}
+		if numExperts > 0 {
+			for e := 0; e < numExperts; e++ {
+				for _, proj := range []string{"gate_proj.weight", "up_proj.weight", "down_proj.weight"} {
+					name := fmt.Sprintf("%smlp.experts.%d.%s", prefix, e, proj)
+					data, info, err := st.ReadTensorFloat32(name)
+					if err != nil || data == nil {
+						continue
+					}
+					writeTensor(name, data, info.Shape[0], info.Shape[1])
+				}
+			}
+		} else {
+			for _, suffix := range denseFfnSuffixes {
+				name := prefix + suffix
+				data, info, err := st.ReadTensorFloat32(name)
+				if err != nil || data == nil {
+					continue
+				}
+				writeTensor(name, data, info.Shape[0], info.Shape[1])
+			}
+		}
 		fmt.Printf("\r  Layer %d/%d quantized to SQ4", l+1, nLayers)
 	}
 	fmt.Println()
 
 	// Metadata
 	metaJSON := struct {
-		Format  string       `json:"format"`
-		Model   string       `json:"model"`
-		Dim     int          `json:"dim"`
-		Layers  int          `json:"layers"`
-		Tensors []tensorMeta `json:"tensors"`
+		Format           string       `json:"format"`
+		Model            string       `json:"model"`
+		Dim              int          `json:"dim"`
+		Layers           int          `json:"layers"`
+		NumExperts       int          `json:"num_experts,omitempty"`
+		NumExpertsPerTok int          `json:"num_experts_per_tok,omitempty"`
+		Tensors          []tensorMeta `json:"tensors"`
 	}{
 		Format:  "sq4",
 		Model:   filepath.Base(modelDir),
 		Dim:     dim,
 		Layers:  nLayers,
 		Tensors: metas,
+	}
+	if numExperts > 0 {
+		metaJSON.NumExperts = numExperts
+		nept := 2
+		if v, ok := cfg["num_experts_per_tok"].(float64); ok { nept = int(v) }
+		metaJSON.NumExpertsPerTok = nept
 	}
 	metaBytes, _ := json.MarshalIndent(metaJSON, "", "  ")
 	os.WriteFile(filepath.Join(outputDir, "sq4_meta.json"), metaBytes, 0644)
@@ -377,12 +418,17 @@ func cmdQuantizeSQ4(modelDir string, st *gguf.SafeTensors, totalParams, sourceBy
 	}
 	for l := 0; l < nLayers; l++ {
 		prefix := fmt.Sprintf("model.layers.%d.", l)
-		for _, n := range []string{
+		fp32Names := []string{
 			"input_layernorm.weight", "post_attention_layernorm.weight",
 			"self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias",
 			"self_attn.o_proj.bias",
-			"mlp.gate_proj.bias", "mlp.up_proj.bias", "mlp.down_proj.bias",
-		} {
+		}
+		if numExperts > 0 {
+			fp32Names = append(fp32Names, "mlp.gate.weight") // router stays FP32
+		} else {
+			fp32Names = append(fp32Names, "mlp.gate_proj.bias", "mlp.up_proj.bias", "mlp.down_proj.bias")
+		}
+		for _, n := range fp32Names {
 			data, info, err := st.ReadTensorFloat32(prefix + n)
 			if err == nil && data != nil {
 				fpTensors[prefix+n] = gguf.SaveTensor{Data: data, Shape: info.Shape}
