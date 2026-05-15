@@ -198,6 +198,8 @@ In our testing, gradient updates can be applied directly to the 4-bit weights vi
 
 **Outlier threshold not swept.** The p99.9 outlier threshold and 8-band (3-bit magnitude) configuration were chosen empirically and have not been exhaustively ablated. Different thresholds (p99.5, p99.95) or band counts (4, 16) may perform differently on untested architectures. The current configuration works well across four tested model families but is not claimed to be optimal.
 
+**Mixture-of-Experts models.** SQ4 has been tested only on dense transformer architectures. On Mixture-of-Experts models (e.g., Qwen3-30B-A3B with 128 experts, top-8 routing, 48 layers), SQ4 expert weights produce degenerate output regardless of whether other tensors are kept at FP32. The ~3% per-weight reconstruction error compounds across MoE layers faster than in dense models: each layer's routing decision is sensitive to the hidden state, so small errors select different experts, producing different outputs, which shifts the next layer's routing further. After 48 layers, the signal is overwhelmed. Models with mandatory per-head QK RMSNorm (Qwen3) amplify SQ4 noise an additional 100-300x through the normalization denominator. Dense models do not exhibit this failure mode — they lack both routing sensitivity and per-head QK normalization. Higher band counts (16 or 32) or mixed-precision approaches (Q8 for experts) may resolve this but have not been tested.
+
 **Formal perplexity evaluation pending.** Qualitative testing across 4 model families shows no visible quality difference between SQ4 and FP16. Quantitative PPL comparison is the standard the community expects, and those measurements are in progress.
 
 ## 7. Conclusion
