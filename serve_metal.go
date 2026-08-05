@@ -27,11 +27,21 @@ type metalStreamingInference struct {
 	slotMu   []sync.Mutex
 	nextSlot atomic.Uint32
 
+	// A sequence holds one slot for its whole lifetime; seqMu serializes
+	// requests so seqSlot unambiguously names the in-flight sequence's slot.
+	seqMu   sync.Mutex
+	seqSlot int
+
+	// slotTokens[i] is the exact token sequence resident in slot i's KV cache,
+	// used to compute a reusable prefix. Stored as the token IDs themselves,
+	// never a digest — see cachedPrefixLen.
+	slotTokens [][]int
+
 	layersReady atomic.Int32 // how many layers have been loaded
 	allReady    atomic.Bool  // true once finalNorm + lmHead are also loaded
 
-	fHidden   [][]float32 // per-slot hidden buffer
-	fLogits   [][]float32 // per-slot logits buffer
+	fHidden   [][]float32            // per-slot hidden buffer
+	fLogits   [][]float32            // per-slot logits buffer
 	streamFwd *metalStreamingForward // ping-pong weight streaming (used before resident weights are loaded)
 }
 
@@ -57,12 +67,16 @@ func buildMetalStreamingInference(s *serveState, st *gguf.SafeTensors, lmHeadDat
 	}
 
 	mi := &metalStreamingInference{
-		metal:   metal,
-		s:       s,
-		nSlots:  nSlots,
-		slotMu:  make([]sync.Mutex, nSlots),
-		fHidden: make([][]float32, nSlots),
-		fLogits: make([][]float32, nSlots),
+		metal:  metal,
+		s:      s,
+		nSlots: nSlots,
+		slotMu: make([]sync.Mutex, nSlots),
+		// -1 means "no sequence in flight"; currentSlot falls back to 0 so a
+		// stray call cannot index out of range.
+		seqSlot:    -1,
+		slotTokens: make([][]int, nSlots),
+		fHidden:    make([][]float32, nSlots),
+		fLogits:    make([][]float32, nSlots),
 	}
 
 	for i := 0; i < nSlots; i++ {
@@ -159,6 +173,19 @@ func (mi *metalStreamingInference) forward(slot int, tokenID, pos int) []float32
 }
 
 // acquireSlot returns a slot index and locks it. Caller must call releaseSlot.
+//
+// A slot owns a KV cache, so it must be held for a whole SEQUENCE, never per
+// token. Calling this once per token round-robins consecutive tokens of one
+// conversation across independent caches: token N lands in slot 0 and token N+1
+// in slot 1, so each token attends to roughly half its history and never to its
+// immediate predecessor.
+//
+// That produces fluent-looking nonsense rather than an error, in every model —
+// Qwen2.5-0.5B emitted "The capital of France is the the sum of the product of
+// the company" — and it looks exactly like a bad checkpoint or a broken
+// template, which is where the debugging time goes.
+//
+// Callers: acquire once per request, then step every token on that slot.
 func (mi *metalStreamingInference) acquireSlot() int {
 	slot := int(mi.nextSlot.Add(1)-1) % mi.nSlots
 	mi.slotMu[slot].Lock()
@@ -167,6 +194,71 @@ func (mi *metalStreamingInference) acquireSlot() int {
 
 func (mi *metalStreamingInference) releaseSlot(slot int) {
 	mi.slotMu[slot].Unlock()
+}
+
+// beginSequence claims a slot for the calling request and holds it until
+// endSequence. Every token of the sequence then runs on that one KV cache.
+func (mi *metalStreamingInference) beginSequence() {
+	mi.seqMu.Lock()
+	mi.seqSlot = mi.acquireSlot()
+}
+
+func (mi *metalStreamingInference) endSequence() {
+	mi.releaseSlot(mi.seqSlot)
+	mi.seqSlot = -1
+	mi.seqMu.Unlock()
+}
+
+// currentSlot is the slot held by the in-flight sequence.
+func (mi *metalStreamingInference) currentSlot() int {
+	if mi.seqSlot < 0 {
+		return 0
+	}
+	return mi.seqSlot
+}
+
+// cachedPrefixLen returns how many leading tokens of `tokens` are already
+// resident in the current slot's KV cache, and therefore need no prefill.
+//
+// The comparison is element-by-element against the exact token sequence the
+// cache was built from. It is deliberately NOT a hash: a collision would serve
+// one conversation's KV cache to another, which is a correctness and privacy
+// failure that no amount of speed justifies.
+//
+// This is what makes multi-turn chat fast. Turn 2 of a conversation repeats the
+// entire system prompt plus turn 1, so the shared prefix is nearly the whole
+// request and only the new user message needs prefilling.
+func (mi *metalStreamingInference) cachedPrefixLen(tokens []int) int {
+	slot := mi.currentSlot()
+	prev := mi.slotTokens[slot]
+	n := len(prev)
+	if len(tokens) < n {
+		n = len(tokens)
+	}
+	// The last cached position must stay strictly inside the new sequence:
+	// re-running the final token is what produces the next logits.
+	if n >= len(tokens) {
+		n = len(tokens) - 1
+	}
+	i := 0
+	for i < n && prev[i] == tokens[i] {
+		i++
+	}
+	return i
+}
+
+// noteSequence records the token sequence now resident in the current slot.
+func (mi *metalStreamingInference) noteSequence(tokens []int) {
+	slot := mi.currentSlot()
+	buf := make([]int, len(tokens))
+	copy(buf, tokens)
+	mi.slotTokens[slot] = buf
+}
+
+// invalidateSlot drops the cached sequence for the current slot, forcing a full
+// prefill on the next request.
+func (mi *metalStreamingInference) invalidateSlot() {
+	mi.slotTokens[mi.currentSlot()] = nil
 }
 
 func (mi *metalStreamingInference) resetKV(slot int) {

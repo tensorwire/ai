@@ -9,9 +9,13 @@ import (
 	"time"
 )
 
+// modelAvailable must never call resolveModel: that helper ends in log.Fatalf,
+// which kills the whole test binary rather than returning "". Every test after
+// this one in the package then never runs — and go test reports the package as
+// FAIL with no indication that most of it was skipped. resolveModelName is the
+// non-fatal equivalent.
 func modelAvailable() bool {
-	path := resolveModel("Qwen2.5-0.5B")
-	return path != ""
+	return resolveModelName("Qwen2.5-0.5B") != ""
 }
 
 func serveOn(t *testing.T, port int) func() {

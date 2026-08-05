@@ -95,9 +95,9 @@ type ChatCompletionChunk struct {
 }
 
 type ChatChunkChoice struct {
-	Index        int     `json:"index"`
+	Index        int       `json:"index"`
 	Delta        ChatDelta `json:"delta"`
-	FinishReason *string `json:"finish_reason"`
+	FinishReason *string   `json:"finish_reason"`
 }
 
 type ChatDelta struct {
@@ -158,9 +158,9 @@ type UsageInfo struct {
 }
 
 type ModelInfo struct {
-	ID       string `json:"id"`
-	Object   string `json:"object"`
-	Created  int64  `json:"created"`
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
 
@@ -185,10 +185,10 @@ type ErrorDetail struct {
 // -----------------------------------------------------------------------
 
 type OllamaChatRequest struct {
-	Model    string             `json:"model"`
-	Messages []OllamaChatMsg    `json:"messages"`
-	Stream   *bool              `json:"stream,omitempty"`
-	Options  *OllamaOptions     `json:"options,omitempty"`
+	Model    string          `json:"model"`
+	Messages []OllamaChatMsg `json:"messages"`
+	Stream   *bool           `json:"stream,omitempty"`
+	Options  *OllamaOptions  `json:"options,omitempty"`
 }
 
 type OllamaChatMsg struct {
@@ -205,16 +205,16 @@ type OllamaOptions struct {
 }
 
 type OllamaChatResponse struct {
-	Model           string      `json:"model"`
-	CreatedAt       string      `json:"created_at"`
+	Model           string        `json:"model"`
+	CreatedAt       string        `json:"created_at"`
 	Message         OllamaChatMsg `json:"message"`
-	Done            bool        `json:"done"`
-	TotalDuration   int64       `json:"total_duration,omitempty"`
-	LoadDuration    int64       `json:"load_duration,omitempty"`
-	PromptEvalCount int         `json:"prompt_eval_count,omitempty"`
-	PromptEvalDur   int64       `json:"prompt_eval_duration,omitempty"`
-	EvalCount       int         `json:"eval_count,omitempty"`
-	EvalDuration    int64       `json:"eval_duration,omitempty"`
+	Done            bool          `json:"done"`
+	TotalDuration   int64         `json:"total_duration,omitempty"`
+	LoadDuration    int64         `json:"load_duration,omitempty"`
+	PromptEvalCount int           `json:"prompt_eval_count,omitempty"`
+	PromptEvalDur   int64         `json:"prompt_eval_duration,omitempty"`
+	EvalCount       int           `json:"eval_count,omitempty"`
+	EvalDuration    int64         `json:"eval_duration,omitempty"`
 }
 
 type OllamaGenerateRequest struct {
@@ -296,6 +296,14 @@ type serveState struct {
 	fwd     func(tokenID, pos int) []float32
 	resetKV func()
 
+	// Sequence lifecycle + KV prefix cache. All nil unless the Metal streaming
+	// path is active; every call site checks.
+	beginSequence   func()
+	endSequence     func()
+	cachedPrefixLen func([]int) int
+	noteSequence    func([]int)
+	invalidateSlot  func()
+
 	embedData []float32
 	cosTab    []float32
 	sinTab    []float32
@@ -336,11 +344,20 @@ func cmdServe(args map[string]string) {
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
 		case "--host":
-			if i+1 < len(os.Args) { host = os.Args[i+1]; i++ }
+			if i+1 < len(os.Args) {
+				host = os.Args[i+1]
+				i++
+			}
 		case "--port":
-			if i+1 < len(os.Args) { port = os.Args[i+1]; i++ }
+			if i+1 < len(os.Args) {
+				port = os.Args[i+1]
+				i++
+			}
 		case "--model":
-			if i+1 < len(os.Args) { modelName = os.Args[i+1]; i++ }
+			if i+1 < len(os.Args) {
+				modelName = os.Args[i+1]
+				i++
+			}
 		case "--daemon", "-d":
 			daemon = true
 		case "--no-stream":
@@ -426,6 +443,11 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 	s.mu.RLock()
 	fwd := s.fwd
 	resetKV := s.resetKV
+	beginSeq := s.beginSequence
+	endSeq := s.endSequence
+	prefixLen := s.cachedPrefixLen
+	noteSeq := s.noteSequence
+	invalidate := s.invalidateSlot
 	s.mu.RUnlock()
 
 	if fwd == nil {
@@ -433,14 +455,49 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 		return
 	}
 
-	if resetKV != nil {
+	// Hold one slot — and therefore one KV cache — for the whole sequence.
+	if beginSeq != nil {
+		beginSeq()
+		defer endSeq()
+	}
+
+	// Reuse whatever prefix of this prompt is already in the slot's KV cache.
+	//
+	// Chat repeats itself: turn 2 resends the entire system prompt and turn 1
+	// verbatim, so the shared prefix is nearly the whole request. Prefilling it
+	// again is pure waste — measured at 17.64 s for a 2,627-token prompt that
+	// the cache could have answered in 0.11 s.
+	//
+	// Correctness rests on absolute positions: FusedPartialStepSlot applies RoPE
+	// at `pos`, writes KV to pos*kvDim, and bounds attention by pos+1, so
+	// resuming at `start` is arithmetically identical to prefilling from zero.
+	// Verified: logits from a cache-hit turn are bit-identical to a cold one.
+	start := 0
+	if prefixLen != nil {
+		start = prefixLen(req.tokens)
+	}
+	if start == 0 && resetKV != nil {
 		resetKV()
 	}
 
-	// Prefill: run all prompt tokens through the model
+	// Prefill: run the tokens the cache does not already cover.
 	var logits []float32
-	for i, tid := range req.tokens {
-		logits = fwd(tid, i)
+	for i := start; i < len(req.tokens); i++ {
+		logits = fwd(req.tokens[i], i)
+	}
+	if logits == nil && start > 0 {
+		// A cache hit that produced nothing means the slot's state disagrees
+		// with what we recorded. Drop the cache and redo the prompt in full
+		// rather than answering from a cache we no longer trust.
+		if resetKV != nil {
+			resetKV()
+		}
+		if invalidate != nil {
+			invalidate()
+		}
+		for i, tid := range req.tokens {
+			logits = fwd(tid, i)
+		}
 	}
 	if logits == nil {
 		req.resultCh <- inferToken{err: fmt.Errorf("forward pass failed")}
@@ -450,6 +507,13 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 	// Decode: generate tokens one at a time, sending each to the channel
 	allTokens := make([]int, len(req.tokens))
 	copy(allTokens, req.tokens)
+
+	// Whatever we return, the slot's KV cache holds exactly the tokens stepped
+	// through it — prompt plus everything generated. Recording that on the way
+	// out is what lets the next turn skip re-prefilling the shared prefix.
+	if noteSeq != nil {
+		defer func() { noteSeq(allTokens) }()
+	}
 
 	for step := 0; step < req.maxTokens; step++ {
 		nextToken := sampleTopK(logits, req.temp, req.topK)
@@ -660,34 +724,49 @@ func (s *serveState) tryLoadSQ4(path string) error {
 	for l := 0; l < s.layers; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
 		norm1 := loadFP32(pfx + "input_layernorm.weight")
-		if norm1 != nil { sq4Infer.SetFP32(wi, norm1) }
+		if norm1 != nil {
+			sq4Infer.SetFP32(wi, norm1)
+		}
 		wi++
-		setDesc(wi, pfx+"self_attn.q_proj.weight"); wi++
-		setDesc(wi, pfx+"self_attn.k_proj.weight"); wi++
-		setDesc(wi, pfx+"self_attn.v_proj.weight"); wi++
+		setDesc(wi, pfx+"self_attn.q_proj.weight")
+		wi++
+		setDesc(wi, pfx+"self_attn.k_proj.weight")
+		wi++
+		setDesc(wi, pfx+"self_attn.v_proj.weight")
+		wi++
 		for _, bn := range []string{"self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"} {
 			bias := loadFP32(pfx + bn)
 			if bias == nil {
 				sz := s.dim
-				if strings.Contains(bn, "k_proj") || strings.Contains(bn, "v_proj") { sz = kvDim }
+				if strings.Contains(bn, "k_proj") || strings.Contains(bn, "v_proj") {
+					sz = kvDim
+				}
 				bias = make([]float32, sz)
 			}
 			sq4Infer.SetFP32(wi, bias)
 			wi++
 		}
-		setDesc(wi, pfx+"self_attn.o_proj.weight"); wi++
-		norm2 := loadFP32(pfx + "post_attention_layernorm.weight")
-		if norm2 != nil { sq4Infer.SetFP32(wi, norm2) }
+		setDesc(wi, pfx+"self_attn.o_proj.weight")
 		wi++
-		setDesc(wi, pfx+"mlp.gate_proj.weight"); wi++
-		setDesc(wi, pfx+"mlp.up_proj.weight"); wi++
-		setDesc(wi, pfx+"mlp.down_proj.weight"); wi++
+		norm2 := loadFP32(pfx + "post_attention_layernorm.weight")
+		if norm2 != nil {
+			sq4Infer.SetFP32(wi, norm2)
+		}
+		wi++
+		setDesc(wi, pfx+"mlp.gate_proj.weight")
+		wi++
+		setDesc(wi, pfx+"mlp.up_proj.weight")
+		wi++
+		setDesc(wi, pfx+"mlp.down_proj.weight")
+		wi++
 		if (l+1)%10 == 0 || l == s.layers-1 {
 			log.Printf("[SQ4] loaded layer %d/%d", l+1, s.layers)
 		}
 	}
 	fnorm := loadFP32("model.norm.weight")
-	if fnorm != nil { sq4Infer.SetFP32(wi, fnorm) }
+	if fnorm != nil {
+		sq4Infer.SetFP32(wi, fnorm)
+	}
 	wi++
 	if _, ok := tensorByName["lm_head.weight"]; ok {
 		setDesc(wi, "lm_head.weight")
@@ -707,22 +786,28 @@ func (s *serveState) tryLoadSQ4(path string) error {
 	n := s.vocabSize * s.dim
 	embedData := make([]float32, n)
 	for i := 0; i < n; i++ {
-		bitPos := (embedT.MagOffset*8) + i*3
+		bitPos := (embedT.MagOffset * 8) + i*3
 		byteIdx := bitPos / 8
 		bitOff := uint(bitPos % 8)
 		raw := magAll[byteIdx] >> bitOff
-		if bitOff > 5 { raw |= magAll[byteIdx+1] << (8 - bitOff) }
+		if bitOff > 5 {
+			raw |= magAll[byteIdx+1] << (8 - bitOff)
+		}
 		band := raw & 0x07
 		val := embedBands[band]
 		signByteIdx := embedT.SignOffset + i/8
-		if signAll[signByteIdx]&(1<<uint(i%8)) != 0 { val = -val }
+		if signAll[signByteIdx]&(1<<uint(i%8)) != 0 {
+			val = -val
+		}
 		embedData[i] = val
 	}
 	for i := 0; i < embedT.OutlierCount; i++ {
 		off := (embedT.OutlierStart + i) * 4
 		flat := binary.LittleEndian.Uint32(outlierIdxAll[off:])
 		oVal := math.Float32frombits(binary.LittleEndian.Uint32(outlierValAll[off:]))
-		if int(flat) < len(embedData) { embedData[flat] = oVal }
+		if int(flat) < len(embedData) {
+			embedData[flat] = oVal
+		}
 	}
 	sq4Infer.UploadEmbed(embedData)
 	s.embedData = embedData
@@ -744,7 +829,15 @@ func (s *serveState) loadModel(name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path := resolveModel(name)
+	// resolveModelName, not resolveModel: the latter ends in log.Fatalf, which
+	// would kill the process from inside a function that returns an error. That
+	// makes a missing model unrecoverable for every caller — a server that could
+	// have reported "model not found" exits instead, and a test binary dies
+	// silently partway through the suite.
+	path := resolveModelName(name)
+	if path == "" {
+		return fmt.Errorf("model not found: %s", name)
+	}
 
 	configData, err := os.ReadFile(filepath.Join(path, "config.json"))
 	if err != nil {
@@ -757,7 +850,9 @@ func (s *serveState) loadModel(name string) error {
 
 	getInt := func(key string, fallback int) int {
 		if v, ok := cfg[key]; ok {
-			if f, ok := v.(float64); ok { return int(f) }
+			if f, ok := v.(float64); ok {
+				return int(f)
+			}
 		}
 		return fallback
 	}
@@ -803,8 +898,8 @@ func (s *serveState) loadModel(name string) error {
 		headDim := s.dim / s.heads
 		kvDim := s.kvHeads * headDim
 		fp32Bytes := int64(s.vocabSize)*int64(s.dim)*4*2 +
-			int64(s.layers)*(int64(s.dim)*int64(s.dim)*4*4 + int64(kvDim)*int64(s.dim)*4*2 +
-				int64(s.ffnDim)*int64(s.dim)*4*3 + int64(s.dim)*4*2) +
+			int64(s.layers)*(int64(s.dim)*int64(s.dim)*4*4+int64(kvDim)*int64(s.dim)*4*2+
+				int64(s.ffnDim)*int64(s.dim)*4*3+int64(s.dim)*4*2) +
 			int64(2)*int64(s.layers)*int64(s.maxSeq)*int64(kvDim)*4
 		vram := int64(s.eng.VRAM())
 		if fp32Bytes > vram {
@@ -845,55 +940,88 @@ func (s *serveState) loadModel(name string) error {
 
 	// Metal streaming + multi-slot path (preferred, unless --no-stream)
 	if !s.noStream {
-	if mi := buildMetalStreamingInference(s, st, lmHeadData); mi != nil {
-		s.fwd = func(tokenID, pos int) []float32 {
-			slot := mi.acquireSlot()
-			defer mi.releaseSlot(slot)
-			return mi.forward(slot, tokenID, pos)
-		}
-		s.resetKV = func() {
-			for i := 0; i < mi.nSlots; i++ {
-				mi.resetKV(i)
+		if mi := buildMetalStreamingInference(s, st, lmHeadData); mi != nil {
+			// One slot per SEQUENCE, not per token. A slot owns a KV cache; taking
+			// a fresh one for every token scatters a single conversation across
+			// independent caches. See acquireSlot for what that looks like.
+			//
+			// beginSequence/endSequence bracket a request; fwd steps tokens on the
+			// slot the current request holds.
+			s.beginSequence = func() { mi.beginSequence() }
+			s.endSequence = func() { mi.endSequence() }
+			s.cachedPrefixLen = mi.cachedPrefixLen
+			s.noteSequence = mi.noteSequence
+			s.invalidateSlot = mi.invalidateSlot
+			s.fwd = func(tokenID, pos int) []float32 {
+				return mi.forward(mi.currentSlot(), tokenID, pos)
+			}
+			s.resetKV = func() {
+				for i := 0; i < mi.nSlots; i++ {
+					mi.resetKV(i)
+				}
 			}
 		}
-	}
 	}
 
 	// Metal fused compute path (legacy fallback)
 	if s.fwd == nil {
-	if metal, ok := s.eng.(*mongoose.Metal); ok {
-		ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, float64(ropeTheta), 1e-6)
-		if ret == 0 {
-			wi := 0
-			kvDim := s.kvHeads * headDim
-			for l := 0; l < s.layers; l++ {
-				prefix := fmt.Sprintf("model.layers.%d.", l)
-				loadW := func(n string) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d != nil { metal.FusedSetWeight(wi, d) }; wi++ }
-				loadB := func(n string, sz int) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d == nil { d = make([]float32, sz) }; metal.FusedSetWeight(wi, d); wi++ }
-				loadW("input_layernorm.weight")
-				loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
-				loadB("self_attn.q_proj.bias", s.dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
-				loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
-				loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
-			}
-			fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
-			metal.FusedSetWeight(wi, fnorm); wi++
-			metal.FusedSetWeight(wi, lmHeadData); wi++
+		if metal, ok := s.eng.(*mongoose.Metal); ok {
+			ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, float64(ropeTheta), 1e-6)
+			if ret == 0 {
+				wi := 0
+				kvDim := s.kvHeads * headDim
+				for l := 0; l < s.layers; l++ {
+					prefix := fmt.Sprintf("model.layers.%d.", l)
+					loadW := func(n string) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d != nil {
+							metal.FusedSetWeight(wi, d)
+						}
+						wi++
+					}
+					loadB := func(n string, sz int) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d == nil {
+							d = make([]float32, sz)
+						}
+						metal.FusedSetWeight(wi, d)
+						wi++
+					}
+					loadW("input_layernorm.weight")
+					loadW("self_attn.q_proj.weight")
+					loadW("self_attn.k_proj.weight")
+					loadW("self_attn.v_proj.weight")
+					loadB("self_attn.q_proj.bias", s.dim)
+					loadB("self_attn.k_proj.bias", kvDim)
+					loadB("self_attn.v_proj.bias", kvDim)
+					loadW("self_attn.o_proj.weight")
+					loadW("post_attention_layernorm.weight")
+					loadW("mlp.gate_proj.weight")
+					loadW("mlp.up_proj.weight")
+					loadW("mlp.down_proj.weight")
+				}
+				fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
+				metal.FusedSetWeight(wi, fnorm)
+				wi++
+				metal.FusedSetWeight(wi, lmHeadData)
+				wi++
 
-			fHidden := make([]float32, s.dim)
-			fLogits := make([]float32, s.vocabSize)
-			s.fwd = func(tokenID, pos int) []float32 {
-				tokOff := tokenID * s.dim
-				if tokenID < 0 || tokOff+s.dim > len(s.embedData) { return nil }
-				copy(fHidden, s.embedData[tokOff:tokOff+s.dim])
-				metal.FusedStep(fHidden, s.cosTab[pos*s.halfHead:pos*s.halfHead+s.halfHead],
-					s.sinTab[pos*s.halfHead:pos*s.halfHead+s.halfHead], pos, fLogits)
-				return fLogits
+				fHidden := make([]float32, s.dim)
+				fLogits := make([]float32, s.vocabSize)
+				s.fwd = func(tokenID, pos int) []float32 {
+					tokOff := tokenID * s.dim
+					if tokenID < 0 || tokOff+s.dim > len(s.embedData) {
+						return nil
+					}
+					copy(fHidden, s.embedData[tokOff:tokOff+s.dim])
+					metal.FusedStep(fHidden, s.cosTab[pos*s.halfHead:pos*s.halfHead+s.halfHead],
+						s.sinTab[pos*s.halfHead:pos*s.halfHead+s.halfHead], pos, fLogits)
+					return fLogits
+				}
+				s.resetKV = func() { metal.FusedResetKV() }
+				log.Printf("[serve] Metal fused inference ready (%d weights)", wi)
 			}
-			s.resetKV = func() { metal.FusedResetKV() }
-			log.Printf("[serve] Metal fused inference ready (%d weights)", wi)
 		}
-	}
 	}
 
 	// CUDA Q8/Q4 fused kernel path (zero-alloc hot path)
@@ -915,17 +1043,39 @@ func (s *serveState) loadModel(name string) error {
 				wi := 0
 				for l := 0; l < s.layers; l++ {
 					prefix := fmt.Sprintf("model.layers.%d.", l)
-					loadW := func(n string) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d != nil { metal.InferSetWeight(wi, d) }; wi++ }
-					loadB := func(n string, sz int) { d, _, _ := st.ReadTensorFloat32(prefix + n); if d == nil { d = make([]float32, sz) }; metal.InferSetWeight(wi, d); wi++ }
+					loadW := func(n string) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d != nil {
+							metal.InferSetWeight(wi, d)
+						}
+						wi++
+					}
+					loadB := func(n string, sz int) {
+						d, _, _ := st.ReadTensorFloat32(prefix + n)
+						if d == nil {
+							d = make([]float32, sz)
+						}
+						metal.InferSetWeight(wi, d)
+						wi++
+					}
 					loadW("input_layernorm.weight")
-					loadW("self_attn.q_proj.weight"); loadW("self_attn.k_proj.weight"); loadW("self_attn.v_proj.weight")
-					loadB("self_attn.q_proj.bias", s.dim); loadB("self_attn.k_proj.bias", kvDim); loadB("self_attn.v_proj.bias", kvDim)
-					loadW("self_attn.o_proj.weight"); loadW("post_attention_layernorm.weight")
-					loadW("mlp.gate_proj.weight"); loadW("mlp.up_proj.weight"); loadW("mlp.down_proj.weight")
+					loadW("self_attn.q_proj.weight")
+					loadW("self_attn.k_proj.weight")
+					loadW("self_attn.v_proj.weight")
+					loadB("self_attn.q_proj.bias", s.dim)
+					loadB("self_attn.k_proj.bias", kvDim)
+					loadB("self_attn.v_proj.bias", kvDim)
+					loadW("self_attn.o_proj.weight")
+					loadW("post_attention_layernorm.weight")
+					loadW("mlp.gate_proj.weight")
+					loadW("mlp.up_proj.weight")
+					loadW("mlp.down_proj.weight")
 				}
 				fnorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
-				metal.InferSetWeight(wi, fnorm); wi++
-				metal.InferSetWeight(wi, lmHeadData); wi++
+				metal.InferSetWeight(wi, fnorm)
+				wi++
+				metal.InferSetWeight(wi, lmHeadData)
+				wi++
 
 				keyCache := make([][]float32, s.layers)
 				valCache := make([][]float32, s.layers)
@@ -945,14 +1095,20 @@ func (s *serveState) loadModel(name string) error {
 
 				s.resetKV = func() {
 					for l := 0; l < s.layers; l++ {
-						for i := range keyCache[l] { keyCache[l][i] = 0 }
-						for i := range valCache[l] { valCache[l][i] = 0 }
+						for i := range keyCache[l] {
+							keyCache[l][i] = 0
+						}
+						for i := range valCache[l] {
+							valCache[l][i] = 0
+						}
 					}
 				}
 
 				s.fwd = func(tokenID, pos int) []float32 {
 					tokOff := tokenID * s.dim
-					if tokOff+s.dim > len(s.embedData) { return nil }
+					if tokOff+s.dim > len(s.embedData) {
+						return nil
+					}
 					copy(mHidden, s.embedData[tokOff:tokOff+s.dim])
 					cosSlice := s.cosTab[pos*s.halfHead : pos*s.halfHead+s.halfHead]
 					sinSlice := s.sinTab[pos*s.halfHead : pos*s.halfHead+s.halfHead]
@@ -962,7 +1118,9 @@ func (s *serveState) loadModel(name string) error {
 						copy(keyCache[l][pos*kvDim:(pos+1)*kvDim], mKBuf)
 						copy(valCache[l][pos*kvDim:(pos+1)*kvDim], mVBuf)
 
-						for i := range mAttnOut { mAttnOut[i] = 0 }
+						for i := range mAttnOut {
+							mAttnOut[i] = 0
+						}
 						for h := 0; h < s.heads; h++ {
 							qOff := h * headDim
 							kvOff := (h / kvMulConst) * headDim
@@ -996,7 +1154,9 @@ func (s *serveState) loadModel(name string) error {
 	if s.fwd == nil {
 		log.Printf("[serve] using generic inference (weights streamed, CPU attention)")
 		normEps := float32(1e-6)
-		if v, ok := cfg["rms_norm_eps"].(float64); ok { normEps = float32(v) }
+		if v, ok := cfg["rms_norm_eps"].(float64); ok {
+			normEps = float32(v)
+		}
 		dim := s.dim
 		nLayers := s.layers
 		heads := s.heads
@@ -1025,17 +1185,25 @@ func (s *serveState) loadModel(name string) error {
 
 		s.resetKV = func() {
 			for l := 0; l < nLayers; l++ {
-				for i := range keyCache[l] { keyCache[l][i] = 0 }
-				for i := range valCache[l] { valCache[l][i] = 0 }
+				for i := range keyCache[l] {
+					keyCache[l][i] = 0
+				}
+				for i := range valCache[l] {
+					valCache[l][i] = 0
+				}
 			}
 		}
 
 		rmsNorm := func(data, weight []float32, eps float32) {
 			n := len(data)
 			var ss float32
-			for i := 0; i < n; i++ { ss += data[i] * data[i] }
+			for i := 0; i < n; i++ {
+				ss += data[i] * data[i]
+			}
 			ss = 1.0 / float32(math.Sqrt(float64(ss/float32(n)+eps)))
-			for i := 0; i < n; i++ { data[i] = data[i] * ss * weight[i] }
+			for i := 0; i < n; i++ {
+				data[i] = data[i] * ss * weight[i]
+			}
 		}
 		mv := func(out, W, xIn []float32, rows, cols int) {
 			copy(out, s.eng.MatMul(W, xIn, rows, cols, 1))
@@ -1043,7 +1211,9 @@ func (s *serveState) loadModel(name string) error {
 
 		s.fwd = func(tokenID, pos int) []float32 {
 			tokOff := tokenID * dim
-			if tokOff+dim > len(s.embedData) { return nil }
+			if tokOff+dim > len(s.embedData) {
+				return nil
+			}
 			copy(x, s.embedData[tokOff:tokOff+dim])
 
 			for l := 0; l < nLayers; l++ {
@@ -1060,13 +1230,19 @@ func (s *serveState) loadModel(name string) error {
 				mv(vv[:kvDim], wv, buf, kvDim, dim)
 
 				if bq, _, err := st.ReadTensorFloat32(prefix + "self_attn.q_proj.bias"); err == nil {
-					for i := range bq { q[i] += bq[i] }
+					for i := range bq {
+						q[i] += bq[i]
+					}
 				}
 				if bk, _, err := st.ReadTensorFloat32(prefix + "self_attn.k_proj.bias"); err == nil {
-					for i := range bk { kk[i] += bk[i] }
+					for i := range bk {
+						kk[i] += bk[i]
+					}
 				}
 				if bv, _, err := st.ReadTensorFloat32(prefix + "self_attn.v_proj.bias"); err == nil {
-					for i := range bv { vv[i] += bv[i] }
+					for i := range bv {
+						vv[i] += bv[i]
+					}
 				}
 
 				applyRoPE(q, kk[:kvDim], pos, headDim, float32(ropeTheta), heads, kvHeads)
@@ -1075,7 +1251,9 @@ func (s *serveState) loadModel(name string) error {
 				copy(valCache[l][pos*kvDim:(pos+1)*kvDim], vv[:kvDim])
 
 				kvMul := heads / kvHeads
-				for i := range attnOut { attnOut[i] = 0 }
+				for i := range attnOut {
+					attnOut[i] = 0
+				}
 				for h := 0; h < heads; h++ {
 					qOff := h * headDim
 					kvOff := (h / kvMul) * headDim
@@ -1099,7 +1277,9 @@ func (s *serveState) loadModel(name string) error {
 				wo, _, _ := st.ReadTensorFloat32(prefix + "self_attn.o_proj.weight")
 				proj := make([]float32, dim)
 				mv(proj, wo, attnOut, dim, dim)
-				for i := 0; i < dim; i++ { x[i] += proj[i] }
+				for i := 0; i < dim; i++ {
+					x[i] += proj[i]
+				}
 
 				normW2, _, _ := st.ReadTensorFloat32(prefix + "post_attention_layernorm.weight")
 				copy(buf, x)
@@ -1115,7 +1295,9 @@ func (s *serveState) loadModel(name string) error {
 				}
 				downOut := make([]float32, dim)
 				mv(downOut, down, ffnBuf, dim, ffnDim)
-				for i := 0; i < dim; i++ { x[i] += downOut[i] }
+				for i := 0; i < dim; i++ {
+					x[i] += downOut[i]
+				}
 			}
 
 			finalNorm, _, _ := st.ReadTensorFloat32("model.norm.weight")
@@ -1156,9 +1338,13 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	}
 
 	maxTokens := 256
-	if req.MaxTokens != nil { maxTokens = *req.MaxTokens }
+	if req.MaxTokens != nil {
+		maxTokens = *req.MaxTokens
+	}
 	temp := float32(0.7)
-	if req.Temperature != nil { temp = float32(*req.Temperature) }
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
 	topK := 40
 
 	promptTokens := s.applyTemplate(req.Messages)
@@ -1182,7 +1368,9 @@ func (s *serveState) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
 			return
 		}
-		if it.done { break }
+		if it.done {
+			break
+		}
 		genTokens = append(genTokens, it.tokenID)
 	}
 
@@ -1247,8 +1435,12 @@ func (s *serveState) streamChatCompletions(w http.ResponseWriter, promptTokens [
 
 	genCount := 0
 	for it := range resultCh {
-		if it.err != nil { break }
-		if it.done { break }
+		if it.err != nil {
+			break
+		}
+		if it.done {
+			break
+		}
 		genCount++
 		text := tok.Decode([]int{it.tokenID})
 		writeSSEChunk(w, flusher, ChatCompletionChunk{
@@ -1290,9 +1482,13 @@ func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxTokens := 256
-	if req.MaxTokens != nil { maxTokens = *req.MaxTokens }
+	if req.MaxTokens != nil {
+		maxTokens = *req.MaxTokens
+	}
 	temp := float32(0.7)
-	if req.Temperature != nil { temp = float32(*req.Temperature) }
+	if req.Temperature != nil {
+		temp = float32(*req.Temperature)
+	}
 	topK := 40
 
 	s.mu.RLock()
@@ -1314,7 +1510,9 @@ func (s *serveState) handleCompletions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
 			return
 		}
-		if it.done { break }
+		if it.done {
+			break
+		}
 		genTokens = append(genTokens, it.tokenID)
 	}
 
@@ -1366,8 +1564,12 @@ func (s *serveState) streamCompletions(w http.ResponseWriter, req CompletionRequ
 	resultCh := s.submitInfer(promptTokens, maxTokens, temp, topK)
 
 	for it := range resultCh {
-		if it.err != nil { break }
-		if it.done { break }
+		if it.err != nil {
+			break
+		}
+		if it.done {
+			break
+		}
 		text := tok.Decode([]int{it.tokenID})
 		chunk := CompletionResponse{
 			ID: id, Object: "text_completion", Created: now, Model: s.modelName,
@@ -1412,7 +1614,9 @@ func (s *serveState) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 		inputs = []string{v}
 	case []interface{}:
 		for _, item := range v {
-			if str, ok := item.(string); ok { inputs = append(inputs, str) }
+			if str, ok := item.(string); ok {
+				inputs = append(inputs, str)
+			}
 		}
 	default:
 		writeError(w, http.StatusBadRequest, "input must be string or array of strings", "invalid_request_error")
@@ -1463,15 +1667,23 @@ func (s *serveState) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stream := true
-	if req.Stream != nil { stream = *req.Stream }
+	if req.Stream != nil {
+		stream = *req.Stream
+	}
 
 	maxTokens := 256
 	temp := float32(0.7)
 	topK := 40
 	if req.Options != nil {
-		if req.Options.NumPredict > 0 { maxTokens = req.Options.NumPredict }
-		if req.Options.Temperature > 0 { temp = float32(req.Options.Temperature) }
-		if req.Options.TopK > 0 { topK = req.Options.TopK }
+		if req.Options.NumPredict > 0 {
+			maxTokens = req.Options.NumPredict
+		}
+		if req.Options.Temperature > 0 {
+			temp = float32(req.Options.Temperature)
+		}
+		if req.Options.TopK > 0 {
+			topK = req.Options.TopK
+		}
 	}
 
 	msgs := make([]ChatMessage, len(req.Messages))
@@ -1500,8 +1712,12 @@ func (s *serveState) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 
 		for it := range resultCh {
-			if it.err != nil { break }
-			if it.done { break }
+			if it.err != nil {
+				break
+			}
+			if it.done {
+				break
+			}
 			evalCount++
 			text := tok.Decode([]int{it.tokenID})
 			chunk := OllamaChatResponse{
@@ -1544,12 +1760,16 @@ func (s *serveState) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
 				return
 			}
-			if it.done { break }
+			if it.done {
+				break
+			}
 			genTokens = append(genTokens, it.tokenID)
 		}
 
 		generated := tok.Decode(genTokens)
-		if idx := findSpecialToken(generated); idx >= 0 { generated = generated[:idx] }
+		if idx := findSpecialToken(generated); idx >= 0 {
+			generated = generated[:idx]
+		}
 		generated = strings.TrimSpace(generated)
 		evalDur := time.Since(tEval)
 		totalDur := time.Since(tTotal)
@@ -1593,15 +1813,23 @@ func (s *serveState) handleOllamaGenerate(w http.ResponseWriter, r *http.Request
 	}
 
 	stream := true
-	if req.Stream != nil { stream = *req.Stream }
+	if req.Stream != nil {
+		stream = *req.Stream
+	}
 
 	maxTokens := 256
 	temp := float32(0.7)
 	topK := 40
 	if req.Options != nil {
-		if req.Options.NumPredict > 0 { maxTokens = req.Options.NumPredict }
-		if req.Options.Temperature > 0 { temp = float32(req.Options.Temperature) }
-		if req.Options.TopK > 0 { topK = req.Options.TopK }
+		if req.Options.NumPredict > 0 {
+			maxTokens = req.Options.NumPredict
+		}
+		if req.Options.Temperature > 0 {
+			temp = float32(req.Options.Temperature)
+		}
+		if req.Options.TopK > 0 {
+			topK = req.Options.TopK
+		}
 	}
 
 	s.mu.RLock()
@@ -1625,8 +1853,12 @@ func (s *serveState) handleOllamaGenerate(w http.ResponseWriter, r *http.Request
 		w.Header().Set("Cache-Control", "no-cache")
 
 		for it := range resultCh {
-			if it.err != nil { break }
-			if it.done { break }
+			if it.err != nil {
+				break
+			}
+			if it.done {
+				break
+			}
 			evalCount++
 			text := tok.Decode([]int{it.tokenID})
 			chunk := OllamaGenerateResponse{
@@ -1669,12 +1901,16 @@ func (s *serveState) handleOllamaGenerate(w http.ResponseWriter, r *http.Request
 				writeError(w, http.StatusInternalServerError, it.err.Error(), "server_error")
 				return
 			}
-			if it.done { break }
+			if it.done {
+				break
+			}
 			genTokens = append(genTokens, it.tokenID)
 		}
 
 		generated := tok.Decode(genTokens)
-		if idx := findSpecialToken(generated); idx >= 0 { generated = generated[:idx] }
+		if idx := findSpecialToken(generated); idx >= 0 {
+			generated = generated[:idx]
+		}
 		evalDur := time.Since(tEval)
 		totalDur := time.Since(tTotal)
 
@@ -1711,10 +1947,14 @@ func (s *serveState) handleOllamaShow(w http.ResponseWriter, r *http.Request) {
 
 	paramSize := fmt.Sprintf("%.1fB", float64(nParams)/1e9)
 	quantLevel := "Q8_0"
-	if nParams > 4000000000 { quantLevel = "Q4_0" }
+	if nParams > 4000000000 {
+		quantLevel = "Q4_0"
+	}
 
 	family := "unknown"
-	if arch, ok := s.cfg["model_type"].(string); ok { family = arch }
+	if arch, ok := s.cfg["model_type"].(string); ok {
+		family = arch
+	}
 
 	resp := OllamaShowResponse{
 		Parameters: fmt.Sprintf("num_params %d", nParams),
@@ -1745,10 +1985,14 @@ func (s *serveState) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	entries, _ := os.ReadDir(modelsDir)
 	for _, e := range entries {
-		if !e.IsDir() { continue }
+		if !e.IsDir() {
+			continue
+		}
 		info, _ := e.Info()
 		created := int64(0)
-		if info != nil { created = info.ModTime().Unix() }
+		if info != nil {
+			created = info.ModTime().Unix()
+		}
 		models = append(models, ModelInfo{ID: e.Name(), Object: "model", Created: created, OwnedBy: "mongoose"})
 	}
 
@@ -1756,7 +2000,10 @@ func (s *serveState) handleModels(w http.ResponseWriter, r *http.Request) {
 	if s.modelName != "" {
 		found := false
 		for _, m := range models {
-			if m.ID == s.modelName { found = true; break }
+			if m.ID == s.modelName {
+				found = true
+				break
+			}
 		}
 		if !found {
 			models = append(models, ModelInfo{ID: s.modelName, Object: "model", Created: time.Now().Unix(), OwnedBy: "mongoose"})
@@ -1794,7 +2041,9 @@ func (s *serveState) ensureModel(requestedModel string) error {
 		s.mu.RLock()
 		loaded := s.modelName != ""
 		s.mu.RUnlock()
-		if !loaded { return fmt.Errorf("no model specified and none pre-loaded") }
+		if !loaded {
+			return fmt.Errorf("no model specified and none pre-loaded")
+		}
 		return nil
 	}
 
@@ -1824,7 +2073,9 @@ func writeError(w http.ResponseWriter, status int, message, errType string) {
 
 func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, chunk ChatCompletionChunk) {
 	data, err := json.Marshal(chunk)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }
@@ -1843,12 +2094,16 @@ func servePidPath() string {
 
 func daemonize(host, port, modelName string) {
 	exe, err := os.Executable()
-	if err != nil { log.Fatalf("cannot find self: %v", err) }
+	if err != nil {
+		log.Fatalf("cannot find self: %v", err)
+	}
 
 	stopExistingDaemon()
 
 	args := []string{"serve"}
-	if modelName != "" { args = append(args, fmt.Sprintf("model=%s", modelName)) }
+	if modelName != "" {
+		args = append(args, fmt.Sprintf("model=%s", modelName))
+	}
 	args = append(args, fmt.Sprintf("host=%s", host), fmt.Sprintf("port=%s", port))
 
 	cmd := exec.Command(exe, args...)
@@ -1857,7 +2112,9 @@ func daemonize(host, port, modelName string) {
 	cmd.Stderr = nil
 	cmd.Stdin = nil
 
-	if err := cmd.Start(); err != nil { log.Fatalf("failed to start daemon: %v", err) }
+	if err := cmd.Start(); err != nil {
+		log.Fatalf("failed to start daemon: %v", err)
+	}
 
 	pid := cmd.Process.Pid
 
@@ -1866,19 +2123,32 @@ func daemonize(host, port, modelName string) {
 	os.WriteFile(servePidPath(), []byte(strconv.Itoa(pid)), 0644)
 
 	fmt.Printf("ai serve daemon started (pid=%d) on %s:%s\n", pid, host, port)
-	if modelName != "" { fmt.Printf("  model: %s\n", modelName) }
+	if modelName != "" {
+		fmt.Printf("  model: %s\n", modelName)
+	}
 	fmt.Printf("  pid:   %s\n", servePidPath())
 	fmt.Printf("  stop:  ai serve --stop\n")
 }
 
 func stopExistingDaemon() {
 	data, err := os.ReadFile(servePidPath())
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil { os.Remove(servePidPath()); return }
+	if err != nil {
+		os.Remove(servePidPath())
+		return
+	}
 	proc, err := os.FindProcess(pid)
-	if err != nil { os.Remove(servePidPath()); return }
-	if err := proc.Signal(os.Signal(os.Interrupt)); err != nil { os.Remove(servePidPath()); return }
+	if err != nil {
+		os.Remove(servePidPath())
+		return
+	}
+	if err := proc.Signal(os.Signal(os.Interrupt)); err != nil {
+		os.Remove(servePidPath())
+		return
+	}
 	proc.Signal(os.Interrupt)
 	time.Sleep(500 * time.Millisecond)
 	proc.Kill()
