@@ -1360,6 +1360,9 @@ func cmdInferGPU(model string, promptParts []string) {
 
 	// === Metal fused compute-shader forward (one command buffer per token) ===
 	fusedForward := func(tokenID, pos int) []float32 { return nil }
+	// fusedPrefill runs a whole prompt in tiles; nil when unavailable.
+	var fusedPrefill func(tokens []int) []float32
+	var fusedResetKV func()
 	useFused := false
 
 	if metal, ok := eng.(*mongoose.Metal); ok && gatedMLP && !geluGated && !fusedQKV && attnDim == dim {
@@ -1446,6 +1449,56 @@ func cmdInferGPU(model string, promptParts []string) {
 				sinSlice := sinTab[pos*halfHead : pos*halfHead+halfHead]
 				metal.FusedStep(fHidden, cosSlice, sinSlice, pos, fLogits)
 				return fLogits
+			}
+
+			// Batched prefill. Prompt tokens are known up front, so they can go
+			// through the model in tiles within a single command buffer instead
+			// of one round trip each. Prefill is memory-bound on weights — every
+			// token otherwise re-reads the whole model — so batching is worth
+			// far more here than any single-kernel optimization.
+			//
+			// Returns nil if unavailable, and the caller falls back to the
+			// per-token loop.
+			fusedResetKV = func() { metal.FusedResetKV() }
+			tile := metal.FusedPrefillTile()
+			if v := os.Getenv("AI_PREFILL_TILE"); v != "" {
+				fmt.Sscanf(v, "%d", &tile)
+			}
+			if tile > 0 {
+				fusedPrefill = func(tokens []int) []float32 {
+					batch := make([]float32, tile*dim)
+					var out []float32
+					for start := 0; start < len(tokens); start += tile {
+						end := start + tile
+						if end > len(tokens) {
+							end = len(tokens)
+						}
+						n := end - start
+						for i, tid := range tokens[start:end] {
+							off := tid * dim
+							if off+dim > len(embedData) {
+								return nil
+							}
+							copy(batch[i*dim:(i+1)*dim], embedData[off:off+dim])
+						}
+						// Only the final tile needs logits: every earlier tile
+						// would pay a full vocab-sized matvec per token for a
+						// result nothing samples.
+						var logitsOut []float32
+						if end == len(tokens) {
+							logitsOut = fLogits
+							out = fLogits
+						}
+						rc := metal.FusedPrefillBatch(0, batch[:n*dim], n, start, logitsOut)
+						if os.Getenv("AI_PREFILL_DEBUG") != "" {
+							fmt.Printf("[prefill] tile start=%d n=%d rc=%d logitsOut=%v\n", start, n, rc, logitsOut != nil)
+						}
+						if rc != 0 {
+							return nil
+						}
+					}
+					return out
+				}
 			}
 		}
 	}
@@ -1590,8 +1643,52 @@ func cmdInferGPU(model string, promptParts []string) {
 
 	fmt.Print("Prefilling... ")
 	var logits []float32
-	for i, tid := range tokens {
-		logits = fwd(tid, i)
+	// Batched prefill is OFF by default: it is measurably not equivalent to the
+	// per-token path (max |logit difference| 19.67 on a 5-token prompt, with a
+	// different argmax, against a freshly reset KV cache). Opt in with
+	// AI_BATCH_PREFILL=1 to work on it; do not enable it for real use until
+	// that difference is zero.
+	if useFused && fusedPrefill != nil && os.Getenv("AI_BATCH_PREFILL") != "" {
+		logits = fusedPrefill(tokens)
+		if os.Getenv("AI_PREFILL_DEBUG") != "" && logits != nil {
+			ref := make([]float32, len(logits))
+			bl := append([]float32(nil), logits...)
+			// The per-token reference must start from the same empty KV cache
+			// the batch did. Without this it re-runs on top of the batch's own
+			// writes and the comparison measures nothing.
+			if fusedResetKV != nil {
+				fusedResetKV()
+			}
+			for i, tid := range tokens {
+				ref = fwd(tid, i)
+			}
+			var maxd float64
+			var ai_, bi int
+			var amax, bmax float32 = -1e30, -1e30
+			for i := range ref {
+				d := float64(bl[i] - ref[i])
+				if d < 0 {
+					d = -d
+				}
+				if d > maxd {
+					maxd = d
+				}
+				if bl[i] > amax {
+					amax, ai_ = bl[i], i
+				}
+				if ref[i] > bmax {
+					bmax, bi = ref[i], i
+				}
+			}
+			fmt.Printf("\n[prefill-debug] max|batch-pertoken| = %.6g  argmax batch=%d pertoken=%d\n", maxd, ai_, bi)
+			logits = ref
+		}
+	}
+	if logits == nil {
+		// Per-token fallback: correct but re-reads every weight per token.
+		for i, tid := range tokens {
+			logits = fwd(tid, i)
+		}
 	}
 	fmt.Println("done")
 
