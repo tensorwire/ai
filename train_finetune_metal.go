@@ -310,9 +310,20 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 	loraVRAM := float64(totalLoraParams) * 4 * 3 / (1024 * 1024)
 
 	arch := "llama"
+	// Granite's architecture scalars. The forward pass below MUST apply these or
+	// it trains a different function than `ai serve` runs — silently, with a
+	// plausible loss curve, making every downstream measurement uninterpretable.
+	// Zero means "not set"; every use site skips its work, so a Llama model
+	// trains exactly as it did before.
+	var archSc archScalars
 	if cfgData, err := os.ReadFile(filepath.Join(modelPath, "config.json")); err == nil {
 		var cfg map[string]interface{}
 		if json.Unmarshal(cfgData, &cfg) == nil {
+			if a, err := archFromConfig(cfg); err != nil {
+				log.Fatalf("arch scalars: %v", err)
+			} else {
+				archSc = a
+			}
 			if a, ok := cfg["architectures"].([]interface{}); ok && len(a) > 0 {
 				s, _ := a[0].(string)
 				switch {
@@ -448,6 +459,14 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 			copy(hiddenShared[i*dim:(i+1)*dim], embedShared[tokID*dim:(tokID+1)*dim])
 			targetsShared[i] = math.Float32frombits(uint32(int32(tokens[start+i+1])))
 		}
+		// Granite scales embeddings once on entry to the stack. Done on the
+		// shared CPU-visible buffer because the rows were just copied here.
+		if archSc.EmbeddingMultiplier != 0 {
+			m := archSc.EmbeddingMultiplier
+			for i := range hiddenShared[:n*dim] {
+				hiddenShared[i] *= m
+			}
+		}
 
 		// === IMMUNE SYSTEM ===
 		if !immuneActive && step > 1 && stepLoss > 0 {
@@ -520,9 +539,21 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 
 			mtl.FusedRoPE(Q, headDim, heads, ropeTheta, dim, n); bar()
 			mtl.FusedRoPE(K, headDim, kvHeads, ropeTheta, kvDim, n); bar()
+			// Granite's attention_multiplier REPLACES 1/sqrt(headDim) — it is
+			// 1/headDim, not a factor on top. FusedAttention hardcodes the
+			// sqrt form, so Q is pre-scaled by attnScale*sqrt(headDim) to
+			// cancel it. Valid because Q is per-step scratch; K and V are not
+			// touched, which matters since they feed the cache at inference.
+			if archSc.AttentionScale != 0 {
+				mtl.ScaleInPlace(Q, archSc.AttentionScale*float32(math.Sqrt(float64(headDim))), n*dim)
+			}
 			mtl.FusedAttention(Q, K, V, attnOut, scores, dim, kvDim, headDim, heads, kvHeads, n); bar()
 
 			loraFwd(&l.wo, dx, attnOut, n, dim, dim)
+			// Granite scales each block's CONTRIBUTION, not the running stream.
+			if archSc.ResidualMultiplier != 0 {
+				mtl.ScaleInPlace(dx, archSc.ResidualMultiplier, n*dim)
+			}
 			mtl.FusedAddInPlace(hidden, dx, n*dim); bar()
 			mtl.FusedCopy(savedXMid[li], hidden, n*dim); bar()
 
@@ -535,6 +566,9 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 			mtl.FusedSiLUGateMul(gatePre, upOut, ffnMid, n*ffnDim); bar()
 
 			loraFwd(&l.down, dx, ffnMid, n, ffnDim, dim)
+			if archSc.ResidualMultiplier != 0 {
+				mtl.ScaleInPlace(dx, archSc.ResidualMultiplier, n*dim)
+			}
 			mtl.FusedAddInPlace(hidden, dx, n*dim); bar()
 		}
 
@@ -546,6 +580,13 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 		logitsBuf := te.Zeros([]int{n, vocabSize})
 		mtl.FusedBegin()
 		mtl.FusedGemmF32BT(normedFinal, lmHead, logitsBuf, n, dim, vocabSize); bar()
+		// logits_scaling DIVIDES despite the name. Granite-4.1 ships 10.0, so
+		// multiplying instead is a 100x error on every logit — it does not
+		// crash, it just trains against a differently-shaped distribution than
+		// the one `ai serve` samples from.
+		if archSc.LogitsScaling != 0 {
+			mtl.ScaleInPlace(logitsBuf, 1.0/archSc.LogitsScaling, n*vocabSize)
+		}
 		mtl.FusedEnd()
 
 		// Softmax CE + gradient (standalone, CUDA-style: modifies logits, writes grad)
