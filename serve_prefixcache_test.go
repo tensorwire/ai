@@ -189,3 +189,54 @@ func TestInvalidateSlotDropsTheCache(t *testing.T) {
 		t.Errorf("cache survived invalidation: %d tokens", n)
 	}
 }
+
+// Round-robin slot selection defeats the prefix cache for the commonest case:
+// with two slots, consecutive turns of ONE conversation alternate between them,
+// so a repeat turn finds its own history only every other time. Measured before
+// the fix as 6.11s, 5.94s, 0.07s across three identical requests — turn 2 should
+// have been instant too.
+func TestSequenceReturnsToTheSlotHoldingItsPrefix(t *testing.T) {
+	mi := newPrefixCacheTestHarness(2)
+
+	convA := []int{1, 2, 3, 4}
+	mi.beginSequenceFor(convA)
+	slotA := mi.currentSlot()
+	mi.noteSequence(convA)
+	mi.endSequence()
+
+	// A different conversation must NOT displace it — that is what slots are for.
+	convB := []int{90, 91, 92}
+	mi.beginSequenceFor(convB)
+	slotB := mi.currentSlot()
+	mi.noteSequence(convB)
+	mi.endSequence()
+	if slotA == slotB {
+		t.Fatalf("an unrelated conversation reused slot %d", slotA)
+	}
+
+	// Continuing conversation A must come back to A's slot and find its prefix.
+	turn2 := []int{1, 2, 3, 4, 5, 6}
+	mi.beginSequenceFor(turn2)
+	defer mi.endSequence()
+
+	if got := mi.currentSlot(); got != slotA {
+		t.Errorf("continuation landed on slot %d, want %d (the one holding its prefix)", got, slotA)
+	}
+	if n := mi.cachedPrefixLen(turn2); n != 4 {
+		t.Errorf("cached prefix = %d, want 4; the turn would re-prefill from scratch", n)
+	}
+}
+
+// commonPrefix must always leave a token to run, or prefill returns no logits.
+func TestCommonPrefixLeavesATokenToRun(t *testing.T) {
+	seq := []int{1, 2, 3}
+	if n := commonPrefix(seq, seq); n != len(seq)-1 {
+		t.Errorf("commonPrefix(x, x) = %d, want %d", n, len(seq)-1)
+	}
+	if n := commonPrefix(nil, seq); n != 0 {
+		t.Errorf("empty cache = %d, want 0", n)
+	}
+	if n := commonPrefix(seq, []int{1}); n != 0 {
+		t.Errorf("single-token follow-up = %d, want 0", n)
+	}
+}

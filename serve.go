@@ -298,7 +298,7 @@ type serveState struct {
 
 	// Sequence lifecycle + KV prefix cache. All nil unless the Metal streaming
 	// path is active; every call site checks.
-	beginSequence   func()
+	beginSequence   func([]int)
 	endSequence     func()
 	cachedPrefixLen func([]int) int
 	noteSequence    func([]int)
@@ -457,7 +457,10 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 
 	// Hold one slot — and therefore one KV cache — for the whole sequence.
 	if beginSeq != nil {
-		beginSeq()
+		// Pick the slot whose KV cache already matches this prompt, so a repeat
+		// turn returns to its own history instead of round-robining onto a cold
+		// slot.
+		beginSeq(req.tokens)
 		defer endSeq()
 	}
 
@@ -947,7 +950,7 @@ func (s *serveState) loadModel(name string) error {
 			//
 			// beginSequence/endSequence bracket a request; fwd steps tokens on the
 			// slot the current request holds.
-			s.beginSequence = func() { mi.beginSequence() }
+			s.beginSequence = func(tokens []int) { mi.beginSequenceFor(tokens) }
 			s.endSequence = func() { mi.endSequence() }
 			s.cachedPrefixLen = mi.cachedPrefixLen
 			s.noteSequence = mi.noteSequence
@@ -966,6 +969,10 @@ func (s *serveState) loadModel(name string) error {
 	// Metal fused compute path (legacy fallback)
 	if s.fwd == nil {
 		if metal, ok := s.eng.(*mongoose.Metal); ok {
+			// Arch scalars before BuildFused — see the note in serve_metal.go.
+			if arch, err := archFromConfig(s.cfg); err == nil && !arch.IsZero() {
+				metal.FusedSetArch(arch.toMongoose())
+			}
 			ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, float64(ropeTheta), 1e-6)
 			if ret == 0 {
 				wi := 0

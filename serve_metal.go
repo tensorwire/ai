@@ -56,6 +56,23 @@ func buildMetalStreamingInference(s *serveState, st *gguf.SafeTensors, lmHeadDat
 	if v, ok := s.cfg["rope_theta"].(float64); ok {
 		ropeTheta = v
 	}
+	// Architecture scalars must be set BEFORE BuildFused. Without them Granite
+	// loads, runs at full speed, and emits token soup — which is exactly what
+	// `ai serve` did while `ai infer` was correct, because only the infer path
+	// had been wired.
+	if arch, err := archFromConfig(s.cfg); err != nil {
+		log.Printf("[serve] arch scalars: %v", err)
+		return nil
+	} else if !arch.IsZero() {
+		if rc := metal.FusedSetArch(arch.toMongoose()); rc != 0 {
+			log.Printf("[serve] arch scalars: FusedSetArch failed (%d)", rc)
+			return nil
+		}
+		log.Printf("[serve] arch scalars: embed=%.4g residual=%.4g attn=%.6g logits=%.4g",
+			arch.EmbeddingMultiplier, arch.ResidualMultiplier,
+			arch.AttentionScale, arch.LogitsScaling)
+	}
+
 	ret := metal.BuildFused(s.dim, s.kvHeads*headDim, headDim, s.heads, s.kvHeads, s.ffnDim, s.vocabSize, s.layers, s.maxSeq, ropeTheta, 1e-6)
 	if ret != 0 {
 		return nil
@@ -203,6 +220,52 @@ func (mi *metalStreamingInference) beginSequence() {
 	mi.seqSlot = mi.acquireSlot()
 }
 
+// beginSequenceFor claims the slot whose KV cache best matches `tokens`,
+// falling back to round-robin when none does.
+//
+// Round-robin alone defeats the prefix cache for the common case. With two
+// slots, consecutive turns of ONE conversation alternate between them, so a
+// turn only ever finds its own history every other time — measured as 6.11s,
+// 5.94s, 0.07s across three identical requests, where turns 2 and 3 should both
+// have been instant.
+//
+// Slots exist for CONCURRENT sequences; picking by cache affinity keeps that
+// property (a second, different conversation still lands elsewhere) while
+// letting a repeat turn return to the slot that already holds its prefix.
+func (mi *metalStreamingInference) beginSequenceFor(tokens []int) {
+	mi.seqMu.Lock()
+
+	best, bestLen := -1, 0
+	for i := 0; i < mi.nSlots; i++ {
+		if n := commonPrefix(mi.slotTokens[i], tokens); n > bestLen {
+			best, bestLen = i, n
+		}
+	}
+	if best >= 0 {
+		mi.slotMu[best].Lock()
+		mi.seqSlot = best
+		return
+	}
+	mi.seqSlot = mi.acquireSlot()
+}
+
+// commonPrefix counts leading tokens shared by a and b, stopping one short of
+// len(b) so there is always a token left to run — see cachedPrefixLen.
+func commonPrefix(a, b []int) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	if n >= len(b) {
+		n = len(b) - 1
+	}
+	i := 0
+	for i < n && a[i] == b[i] {
+		i++
+	}
+	return i
+}
+
 func (mi *metalStreamingInference) endSequence() {
 	mi.releaseSlot(mi.seqSlot)
 	mi.seqSlot = -1
@@ -229,22 +292,7 @@ func (mi *metalStreamingInference) currentSlot() int {
 // entire system prompt plus turn 1, so the shared prefix is nearly the whole
 // request and only the new user message needs prefilling.
 func (mi *metalStreamingInference) cachedPrefixLen(tokens []int) int {
-	slot := mi.currentSlot()
-	prev := mi.slotTokens[slot]
-	n := len(prev)
-	if len(tokens) < n {
-		n = len(tokens)
-	}
-	// The last cached position must stay strictly inside the new sequence:
-	// re-running the final token is what produces the next logits.
-	if n >= len(tokens) {
-		n = len(tokens) - 1
-	}
-	i := 0
-	for i < n && prev[i] == tokens[i] {
-		i++
-	}
-	return i
+	return commonPrefix(mi.slotTokens[mi.currentSlot()], tokens)
 }
 
 // noteSequence records the token sequence now resident in the current slot.
