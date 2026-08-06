@@ -296,6 +296,11 @@ type serveState struct {
 	fwd     func(tokenID, pos int) []float32
 	resetKV func()
 
+	// opConstrainer restricts tool-call op names to a supplied catalog. nil
+	// unless --op-catalog was given, in which case decoding is unchanged.
+	opConstrainer *opConstrainer
+	opCatalogPath string
+
 	// Sequence lifecycle + KV prefix cache. All nil unless the Metal streaming
 	// path is active; every call site checks.
 	beginSequence   func([]int)
@@ -331,18 +336,28 @@ func cmdServe(args map[string]string) {
 	} else if v, ok := args["_0"]; ok && !strings.HasPrefix(v, "--") {
 		modelName = v
 	}
+	opCatalogArg := ""
 	if v, ok := args["host"]; ok {
 		host = v
 	}
 	if v, ok := args["port"]; ok {
 		port = v
 	}
+	if v, ok := args["op-catalog"]; ok {
+		opCatalogArg = v
+	}
 
 	daemon := false
 	noStream := false
+	opCatalog := opCatalogArg
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
+		case "--op-catalog":
+			if i+1 < len(os.Args) {
+				opCatalog = os.Args[i+1]
+				i++
+			}
 		case "--host":
 			if i+1 < len(os.Args) {
 				host = os.Args[i+1]
@@ -382,7 +397,7 @@ func cmdServe(args map[string]string) {
 		return
 	}
 
-	state := &serveState{noStream: noStream}
+	state := &serveState{noStream: noStream, opCatalogPath: opCatalog}
 
 	if modelName != "" {
 		if err := state.loadModel(modelName); err != nil {
@@ -518,13 +533,34 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 		defer func() { noteSeq(allTokens) }()
 	}
 
+	// Constrained decoding for tool-call op names. Inert unless the server was
+	// started with an op catalog AND generation is inside an `"op": "..."`
+	// string, so ordinary chat is bit-identical to an unconstrained run.
+	var oc *opConstrainer
+	if s.opConstrainer != nil {
+		oc = s.opConstrainer
+		oc.reset()
+	}
+	var genText strings.Builder
+
 	for step := 0; step < req.maxTokens; step++ {
+		if oc != nil {
+			oc.constrainLogits(logits)
+		}
 		nextToken := sampleTopK(logits, req.temp, req.topK)
 		allTokens = append(allTokens, nextToken)
 
 		if req.stopToks[nextToken] {
 			req.resultCh <- inferToken{tokenID: nextToken, done: true}
 			return
+		}
+
+		if oc != nil {
+			// Track the generated text so the constrainer knows when it enters
+			// and leaves an op string. Decoding one token at a time is exact
+			// here; re-decoding the whole sequence would be quadratic.
+			genText.WriteString(s.tokenizer.Decode([]int{nextToken}))
+			oc.observe(genText.String())
 		}
 
 		req.resultCh <- inferToken{tokenID: nextToken}
@@ -940,6 +976,20 @@ func (s *serveState) loadModel(name string) error {
 	}
 
 	s.stopTokens = discoverStopTokens(tok, cfg, path)
+
+	// Build the op constrainer once the tokenizer exists. Decoding the whole
+	// vocabulary up front costs one pass at load; doing it per token inside the
+	// sampling loop would dominate generation.
+	if s.opCatalogPath != "" {
+		ops, err := loadOpCatalog(s.opCatalogPath)
+		if err != nil {
+			log.Printf("[serve] op catalog: %v — decoding unconstrained", err)
+		} else if len(ops) > 0 {
+			s.opConstrainer = newOpConstrainer(ops, tok)
+			log.Printf("[serve] op-constrained decoding: %d ops from %s",
+				len(ops), s.opCatalogPath)
+		}
+	}
 
 	// Metal streaming + multi-slot path (preferred, unless --no-stream)
 	if !s.noStream {
