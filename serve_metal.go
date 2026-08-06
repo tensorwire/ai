@@ -107,6 +107,7 @@ func buildMetalStreamingInference(s *serveState, st *gguf.SafeTensors, lmHeadDat
 	// Also load weights into resident buffers in background for fast path
 	go mi.loadWeights(st, lmHeadData)
 
+	s.inferSlots = nSlots
 	log.Printf("[serve] Metal streaming inference — %d slots, loading weights in background", nSlots)
 	return mi
 }

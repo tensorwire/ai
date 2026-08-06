@@ -301,6 +301,10 @@ type serveState struct {
 	opConstrainer *opConstrainer
 	opCatalogPath string
 
+	// inferSlots is the number of independent KV slots, and therefore the
+	// number of requests that may run concurrently.
+	inferSlots int
+
 	// Sequence lifecycle + KV prefix cache. All nil unless the Metal streaming
 	// path is active; every call site checks.
 	beginSequence   func([]int)
@@ -412,7 +416,21 @@ func cmdServe(args map[string]string) {
 		fmt.Sscanf(v, "%d", &queueSize)
 	}
 	state.inferQueue = make(chan *inferRequest, queueSize)
-	go state.inferWorker()
+
+	// One worker per KV slot. A single worker made the server strictly serial,
+	// so the slots existed but nothing ever drove two at once — a GRPO group of
+	// 8 rollouts cost 8x wall-clock instead of 4x, and every throughput number
+	// measured through this server understated what the hardware can do.
+	//
+	// Concurrency is already safe: beginSequence takes the slot mutex and holds
+	// it for the whole sequence, so a worker with no free slot blocks rather
+	// than sharing a KV cache. Starting more workers than slots only adds
+	// queueing.
+	workers := state.inferWorkers()
+	for i := 0; i < workers; i++ {
+		go state.inferWorker()
+	}
+	log.Printf("[serve] %d inference worker(s)", workers)
 
 	mux := http.NewServeMux()
 
@@ -2189,4 +2207,22 @@ func stopExistingDaemon() {
 	time.Sleep(500 * time.Millisecond)
 	proc.Kill()
 	os.Remove(servePidPath())
+}
+
+// inferWorkers returns how many requests may be in flight at once.
+//
+// Bounded by the KV slot count, because a sequence holds its slot for its whole
+// life: more workers than slots would simply queue on the slot mutex while
+// consuming goroutines and making latency less predictable.
+//
+// Falls back to 1 when the streaming path is not active, which is the
+// conservative choice — the non-streaming paths have not been audited for
+// concurrent use.
+func (s *serveState) inferWorkers() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.inferSlots > 1 {
+		return s.inferSlots
+	}
+	return 1
 }
