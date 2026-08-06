@@ -60,9 +60,14 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 	if err != nil {
 		log.Fatalf("read data: %v", err)
 	}
-	tokens := tok.Encode(string(raw))
-	log.Printf("[finetune-metal] %d bytes → %d tokens (%.1fx)",
-		len(raw), len(tokens), float64(len(raw))/float64(len(tokens)))
+	corpus, err := LoadTrainCorpus(dataPath, tok)
+	if err != nil {
+		log.Fatalf("load data: %v", err)
+	}
+	tokens := corpus.Tokens
+	log.Printf("[finetune-metal] %d bytes → %d tokens (%.1fx), %.1f%% supervised",
+		len(raw), len(tokens), float64(len(raw))/float64(len(tokens)),
+		100*corpus.SupervisedFraction())
 	if len(tokens) < n+1 {
 		log.Fatalf("need at least %d tokens, got %d", n+1, len(tokens))
 	}
@@ -457,7 +462,14 @@ func cmdFinetuneMetalLoRA(modelPath, dataPath string, steps int, lr float64, ran
 		for i := 0; i < n; i++ {
 			tokID := tokens[start+i]
 			copy(hiddenShared[i*dim:(i+1)*dim], embedShared[tokID*dim:(tokID+1)*dim])
-			targetsShared[i] = math.Float32frombits(uint32(int32(tokens[start+i+1])))
+			// A masked position trains nothing: the model conditions on the
+			// prompt but is not taught to reproduce it. -1 is the sentinel
+			// softmax_ce_grad reads as "skip".
+			tgt := int32(tokens[start+i+1])
+			if !corpus.Mask[start+i] {
+				tgt = -1
+			}
+			targetsShared[i] = math.Float32frombits(uint32(tgt))
 		}
 		// Granite scales embeddings once on entry to the stack. Done on the
 		// shared CPU-visible buffer because the rows were just copied here.
