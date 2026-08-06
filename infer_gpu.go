@@ -1639,11 +1639,22 @@ func cmdInferGPU(model string, promptParts []string) {
 
 	fmt.Print("Prefilling... ")
 	var logits []float32
-	// Batched prefill: 2.81x faster than the per-token path (7.41 vs 20.83
-	// ms/prompt-token on a 2005-token prompt), same argmax, same generated text.
-	// AI_NO_BATCH_PREFILL=1 falls back to the per-token loop; AI_PREFILL_DEBUG=1
-	// prints the max logit difference between the two.
-	if useFused && fusedPrefill != nil && os.Getenv("AI_NO_BATCH_PREFILL") == "" {
+	// Batched prefill is 2.81x faster (7.41 vs 20.83 ms/prompt-token on a
+	// 2005-token prompt) but is NOT yet equivalent: its argmax diverges from the
+	// per-token path once a prompt contains as few as 4 DISTINCT tokens, while
+	// matching exactly on prompts of repeated tokens. That signature points at
+	// attention reading the wrong positions — with identical tokens, attending
+	// to the wrong ones still gives the right answer.
+	//
+	// The causal bound, GQA head indexing, KV publish ordering and Granite's Q
+	// pre-scale have each been checked individually and are correct, so the
+	// fault is somewhere their interaction is not. Until it is found, correct
+	// output wins over fast output.
+	//
+	// AI_BATCH_PREFILL=1 enables it; AI_PREFILL_DEBUG=1 prints the max logit
+	// difference and both argmaxes against a freshly reset KV cache, which is
+	// the reproduction.
+	if useFused && fusedPrefill != nil && os.Getenv("AI_BATCH_PREFILL") != "" {
 		logits = fusedPrefill(tokens)
 		if os.Getenv("AI_PREFILL_DEBUG") != "" && logits != nil {
 			ref := make([]float32, len(logits))
