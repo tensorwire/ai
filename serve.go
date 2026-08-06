@@ -533,34 +533,13 @@ func (s *serveState) processInferRequest(req *inferRequest) {
 		defer func() { noteSeq(allTokens) }()
 	}
 
-	// Constrained decoding for tool-call op names. Inert unless the server was
-	// started with an op catalog AND generation is inside an `"op": "..."`
-	// string, so ordinary chat is bit-identical to an unconstrained run.
-	var oc *opConstrainer
-	if s.opConstrainer != nil {
-		oc = s.opConstrainer
-		oc.reset()
-	}
-	var genText strings.Builder
-
 	for step := 0; step < req.maxTokens; step++ {
-		if oc != nil {
-			oc.constrainLogits(logits)
-		}
 		nextToken := sampleTopK(logits, req.temp, req.topK)
 		allTokens = append(allTokens, nextToken)
 
 		if req.stopToks[nextToken] {
 			req.resultCh <- inferToken{tokenID: nextToken, done: true}
 			return
-		}
-
-		if oc != nil {
-			// Track the generated text so the constrainer knows when it enters
-			// and leaves an op string. Decoding one token at a time is exact
-			// here; re-decoding the whole sequence would be quadratic.
-			genText.WriteString(s.tokenizer.Decode([]int{nextToken}))
-			oc.observe(genText.String())
 		}
 
 		req.resultCh <- inferToken{tokenID: nextToken}
